@@ -133,16 +133,28 @@ class LeaderboardCopier:
                     logger.debug(f"[Leaderboard] Skipping RWA asset {coin}")
                     continue
 
-                # Skip closing trades (closedPnl != 0 means they're exiting)
-                if closed_pnl != 0:
-                    continue
-
                 # dir: "Open Long" / "Open Short" / "Close Long" / "Close Short"
                 if "Long" in side or side == "B":
                     direction = "long"
                 elif "Short" in side or side == "A":
                     direction = "short"
                 else:
+                    continue
+
+                is_close = closed_pnl != 0 or "Close" in side
+
+                # ── COPY EXIT — trader is closing, we close too ────────────────
+                if is_close:
+                    logger.info(f"[Leaderboard] 🚪 COPY EXIT {coin} | trader closed | from {address[:10]}…")
+                    if self._signal_queue:
+                        await self._signal_queue.put(TradeSignal(
+                            strategy="leaderboard",
+                            coin=coin,
+                            direction=direction,
+                            size_usd=0,
+                            confidence=1.0,
+                            meta={"action": "exit", "reason": "trader_closed"},
+                        ))
                     continue
 
                 # Dedup: skip if we already have this coin+direction open

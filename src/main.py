@@ -153,6 +153,43 @@ async def main():
         feed.subscribe("allMids", on_price_tick_for_cascade)
         logger.info("Strategy CASCADE enabled")
 
+    # ── Position guardian — max hold, stop loss, take profit ─────────────────
+    MAX_HOLD_HOURS  = 4.0    # force close after 4h
+    STOP_LOSS_PCT   = 0.05   # close at -5%
+    TAKE_PROFIT_PCT = 0.04   # close at +4%
+
+    async def position_guardian():
+        from datetime import datetime, timedelta
+        while True:
+            await asyncio.sleep(30)   # check every 30s
+            now = datetime.utcnow()
+            for pos in list(risk.open_positions):
+                current_price = store.latest_mid(pos.coin)
+                if current_price:
+                    risk.update_unrealized(pos.coin, current_price)
+
+                age_h = (now - pos.opened_at).total_seconds() / 3600
+                pnl_pct = pos.unrealized_pnl / pos.size_usd if pos.size_usd else 0
+
+                reason = None
+                if age_h >= MAX_HOLD_HOURS:
+                    reason = f"max hold {age_h:.1f}h"
+                elif pnl_pct <= -STOP_LOSS_PCT:
+                    reason = f"stop loss {pnl_pct:.1%}"
+                elif pnl_pct >= TAKE_PROFIT_PCT:
+                    reason = f"take profit {pnl_pct:.1%}"
+
+                if reason:
+                    logger.info(f"[Guardian] CLOSING {pos.coin} pos#{pos.id} — {reason}")
+                    await executor.enqueue(TradeSignal(
+                        strategy=pos.strategy,
+                        coin=pos.coin,
+                        direction="long" if pos.direction == "short" else "short",
+                        size_usd=0,
+                        confidence=1.0,
+                        meta={"action": "exit", "reason": reason},
+                    ))
+
     # Daily summary at 23:55 UTC
     async def daily_summary():
         await alerter.daily_summary(risk.status())
@@ -165,6 +202,7 @@ async def main():
     await asyncio.gather(
         feed.run(),
         executor.run(),
+        position_guardian(),
     )
 
 
