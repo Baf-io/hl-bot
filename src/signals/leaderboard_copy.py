@@ -179,24 +179,38 @@ class LeaderboardCopier:
     # ── REST fetch ─────────────────────────────────────────────────────────────
 
     async def _fetch_leaderboard(self) -> list[TrackedTrader]:
-        try:
-            async with aiohttp.ClientSession() as session:
-                # HL leaderboard endpoint
-                async with session.post(
-                    HL_REST,
-                    json={"type": "leaderboard"},
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.error(f"[Leaderboard] HTTP {resp.status}")
-                        return []
-                    data = await resp.json(content_type=None)
-                    traders = self._parse_leaderboard(data)
-                    logger.info(f"[Leaderboard] Fetched {len(traders)} traders from API")
-                    return traders
-        except Exception as e:
-            logger.error(f"[Leaderboard] Fetch failed: {e}")
+        """
+        HL doesn't expose a public leaderboard API.
+        Instead we hardcode known profitable trader addresses from the public leaderboard UI.
+        Update this list periodically by checking app.hyperliquid.xyz/leaderboard manually.
+        """
+        # Top traders from HL leaderboard (update weekly)
+        # Format: (address, est_pnl, win_rate, max_dd, avg_lev, trades, age_days)
+        KNOWN_TRADERS = [
+            # Add addresses from app.hyperliquid.xyz/leaderboard here
+            # Example format (replace with real ones):
+            # ("0xADDRESS", 500000, 0.65, 0.15, 8, 2000, 90),
+        ]
+
+        if not KNOWN_TRADERS:
+            logger.warning(
+                "[Leaderboard] No trader addresses configured. "
+                "Add addresses from app.hyperliquid.xyz/leaderboard to KNOWN_TRADERS in leaderboard_copy.py"
+            )
             return []
+
+        traders = []
+        for addr, pnl, wr, dd, lev, tc, age in KNOWN_TRADERS:
+            traders.append(TrackedTrader(
+                address=addr,
+                realized_pnl=pnl,
+                win_rate=wr,
+                max_drawdown=dd,
+                avg_leverage=lev,
+                trade_count=tc,
+                account_age_days=age,
+            ))
+        return traders
 
     @staticmethod
     def _parse_leaderboard(data) -> list[TrackedTrader]:
