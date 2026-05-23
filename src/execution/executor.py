@@ -128,8 +128,12 @@ class Executor:
             logger.error(f"[Executor] No price for {coin}, skipping")
             return
 
-        # Convert USD size to coin size
-        size_coin = round(size_usd / mid, 6)
+        # Convert USD size to coin size, respecting HL's per-coin lot size (szDecimals)
+        sz_decimals = self._get_sz_decimals(coin)
+        size_coin = round(size_usd / mid, sz_decimals)
+        if size_coin <= 0:
+            logger.warning(f"[Executor] {coin} size rounds to 0 at ${size_usd} — skipping")
+            return
         is_buy = direction == "long"
 
         # All strategies use market orders — latency matters, maker rebate is tiny vs missed entry
@@ -199,6 +203,17 @@ class Executor:
         except Exception as e:
             logger.error(f"[Executor] limit order failed: {e}")
             return None
+
+    def _get_sz_decimals(self, coin: str) -> int:
+        """Return the number of decimal places allowed for a coin's size on HL."""
+        try:
+            universe = self._meta.get("universe", [])
+            for asset in universe:
+                if asset.get("name") == coin:
+                    return int(asset.get("szDecimals", 4))
+        except Exception:
+            pass
+        return 4  # safe fallback
 
     @staticmethod
     def _parse_fill(result: dict) -> tuple[bool, float | None, str]:
