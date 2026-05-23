@@ -31,10 +31,12 @@ MIN_ALLTIME_VLM  = 100_000
 STAGE1_LIMIT     = 300         # profile top 300 candidates
 
 # ── Stage 2 filters (from fill history profiling) ────────────────────────────
-MIN_TRADES_PER_DAY   = 3.0     # at least 3 trades/day average
-MAX_AVG_HOLD_HOURS   = 3.0     # average hold under 3h
-MIN_WIN_RATE         = 0.52    # at least 52% profitable trades
-MIN_RECENT_TRADES_7D = 10      # must have 10+ trades in last 7 days
+# Minimal sanity only — we rank all 300 and take top N by composite score.
+# Hard cutoffs caused only 9/300 to qualify. Score sorts out quality.
+MIN_TRADES_PER_DAY   = 0.5     # bare minimum: at least 1 trade every 2 days
+MAX_AVG_HOLD_HOURS   = 48.0    # exclude multi-day bagholders only
+MIN_WIN_RATE         = 0.45    # exclude catastrophically bad traders
+MIN_RECENT_TRADES_7D = 1       # must have traded at least once this week
 TOP_N                = 75      # final output size
 
 
@@ -188,9 +190,17 @@ async def main():
             print(f"  Profiled {done}/{len(candidates)} | qualifying so far: {len(results)}")
             await asyncio.sleep(0.5)   # gentle rate limiting
 
-    # Sort by composite score: trades/day * win_rate / avg_hold
+    # Composite score — weights:
+    #   frequency²  : squared so high-freq traders dominate (not just slightly better)
+    #   win_rate    : linear quality factor
+    #   1/hold_h    : shorter holds = higher score (mean-reversion speed)
+    #   7d_recency  : bonus for recent activity (active RIGHT NOW)
     for r in results:
-        r["score"] = (r["trades_per_day"] * r["win_rate"]) / max(r["avg_hold_h"], 0.1)
+        freq    = r["trades_per_day"]
+        wr      = r["win_rate"]
+        hold    = max(r["avg_hold_h"], 0.1)
+        recency = min(r["trades_7d"] / 20, 1.0)   # normalise, cap at 1.0
+        r["score"] = (freq ** 2 * wr / hold) * (1 + recency)
 
     results.sort(key=lambda t: t["score"], reverse=True)
     top = results[:TOP_N]
