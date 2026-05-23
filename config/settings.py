@@ -9,40 +9,40 @@ load_dotenv()
 # ── Hyperliquid connection ─────────────────────────────────────────────────────
 HL_WALLET_ADDRESS   = os.getenv("HL_WALLET_ADDRESS", "")
 HL_PRIVATE_KEY      = os.getenv("HL_PRIVATE_KEY", "")
-HL_TESTNET          = os.getenv("HL_TESTNET", "true").lower() == "true"   # ALWAYS start on testnet
+HL_TESTNET          = os.getenv("HL_TESTNET", "true").lower() == "true"
 
-# ── Risk limits ───────────────────────────────────────────────────────────────
-MAX_OPEN_POSITIONS      = 5
-MAX_POSITION_SIZE_PCT   = 0.08      # 8% of portfolio per position
-DAILY_LOSS_HALT_PCT     = 0.03      # halt all trading if -3% day
-MAX_LEVERAGE            = 10        # hard cap, override per-strategy
-PORTFOLIO_DELTA_MAX     = 0.15      # net delta can't exceed 15% of portfolio
+# ── Risk limits ── AGGRESSIVE MODE (tuned for $100 fast trading) ──────────────
+MAX_OPEN_POSITIONS      = 3             # concentrate — fewer, bigger bets
+MAX_POSITION_SIZE_PCT   = 0.25          # 25% per position ($25 on $100)
+DAILY_LOSS_HALT_PCT     = 0.20          # halt at -20% ($20 on $100)
+MAX_LEVERAGE            = 20            # allow higher leverage for leaderboard copies
+PORTFOLIO_DELTA_MAX     = 0.75          # allow more directional exposure
 
 # ── Strategy toggles ──────────────────────────────────────────────────────────
 STRATEGY_FUNDING_CARRY    = os.getenv("STRATEGY_FUNDING_CARRY", "true").lower() == "true"
-STRATEGY_LEADERBOARD_COPY = os.getenv("STRATEGY_LEADERBOARD_COPY", "false").lower() == "true"
-STRATEGY_CASCADE          = os.getenv("STRATEGY_CASCADE", "false").lower() == "true"
+STRATEGY_LEADERBOARD_COPY = os.getenv("STRATEGY_LEADERBOARD_COPY", "true").lower() == "true"
+STRATEGY_CASCADE          = os.getenv("STRATEGY_CASCADE", "true").lower() == "true"
 
 # ── Funding carry params ──────────────────────────────────────────────────────
-FUNDING_ENTRY_THRESHOLD   = 0.0005  # 0.05% per 8h
-FUNDING_EXIT_THRESHOLD    = 0.0002  # exit when funding drops below this
-FUNDING_MAX_POSITIONS     = 3       # max simultaneous carry positions
+FUNDING_ENTRY_THRESHOLD   = 0.0003      # lower bar — catch more opportunities
+FUNDING_EXIT_THRESHOLD    = 0.0001
+FUNDING_MAX_POSITIONS     = 1           # only 1 carry at a time (capital is small)
 
-# ── Leaderboard copy params ───────────────────────────────────────────────────
-COPY_MIN_ACCOUNT_AGE_DAYS = 45
-COPY_MIN_REALIZED_PNL_USD = 150_000
-COPY_MIN_WIN_RATE         = 0.58
-COPY_MAX_DRAWDOWN         = 0.22
-COPY_MAX_AVG_LEVERAGE     = 12
-COPY_MIN_TRADE_COUNT      = 500
-COPY_SIZE_SCALE           = 0.01    # copy at 1% of their notional (tune to your capital)
-COPY_MAX_LAG_MS           = 500     # discard signal if we're >500ms behind
+# ── Leaderboard copy params ── loosened for more signals ─────────────────────
+COPY_MIN_ACCOUNT_AGE_DAYS = 20          # lowered from 45
+COPY_MIN_REALIZED_PNL_USD = 50_000      # lowered from 150k
+COPY_MIN_WIN_RATE         = 0.52        # lowered from 0.58
+COPY_MAX_DRAWDOWN         = 0.35        # more lenient
+COPY_MAX_AVG_LEVERAGE     = 20          # allow higher leverage traders
+COPY_MIN_TRADE_COUNT      = 200         # lowered from 500
+COPY_SIZE_SCALE           = 0.005       # 0.5% of their notional (scales to $100 portfolio)
+COPY_MAX_LAG_MS           = 300         # tighter — only copy if fast enough
 
-# ── Cascade params ────────────────────────────────────────────────────────────
-CASCADE_OI_PERCENTILE     = 90      # OI must be above 90th pct (30d)
-CASCADE_FUNDING_THRESHOLD = 0.0003
-CASCADE_MOVE_1H_PCT       = 0.018   # 1.8% move in 1h
-CASCADE_IMBALANCE_MIN     = 0.70    # bid/ask imbalance
+# ── Cascade params ── more sensitive triggers ─────────────────────────────────
+CASCADE_OI_PERCENTILE     = 75          # lowered from 90 — fires more often
+CASCADE_FUNDING_THRESHOLD = 0.0002      # more sensitive
+CASCADE_MOVE_1H_PCT       = 0.012       # 1.2% move triggers (was 1.8%)
+CASCADE_IMBALANCE_MIN     = 0.62        # lower bar (was 0.70)
 
 # ── Monitoring ────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
