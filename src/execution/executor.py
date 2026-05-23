@@ -32,7 +32,13 @@ class Executor:
             if settings.HL_TESTNET
             else constants.MAINNET_API_URL
         )
-        self._exchange = Exchange(wallet, base_url)
+        # account_address tells the SDK to trade on behalf of the main wallet
+        # using the agent key for signing — critical for agent key setup
+        self._exchange = Exchange(
+            wallet,
+            base_url,
+            account_address=settings.HL_WALLET_ADDRESS,
+        )
         self._info = Info(base_url, skip_ws=True)
         # Pre-warm: load coin metadata so first trade has no cold-start delay
         try:
