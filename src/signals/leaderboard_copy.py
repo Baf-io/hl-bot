@@ -45,16 +45,13 @@ class LeaderboardCopier:
     async def refresh_leaderboard(self):
         raw = await self._fetch_leaderboard()
         if not raw:
-            logger.warning("[Leaderboard] No traders returned from API")
+            logger.warning("[Leaderboard] No traders returned")
             return
 
-        qualified = [t for t in raw if self._passes_filter(t)]
-        qualified.sort(key=lambda t: t.score, reverse=True)
-        top = qualified[:10]
-
-        if not top:
-            logger.warning("[Leaderboard] No traders passed filter")
-            return
+        # Manually curated addresses — skip filter, trust the list
+        for t in raw:
+            t.score = self._score(t)
+        top = raw  # use all of them
 
         new_addresses = {t.address for t in top}
         old_addresses = set(self._tracked.keys())
