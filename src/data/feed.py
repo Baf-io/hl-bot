@@ -25,8 +25,12 @@ class HyperliquidFeed:
         self._loop = None
 
     def subscribe(self, channel: str, handler):
+        """Register handler. If WS is already running, subscribe immediately."""
         self._handlers.setdefault(channel, []).append(handler)
         logger.debug(f"Subscribed {handler.__name__} to {channel}")
+        # If WebSocket already running, subscribe this channel live
+        if self._ws is not None and channel.startswith("userFills:"):
+            self._subscribe_channel(channel)
 
     async def run(self):
         base_url = (

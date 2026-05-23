@@ -133,8 +133,11 @@ async def main():
                 sig = await signal_queue.get()
                 await executor.enqueue(sig)
 
-        scheduler.add_job(copier.refresh_leaderboard, "interval", seconds=60, id="lb_refresh")
+        # Run immediately on startup, then refresh list every 5 min
+        scheduler.add_job(copier.refresh_leaderboard, "interval", minutes=5, id="lb_refresh")
         scheduler.add_job(relay_signals, "interval", seconds=1, id="lb_relay")
+        # Trigger immediately so we don't wait 5 min for first subscription
+        scheduler.add_job(copier.refresh_leaderboard, "date", id="lb_startup")
         logger.info("Strategy LEADERBOARD COPY enabled")
 
     if settings.STRATEGY_CASCADE:
