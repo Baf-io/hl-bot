@@ -22,6 +22,7 @@ class HyperliquidFeed:
     def __init__(self):
         self._handlers: dict[str, list] = {}
         self._ws = None
+        self._loop = None
 
     def subscribe(self, channel: str, handler):
         self._handlers.setdefault(channel, []).append(handler)
@@ -34,6 +35,7 @@ class HyperliquidFeed:
             else "https://api.hyperliquid.xyz"
         )
         logger.info(f"Connecting to HL feed ({'TESTNET' if settings.HL_TESTNET else 'MAINNET'})")
+        self._loop = asyncio.get_event_loop()   # capture loop for thread-safe dispatch
 
         self._ws = WebsocketManager(base_url)
         self._ws.start()
@@ -73,8 +75,11 @@ class HyperliquidFeed:
         handlers = self._handlers.get(channel, [])
 
         def dispatch(msg):
-            for handler in handlers:
-                asyncio.create_task(handler(msg))
+            # WebSocket runs in a separate thread — must use threadsafe call
+            loop = self._loop
+            if loop and loop.is_running():
+                for handler in handlers:
+                    asyncio.run_coroutine_threadsafe(handler(msg), loop)
 
         return dispatch
 
