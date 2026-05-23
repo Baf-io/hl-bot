@@ -1,0 +1,21 @@
+[Unit]
+Description=HL Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/hl-bot
+ExecStart=/root/hl-bot/.venv/bin/python src/main.py
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+# Capture all output to journald (view with: journalctl -u hl-bot -f)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

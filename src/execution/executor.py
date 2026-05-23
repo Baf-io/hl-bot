@@ -108,6 +108,8 @@ class Executor:
                 f"(${size_usd:,.0f}) pos#{position_id} [{signal.strategy}]"
             )
             await self.risk.store.log_trade(signal.strategy, coin, direction, size_usd, mid)
+            # Place native SL/TP on HL — these survive bot crashes
+            await self._place_native_sltp(coin, is_buy, size_coin, mid)
         else:
             logger.error(f"[Executor] Order failed: {result}")
 
@@ -161,6 +163,49 @@ class Executor:
         except Exception as e:
             logger.error(f"[Executor] limit order failed: {e}")
             return None
+
+    async def _place_native_sltp(self, coin: str, is_buy: bool, size: float, entry_px: float):
+        """
+        Place native stop-loss + take-profit orders directly on Hyperliquid.
+        These are exchange-side orders — they execute even if the bot is offline.
+
+        is_buy=True means we entered LONG → SL is a sell below, TP is a sell above.
+        is_buy=False means we entered SHORT → SL is a buy above, TP is a buy below.
+        """
+        SL_PCT = 0.03   # -3% stop loss
+        TP_PCT = 0.08   # +8% take profit
+
+        if is_buy:  # long position
+            sl_px = round(entry_px * (1 - SL_PCT), 4)
+            tp_px = round(entry_px * (1 + TP_PCT), 4)
+            close_is_buy = False   # sell to close long
+        else:       # short position
+            sl_px = round(entry_px * (1 + SL_PCT), 4)
+            tp_px = round(entry_px * (1 - TP_PCT), 4)
+            close_is_buy = True    # buy to close short
+
+        try:
+            # Stop loss
+            sl_result = self._exchange.order(
+                coin, close_is_buy, size, sl_px,
+                {"trigger": {"triggerPx": sl_px, "isMarket": True, "tpsl": "sl"}},
+                reduce_only=True,
+            )
+            # Take profit
+            tp_result = self._exchange.order(
+                coin, close_is_buy, size, tp_px,
+                {"trigger": {"triggerPx": tp_px, "isMarket": True, "tpsl": "tp"}},
+                reduce_only=True,
+            )
+            sl_ok = sl_result and sl_result.get("status") == "ok"
+            tp_ok = tp_result and tp_result.get("status") == "ok"
+            logger.info(
+                f"[Executor] Native SL/TP placed for {coin} | "
+                f"SL=${sl_px:,.4f} {'✅' if sl_ok else '❌'} | "
+                f"TP=${tp_px:,.4f} {'✅' if tp_ok else '❌'}"
+            )
+        except Exception as e:
+            logger.warning(f"[Executor] SL/TP placement failed for {coin}: {e} — guardian will cover")
 
     async def _get_mid_price(self, coin: str) -> float | None:
         if not self._info:
