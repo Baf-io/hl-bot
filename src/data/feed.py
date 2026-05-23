@@ -1,35 +1,33 @@
 """
-WebSocket feed — connects to Hyperliquid and routes messages
-to registered handlers. Single connection, multiple subscribers.
+WebSocket feed + REST polling for funding data.
 """
 import asyncio
-import json
+import aiohttp
 from loguru import logger
 from hyperliquid.websocket_manager import WebsocketManager
 from config import settings
 
+HL_REST = (
+    "https://api.hyperliquid-testnet.xyz/info"
+    if settings.HL_TESTNET
+    else "https://api.hyperliquid.xyz/info"
+)
+
+WATCHED_COINS = [
+    "BTC", "ETH", "SOL", "HYPE", "WIF", "BONK", "ARB", "OP", "PURR"
+]
+
 
 class HyperliquidFeed:
-    """
-    Wraps the HL WebSocket. Handlers register for specific channels.
-
-    Usage:
-        feed = HyperliquidFeed()
-        feed.subscribe("allMids", my_handler)
-        await feed.run()
-    """
-
     def __init__(self):
         self._handlers: dict[str, list] = {}
         self._ws = None
 
     def subscribe(self, channel: str, handler):
-        """Register an async callback for a channel."""
         self._handlers.setdefault(channel, []).append(handler)
         logger.debug(f"Subscribed {handler.__name__} to {channel}")
 
     async def run(self):
-        """Start the WebSocket — runs forever (use asyncio.create_task)."""
         base_url = (
             "https://api.hyperliquid-testnet.xyz"
             if settings.HL_TESTNET
@@ -37,31 +35,30 @@ class HyperliquidFeed:
         )
         logger.info(f"Connecting to HL feed ({'TESTNET' if settings.HL_TESTNET else 'MAINNET'})")
 
-        # hyperliquid-python-sdk's WebsocketManager handles reconnect
         self._ws = WebsocketManager(base_url)
         self._ws.start()
 
-        # Subscribe to channels we have handlers for
-        for channel in self._handlers:
+        # Subscribe WebSocket channels
+        for channel in list(self._handlers.keys()):
             self._subscribe_channel(channel)
 
-        # Keep alive — real message routing happens via callbacks
-        while True:
-            await asyncio.sleep(1)
+        # Run funding poller alongside WebSocket
+        await asyncio.gather(
+            self._poll_funding_forever(),
+            self._keepalive(),
+        )
 
     def _subscribe_channel(self, channel: str):
-        """Map channel name → SDK subscription call."""
         ws = self._ws
-
         if channel == "allMids":
             ws.subscribe({"type": "allMids"}, self._make_dispatcher(channel))
 
-        elif channel == "funding":
-            # Subscribe to funding updates for all coins
-            ws.subscribe({"type": "activeAssetCtx"}, self._make_dispatcher(channel))
-
-        elif channel == "trades":
-            ws.subscribe({"type": "trades", "coin": "BTC"}, self._make_dispatcher(channel))
+        elif channel == "orderbook":
+            for coin in ["BTC", "ETH", "SOL"]:
+                ws.subscribe(
+                    {"type": "l2Book", "coin": coin},
+                    self._make_dispatcher(channel),
+                )
 
         elif channel.startswith("userFills:"):
             address = channel.split(":")[1]
@@ -70,20 +67,70 @@ class HyperliquidFeed:
                 self._make_dispatcher(channel),
             )
 
-        elif channel == "orderbook":
-            # Subscribe to L2 book for major coins
-            for coin in ["BTC", "ETH", "SOL"]:
-                ws.subscribe(
-                    {"type": "l2Book", "coin": coin},
-                    self._make_dispatcher(channel),
-                )
+        # "funding" channel handled via REST polling — not WebSocket
 
     def _make_dispatcher(self, channel: str):
-        """Returns a callback that fans out to all handlers for this channel."""
-        handlers = self._handlers[channel]
+        handlers = self._handlers.get(channel, [])
 
         def dispatch(msg):
             for handler in handlers:
                 asyncio.create_task(handler(msg))
 
         return dispatch
+
+    async def _poll_funding_forever(self):
+        """
+        Poll funding + OI via REST every 15s.
+        More reliable than WebSocket for this data.
+        """
+        while True:
+            try:
+                await self._fetch_and_dispatch_funding()
+            except Exception as e:
+                logger.warning(f"[Feed] Funding poll error: {e}")
+            await asyncio.sleep(15)
+
+    async def _fetch_and_dispatch_funding(self):
+        handlers = self._handlers.get("funding", [])
+        if not handlers:
+            return
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                HL_REST,
+                json={"type": "metaAndAssetCtxs"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json(content_type=None)
+
+        # data = [meta, assetCtxs]
+        if not isinstance(data, list) or len(data) < 2:
+            return
+
+        meta      = data[0]
+        asset_ctxs = data[1]
+        universe  = meta.get("universe", [])
+
+        for i, ctx in enumerate(asset_ctxs):
+            if i >= len(universe):
+                break
+            coin = universe[i].get("name", "")
+            if not coin:
+                continue
+
+            msg = {
+                "data": [{
+                    "coin":          coin,
+                    "funding":       ctx.get("funding", "0"),
+                    "openInterest":  ctx.get("openInterest", "0"),
+                    "markPx":        ctx.get("markPx", "0"),
+                    "oraclePx":      ctx.get("oraclePx", "0"),
+                }]
+            }
+            for handler in handlers:
+                asyncio.create_task(handler(msg))
+
+    async def _keepalive(self):
+        """Prevent WebSocket timeout."""
+        while True:
+            await asyncio.sleep(30)
