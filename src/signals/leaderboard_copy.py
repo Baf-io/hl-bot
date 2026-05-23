@@ -184,33 +184,51 @@ class LeaderboardCopier:
         Instead we hardcode known profitable trader addresses from the public leaderboard UI.
         Update this list periodically by checking app.hyperliquid.xyz/leaderboard manually.
         """
-        # Curated from beacontrade.io/leaderboard — verified active accounts only
-        # Updated: 2026-05-24
+        # Curated from beacontrade.io/leaderboard — all active accounts with positive PnL
+        # Updated: 2026-05-24 | Source: beacontrade.io/leaderboard
         # Format: (address, est_pnl_usd, win_rate, max_dd, avg_lev, trade_count, age_days)
         KNOWN_TRADERS = [
-            # ── Tier 1: Whales — massive accounts, very active, proven PnL ────────
-            # Rank 1  | $114M account | 183 open positions
-            ("0x31ca8395cf837de08b24da3f660e77761dfb974b", 2_000_000, 0.62, 0.15, 8, 5000, 180),
-            # Rank 3  | $25M account  | 87 positions | +$762K unrealized
-            ("0xecb63caa47c7c4e77f60f1ce858cf28dc2b82b00", 1_500_000, 0.63, 0.18, 8, 3000, 90),
-            # Rank 4  | $22M account  | +$9M unrealized PnL — best ratio on board
-            ("0x7fdafde5cfb5465924316eced2d3715494c517d1", 1_000_000, 0.65, 0.12, 7, 2000, 120),
-            # ── Tier 2: Active mid-size — high trade frequency ────────────────────
-            # Rank 7  | $11M account  | 76 positions | +$716K
-            ("0x023a3d058020fb76cca98f01b3c48c8938a22355", 800_000, 0.61, 0.20, 10, 2500, 90),
-            # Rank 8  | $11M account  | 150 positions — highest frequency mid-tier
-            ("0x57dd78cd36e76e2011e8f6dc25cabbaba994494b", 600_000, 0.60, 0.22, 9,  4000, 80),
-            # Rank 10 | $4M account   | 176 positions | +$251K — extremely active
-            ("0x7717a7a245d9f950e586822b8c9b46863ed7bd7e", 400_000, 0.61, 0.20, 8,  3500, 75),
+            # ── Tier 1: Mega whales — $10M+ accounts, extremely active ───────────
+            # Rank 1  | $114M | 183 positions | +$3.6K
+            ("0x31ca8395cf837de08b24da3f660e77761dfb974b", 2_000_000, 0.62, 0.15, 8,  5000, 180),
+            # Rank 3  | $25M  | 87 positions  | +$762K
+            ("0xecb63caa47c7c4e77f60f1ce858cf28dc2b82b00", 1_500_000, 0.63, 0.18, 8,  3000, 90),
+            # Rank 4  | $22M  | 28 positions  | +$9M unrealized — best PnL on board
+            ("0x7fdafde5cfb5465924316eced2d3715494c517d1", 1_000_000, 0.65, 0.12, 7,  2000, 120),
+            # Rank 5  | $20M  | 6 positions   | +$91.9K
+            ("0xfc667adba8d4837586078f4fdcdc29804337ca06", 900_000,   0.62, 0.16, 8,  2000, 100),
+            # Rank 6  | $13M  | 6 positions   | +$493K
+            ("0x31dea2516beee92135b96f464eeec3cf292a13f2", 700_000,   0.63, 0.17, 9,  1800, 90),
+            # Rank 7  | $11M  | 76 positions  | +$716K
+            ("0x023a3d058020fb76cca98f01b3c48c8938a22355", 800_000,   0.61, 0.20, 10, 2500, 90),
+            # Rank 8  | $11M  | 150 positions | +$41K — highest frequency
+            ("0x57dd78cd36e76e2011e8f6dc25cabbaba994494b", 600_000,   0.60, 0.22, 9,  4000, 80),
+            # ── Tier 2: $1M–$10M accounts, active and profitable ─────────────────
+            # Rank 10 | $4M   | 176 positions | +$251K — extremely active
+            ("0x7717a7a245d9f950e586822b8c9b46863ed7bd7e", 400_000,   0.61, 0.20, 8,  3500, 75),
+            # Rank 11 | $4M   | 1 position    | +$397.8K — high conviction
+            ("0x9e8b1e51c642f4c8b87c6ba11c53d516a218afc4", 400_000,   0.64, 0.15, 7,  1500, 80),
+            # Rank 13 | $2.6M | 4 positions   | +$75.2K
+            ("0x61ceef212ff4a86933c69fb6aca2fe35d8f2a62b", 300_000,   0.61, 0.19, 8,  1600, 70),
+            # Rank 15 | $2M   | 102 positions | +$72.6K — very active
+            ("0x7c930969fcf3e5a5c78bcf2e1cefda3f53e3c8fd", 250_000,   0.60, 0.22, 10, 1800, 65),
+            # Rank 18 | $1.2M | 2 positions   | +$65.3K
+            ("0xa6ee1ed1ae80b8352603654b39f5e7b9bedd5078", 200_000,   0.61, 0.20, 9,  1200, 60),
             # ── Tier 3: High ROI relative to account size ─────────────────────────
-            # Rank 20 | $827K account | +$1.12M unrealized — insane ROI ratio
-            ("0xf517639a8872e756ac98d3c65507d2ebc25cc032", 300_000, 0.64, 0.18, 12, 1500, 60),
-            # Rank 24 | $430K account | 83 positions | +$852K — best ROI on board
-            ("0xc926ddba8b7617dbc65712f20cf8e1b58b8598d3", 500_000, 0.62, 0.19, 8,  2000, 70),
-            # Rank 15 | $2M account   | 102 positions | active and consistent
-            ("0x7c930969fcf3e5a5c78bcf2e1cefda3f53e3c8fd", 250_000, 0.60, 0.22, 10, 1800, 65),
-            # Rank 21 | $607K account | from your original list — verified active
-            ("0x7839e2f2c375dd2935193f2736167514efff9916", 200_000, 0.60, 0.22, 10, 1500, 75),
+            # Rank 20 | $827K | 9 positions   | +$1.12M — insane ROI ratio
+            ("0xf517639a8872e756ac98d3c65507d2ebc25cc032", 300_000,   0.64, 0.18, 12, 1500, 60),
+            # Rank 21 | $607K | 1 position    | +$3.5K
+            ("0x7839e2f2c375dd2935193f2736167514efff9916", 200_000,   0.60, 0.22, 10, 1500, 75),
+            # Rank 23 | $451K | 1 position    | +$94.4K
+            ("0xcab59c7a92b8f7c4d5cde72bb7669ee7d75b6e6e", 150_000,   0.61, 0.21, 9,  1000, 50),
+            # Rank 24 | $430K | 83 positions  | +$852K — best ROI ratio mid-tier
+            ("0xc926ddba8b7617dbc65712f20cf8e1b58b8598d3", 500_000,   0.62, 0.19, 8,  2000, 70),
+            # Rank 26 | $182K | 2 positions   | +$14K
+            ("0x535e34b5ada64997afc88444271ae9b3f82b3867", 80_000,    0.59, 0.25, 10, 600,  35),
+            # Rank 29 | $110K | 5 positions   | +$905
+            ("0x1c1c270b573d55b68b3d14722b5d5d401511bed0", 60_000,    0.58, 0.26, 9,  500,  30),
+            # Rank 31 | $67K  | 10 positions  | +$20.8K — active small account
+            ("0x53babe76166eae33c861aeddf9ce89af20311cd0", 50_000,    0.58, 0.27, 11, 400,  25),
         ]
 
         if not KNOWN_TRADERS:
