@@ -157,14 +157,15 @@ class LeaderboardCopier:
                         ))
                     continue
 
-                # Dedup: skip if we already have this coin+direction open
-                dedup_key = f"{coin}:{direction}"
+                # Dedup: skip if we already have ANY position in this coin
+                # (prevents long+short same coin from two different traders)
+                dedup_key = f"{coin}"
                 if dedup_key in self._recent_signals:
-                    logger.debug(f"[Leaderboard] Dedup skip {dedup_key}")
+                    logger.debug(f"[Leaderboard] Dedup skip {coin} (already in play)")
                     continue
                 self._recent_signals.add(dedup_key)
-                # Clear dedup after 10s to allow re-entry
-                asyncio.get_event_loop().call_later(10, self._recent_signals.discard, dedup_key)
+                # Clear dedup after 30s to allow re-entry
+                asyncio.get_event_loop().call_later(30, self._recent_signals.discard, dedup_key)
 
                 # Let risk manager size it — pass 0 so it uses max_size * confidence
                 # Their notional is logged for reference only
@@ -179,8 +180,8 @@ class LeaderboardCopier:
                     strategy="leaderboard",
                     coin=coin,
                     direction=direction,
-                    size_usd=0,          # 0 = let risk manager size it (~$18 at 7%)
-                    confidence=trader.score,
+                    size_usd=0,          # 0 = let risk manager size it at full max_size
+                    confidence=1.0,      # trust all filtered traders fully — score used for ranking only
                     meta={
                         "source": address,
                         "lag_ms": lag_ms,

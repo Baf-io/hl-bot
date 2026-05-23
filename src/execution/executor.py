@@ -49,6 +49,44 @@ class Executor:
             f"Executor initialised | wallet={settings.HL_WALLET_ADDRESS[:10]}… "
             f"({'TESTNET' if settings.HL_TESTNET else 'MAINNET'})"
         )
+        # Sync open positions from HL so risk manager is accurate after restarts
+        self._sync_positions_from_hl()
+
+    def _sync_positions_from_hl(self):
+        """
+        On startup: fetch real open positions from Hyperliquid and populate
+        the risk manager. Prevents opening duplicate positions after bot restarts.
+        """
+        try:
+            state = self._info.user_state(settings.HL_WALLET_ADDRESS)
+            positions = state.get("assetPositions", [])
+            count = 0
+            for p in positions:
+                pos = p.get("position", {})
+                szi = float(pos.get("szi", 0))
+                if szi == 0:
+                    continue
+                coin      = pos.get("coin", "")
+                direction = "long" if szi > 0 else "short"
+                entry_px  = float(pos.get("entryPx") or 0)
+                size_usd  = abs(szi) * entry_px
+
+                from data.store import TradeSignal
+                fake_signal = TradeSignal(
+                    strategy="leaderboard",   # assume leaderboard — conservative
+                    coin=coin, direction=direction,
+                    size_usd=size_usd, confidence=1.0, meta={"action": "enter"},
+                )
+                self.risk.register_fill(fake_signal, size_usd, entry_px)
+                count += 1
+                logger.info(f"[Executor] Synced existing position: {direction} {coin} ${size_usd:,.0f}")
+
+            if count == 0:
+                logger.info("[Executor] No existing HL positions — clean start")
+            else:
+                logger.warning(f"[Executor] Synced {count} existing positions from HL — slots pre-filled")
+        except Exception as e:
+            logger.warning(f"[Executor] Position sync failed: {e} — starting fresh")
 
     async def enqueue(self, signal: TradeSignal):
         """Signal engines push here; executor processes sequentially."""
