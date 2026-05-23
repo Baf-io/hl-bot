@@ -1,0 +1,29 @@
+# Secrets — NEVER commit
+.env
+*.env
+config/secrets.py
+private_key.txt
+wallet.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Data / logs / DB
+data/
+logs/
+*.db
+*.sqlite
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
