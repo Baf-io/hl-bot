@@ -34,6 +34,11 @@ class Executor:
         )
         self._exchange = Exchange(wallet, base_url)
         self._info = Info(base_url, skip_ws=True)
+        # Pre-warm: load coin metadata so first trade has no cold-start delay
+        try:
+            self._meta = self._info.meta()
+        except Exception:
+            self._meta = {}
         logger.info(
             f"Executor initialised | wallet={settings.HL_WALLET_ADDRESS[:10]}… "
             f"({'TESTNET' if settings.HL_TESTNET else 'MAINNET'})"
@@ -129,7 +134,8 @@ class Executor:
             logger.error("Exchange not initialised — call init_client() first")
             return None
         try:
-            result = self._exchange.market_open(coin, is_buy, size)
+            # slippage=0.001 = 0.1% max slippage, fast IOC fill
+            result = self._exchange.market_open(coin, is_buy, size, slippage=0.001)
             return result
         except Exception as e:
             logger.error(f"[Executor] market_open failed: {e}")
