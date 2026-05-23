@@ -11,12 +11,26 @@ HL_WALLET_ADDRESS   = os.getenv("HL_WALLET_ADDRESS", "")
 HL_PRIVATE_KEY      = os.getenv("HL_PRIVATE_KEY", "")
 HL_TESTNET          = os.getenv("HL_TESTNET", "true").lower() == "true"
 
-# ── Risk limits ── SCALED FOR $260 + HIGH SIGNAL VOLUME ──────────────────────
-MAX_OPEN_POSITIONS      = 15            # enough slots for copy trading volume
-MAX_POSITION_SIZE_PCT   = 0.07          # 7% per position (~$18 on $260)
-DAILY_LOSS_HALT_PCT     = 0.20          # halt at -20% ($52 on $260)
+# ── Risk limits ── SCALED FOR $1000 PORTFOLIO ────────────────────────────────
+MAX_OPEN_POSITIONS      = 15            # global ceiling across all strategies
+MAX_POSITION_SIZE_PCT   = 0.05          # 5% per position (~$50 on $1000)
+DAILY_LOSS_HALT_PCT     = 0.10          # halt at -10% ($100 on $1000)
 MAX_LEVERAGE            = 20            # allow higher leverage for leaderboard copies
 PORTFOLIO_DELTA_MAX     = 0.90          # allow high directional exposure
+
+# ── Per-strategy slot caps (slots × $50 = capital reserved per strategy) ─────
+# leaderboard:  7 slots × $50 = $350 max deployed (copy trades)
+# funding:      1 slot  × $50 = $50  (one carry at a time)
+# cascade:      3 slots × $50 = $150 (momentum/squeeze)
+# arb:          3 slots × $50 = $150 (future stat-arb)
+# remaining:    global MAX_OPEN_POSITIONS = 15 safety ceiling
+STRATEGY_MAX_POSITIONS = {
+    "leaderboard": 7,
+    "funding":     1,
+    "cascade":     3,
+    "squeeze":     3,
+    "arb":         3,
+}
 
 # ── Strategy toggles ──────────────────────────────────────────────────────────
 STRATEGY_FUNDING_CARRY    = os.getenv("STRATEGY_FUNDING_CARRY", "true").lower() == "true"

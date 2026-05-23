@@ -71,9 +71,15 @@ class RiskManager:
         if signal.meta.get("action") == "exit":
             return True, "exit approved", signal.size_usd
 
-        # ── Rule 1: max positions ──────────────────────────────────────────────
+        # ── Rule 1: max positions (global + per-strategy) ─────────────────────
         if len(self.open_positions) >= settings.MAX_OPEN_POSITIONS:
             return False, f"max positions ({settings.MAX_OPEN_POSITIONS}) reached", 0
+
+        strategy_cap = settings.STRATEGY_MAX_POSITIONS.get(signal.strategy)
+        if strategy_cap is not None:
+            strategy_count = sum(1 for p in self.open_positions if p.strategy == signal.strategy)
+            if strategy_count >= strategy_cap:
+                return False, f"{signal.strategy} at cap ({strategy_cap} slots)", 0
 
         # ── Rule 2: max per-position size ─────────────────────────────────────
         max_size = self.portfolio_value * settings.MAX_POSITION_SIZE_PCT
