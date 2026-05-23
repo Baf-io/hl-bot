@@ -184,7 +184,7 @@ class LeaderboardCopier:
                 # HL leaderboard endpoint
                 async with session.post(
                     HL_REST,
-                    json={"type": "leaderboard", "window": "allTime"},
+                    json={"type": "leaderboard"},
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.status != 200:
