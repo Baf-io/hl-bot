@@ -132,24 +132,22 @@ class Executor:
         size_coin = round(size_usd / mid, 6)
         is_buy = direction == "long"
 
-        # Use limit order at slight offset for maker rebates when urgency is low
-        # Use market order for cascade (time-sensitive)
-        if signal.strategy == "cascade":
-            result = await self._place_market(coin, is_buy, size_coin)
-        else:
-            result = await self._place_limit(coin, is_buy, size_coin, mid)
+        # All strategies use market orders — latency matters, maker rebate is tiny vs missed entry
+        result = await self._place_market(coin, is_buy, size_coin)
 
-        if result and result.get("status") == "ok":
-            position_id = self.risk.register_fill(signal, size_usd, mid)
+        filled, fill_px, err = self._parse_fill(result)
+        if filled:
+            actual_px = fill_px or mid
+            position_id = self.risk.register_fill(signal, size_usd, actual_px)
             logger.success(
-                f"[Executor] FILLED {direction.upper()} {size_coin} {coin} @ ${mid:,.2f} "
+                f"[Executor] FILLED {direction.upper()} {size_coin} {coin} @ ${actual_px:,.4f} "
                 f"(${size_usd:,.0f}) pos#{position_id} [{signal.strategy}]"
             )
-            await self.risk.store.log_trade(signal.strategy, coin, direction, size_usd, mid)
-            # Place native SL/TP on HL — these survive bot crashes
-            await self._place_native_sltp(coin, is_buy, size_coin, mid)
+            await self.risk.store.log_trade(signal.strategy, coin, direction, size_usd, actual_px)
+            # Place native SL/TP on HL — survive bot crashes
+            await self._place_native_sltp(coin, is_buy, size_coin, actual_px)
         else:
-            logger.error(f"[Executor] Order failed: {result}")
+            logger.warning(f"[Executor] Order not filled for {coin}: {err}")
 
     async def _close_position(self, signal: TradeSignal):
         # Find matching open position
@@ -201,6 +199,32 @@ class Executor:
         except Exception as e:
             logger.error(f"[Executor] limit order failed: {e}")
             return None
+
+    @staticmethod
+    def _parse_fill(result: dict) -> tuple[bool, float | None, str]:
+        """
+        Parse the HL SDK response properly.
+        Returns (filled, avg_price, error_msg).
+        SDK always returns {"status":"ok"} even on errors — must check inside.
+        """
+        if not result:
+            return False, None, "no result"
+        if result.get("status") != "ok":
+            return False, None, str(result)
+        try:
+            statuses = result["response"]["data"]["statuses"]
+            s = statuses[0]
+            if "filled" in s:
+                px = float(s["filled"].get("avgPx", 0)) or None
+                return True, px, ""
+            if "resting" in s:
+                # Limit order sitting — treat as not filled yet
+                return False, None, "order resting (limit not filled)"
+            if "error" in s:
+                return False, None, s["error"]
+        except (KeyError, IndexError, TypeError) as e:
+            return False, None, f"parse error: {e}"
+        return False, None, f"unknown status: {result}"
 
     async def _place_native_sltp(self, coin: str, is_buy: bool, size: float, entry_px: float):
         """
