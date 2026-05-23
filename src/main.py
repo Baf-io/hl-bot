@@ -154,9 +154,11 @@ async def main():
         logger.info("Strategy CASCADE enabled")
 
     # ── Position guardian — max hold, stop loss, take profit ─────────────────
-    MAX_HOLD_HOURS  = 4.0    # force close after 4h
-    STOP_LOSS_PCT   = 0.05   # close at -5%
-    TAKE_PROFIT_PCT = 0.04   # close at +4%
+    # Primary exit = copy trader's close (mirrored in leaderboard_copy.py)
+    # These are SAFETY NETS only — should rarely trigger
+    MAX_HOLD_HOURS  = 2.0    # force close after 2h (high frequency)
+    STOP_LOSS_PCT   = 0.03   # safety net: close at -3% (tight, cut bad copies fast)
+    TAKE_PROFIT_PCT = 0.08   # let winners run to +8% (trader usually exits before this)
 
     async def position_guardian():
         from datetime import datetime, timedelta
