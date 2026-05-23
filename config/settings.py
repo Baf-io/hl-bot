@@ -11,12 +11,12 @@ HL_WALLET_ADDRESS   = os.getenv("HL_WALLET_ADDRESS", "")
 HL_PRIVATE_KEY      = os.getenv("HL_PRIVATE_KEY", "")
 HL_TESTNET          = os.getenv("HL_TESTNET", "true").lower() == "true"
 
-# ── Risk limits ── AGGRESSIVE MODE (tuned for $100 fast trading) ──────────────
-MAX_OPEN_POSITIONS      = 3             # concentrate — fewer, bigger bets
-MAX_POSITION_SIZE_PCT   = 0.25          # 25% per position ($25 on $100)
-DAILY_LOSS_HALT_PCT     = 0.20          # halt at -20% ($20 on $100)
+# ── Risk limits ── SCALED FOR $260 + HIGH SIGNAL VOLUME ──────────────────────
+MAX_OPEN_POSITIONS      = 15            # enough slots for copy trading volume
+MAX_POSITION_SIZE_PCT   = 0.07          # 7% per position (~$18 on $260)
+DAILY_LOSS_HALT_PCT     = 0.20          # halt at -20% ($52 on $260)
 MAX_LEVERAGE            = 20            # allow higher leverage for leaderboard copies
-PORTFOLIO_DELTA_MAX     = 0.75          # allow more directional exposure
+PORTFOLIO_DELTA_MAX     = 0.90          # allow high directional exposure
 
 # ── Strategy toggles ──────────────────────────────────────────────────────────
 STRATEGY_FUNDING_CARRY    = os.getenv("STRATEGY_FUNDING_CARRY", "true").lower() == "true"
