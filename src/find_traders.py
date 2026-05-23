@@ -1,156 +1,120 @@
 """
 Auto-discover top traders from Hyperliquid's stats API.
-Filters by PnL, win rate, trade frequency, and recency.
+Schema: windowPerformances = [["day",{pnl,roi,vlm}], ["week",...], ["month",...], ["allTime",...]]
 
-Run on VPS: python src/find_traders.py
-Outputs ready-to-paste KNOWN_TRADERS list.
+Run: python src/find_traders.py
 """
-import asyncio
-import sys, os
+import asyncio, sys, json
 import pathlib as _pl
 sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 sys.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent))
-
 import aiohttp
-from datetime import datetime, timezone
 
 STATS_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
-HL_REST   = "https://api.hyperliquid.xyz/info"
 
-# ── Filter thresholds ──────────────────────────────────────────────────────────
-MIN_PNL_USD        = 50_000      # minimum all-time realized PnL
-MIN_WIN_RATE       = 0.50        # minimum win rate
-MIN_TRADE_COUNT    = 100         # minimum trades ever
-MAX_LAST_TRADE_H   = 48          # must have traded within 48 hours
-TOP_N              = 50          # how many to return
-
-
-async def fetch_leaderboard() -> list[dict]:
-    print("Fetching leaderboard from stats-data.hyperliquid.xyz …")
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            STATS_URL,
-            timeout=aiohttp.ClientTimeout(total=60),
-        ) as resp:
-            if resp.status != 200:
-                print(f"HTTP {resp.status} — trying fallback")
-                return []
-            data = await resp.json(content_type=None)
-            print(f"Got {len(data)} traders from API")
-            return data if isinstance(data, list) else data.get("leaderboardRows", [])
+# ── Filters ────────────────────────────────────────────────────────────────────
+MIN_ALLTIME_PNL   = 100_000     # $100k+ all-time PnL
+MIN_WEEK_PNL      =       0     # profitable this week
+MIN_DAY_VLM       =  10_000     # traded at least $10k today (active right now)
+MIN_ALLTIME_VLM   = 500_000     # serious trader, not one-off
+TOP_N             =      75     # return top 75
 
 
-async def get_last_trade_hours(session, address: str) -> float:
-    """Returns hours since last trade, or 9999 if no fills."""
-    try:
-        async with session.post(
-            HL_REST,
-            json={"type": "userFills", "user": address},
-            timeout=aiohttp.ClientTimeout(total=8),
-        ) as resp:
-            fills = await resp.json(content_type=None)
-        if not fills:
-            return 9999
-        last_ts = fills[-1]["time"] / 1000
-        age_h = (datetime.now(timezone.utc).timestamp() - last_ts) / 3600
-        return age_h
-    except Exception:
-        return 9999
+def parse_windows(perfs: list) -> dict:
+    """Extract stats per window into a flat dict."""
+    out = {}
+    for item in perfs:
+        if isinstance(item, list) and len(item) == 2:
+            window, stats = item
+            out[window] = {
+                "pnl": float(stats.get("pnl", 0)),
+                "roi": float(stats.get("roi", 0)),
+                "vlm": float(stats.get("vlm", 0)),
+            }
+    return out
 
 
 async def main():
-    raw = await fetch_leaderboard()
-    if not raw:
-        print("No data returned. Trying alternative parse…")
-        return
+    print("Fetching leaderboard from stats-data.hyperliquid.xyz …")
+    async with aiohttp.ClientSession() as s:
+        async with s.get(STATS_URL, timeout=aiohttp.ClientTimeout(total=60)) as r:
+            data = await r.json(content_type=None)
 
-    # ── Parse each entry ───────────────────────────────────────────────────────
+    rows = data.get("leaderboardRows", []) if isinstance(data, dict) else data
+    print(f"Total rows in API: {len(rows):,}")
+
+    # ── Parse ──────────────────────────────────────────────────────────────────
     parsed = []
-    for entry in raw:
-        try:
-            # Handle different schema versions
-            perfs = entry.get("windowPerformances", [])
-            stats = {}
-            for item in perfs:
-                if isinstance(item, list) and len(item) >= 2:
-                    if item[0] == "allTime":
-                        stats = item[1]
-                        break
-            if not stats and perfs:
-                stats = perfs[-1][1] if isinstance(perfs[-1], list) else {}
-
-            pnl    = float(stats.get("pnl", entry.get("pnl", 0)))
-            wr     = float(stats.get("winRate", entry.get("winRate", 0)))
-            trades = int(stats.get("tradeCount", entry.get("tradeCount", 0)))
-            addr   = entry.get("ethAddress", entry.get("user", ""))
-
-            if not addr or len(addr) != 42:
-                continue
-
-            parsed.append({
-                "address": addr,
-                "pnl": pnl,
-                "win_rate": wr,
-                "trade_count": trades,
-            })
-        except Exception:
+    for entry in rows:
+        addr = entry.get("ethAddress", "")
+        if not addr or len(addr) != 42:
             continue
 
-    print(f"Parsed {len(parsed)} valid entries")
+        w = parse_windows(entry.get("windowPerformances", []))
+        alltime = w.get("allTime", {})
+        week    = w.get("week",    {})
+        month   = w.get("month",   {})
+        day     = w.get("day",     {})
 
-    # ── Apply filters ──────────────────────────────────────────────────────────
+        parsed.append({
+            "address":      addr,
+            "display":      entry.get("displayName") or addr[:10] + "…",
+            "account_val":  float(entry.get("accountValue", 0)),
+            "alltime_pnl":  alltime.get("pnl", 0),
+            "alltime_roi":  alltime.get("roi", 0),
+            "alltime_vlm":  alltime.get("vlm", 0),
+            "month_pnl":    month.get("pnl", 0),
+            "month_vlm":    month.get("vlm", 0),
+            "week_pnl":     week.get("pnl", 0),
+            "week_vlm":     week.get("vlm", 0),
+            "day_pnl":      day.get("pnl", 0),
+            "day_vlm":      day.get("vlm", 0),
+        })
+
+    print(f"Parsed: {len(parsed):,} valid addresses")
+
+    # ── Filter ─────────────────────────────────────────────────────────────────
     filtered = [
         t for t in parsed
-        if t["pnl"]         >= MIN_PNL_USD
-        and t["win_rate"]   >= MIN_WIN_RATE
-        and t["trade_count"] >= MIN_TRADE_COUNT
+        if t["alltime_pnl"] >= MIN_ALLTIME_PNL
+        and t["week_pnl"]   >= MIN_WEEK_PNL
+        and t["day_vlm"]    >= MIN_DAY_VLM
+        and t["alltime_vlm"] >= MIN_ALLTIME_VLM
     ]
-    print(f"After PnL/WR/trades filter: {len(filtered)} traders")
+    print(f"After filter (alltime PnL>${MIN_ALLTIME_PNL:,} + active today): {len(filtered):,}")
 
-    # Sort by PnL descending
-    filtered.sort(key=lambda t: t["pnl"], reverse=True)
-    candidates = filtered[:200]  # check top 200 for recency
+    # Sort by all-time PnL
+    filtered.sort(key=lambda t: t["alltime_pnl"], reverse=True)
+    top = filtered[:TOP_N]
 
-    # ── Check last trade time (parallel) ──────────────────────────────────────
-    print(f"Checking last trade time for {len(candidates)} traders …")
-    async with aiohttp.ClientSession() as session:
-        tasks = [get_last_trade_hours(session, t["address"]) for t in candidates]
-        ages  = await asyncio.gather(*tasks)
+    # ── Print summary ──────────────────────────────────────────────────────────
+    print(f"\n{'='*80}")
+    print(f"TOP {len(top)} ACTIVE PROFITABLE TRADERS")
+    print(f"{'='*80}")
+    print(f"{'#':<4} {'Address':<14} {'AllTime PnL':>14} {'Week PnL':>12} {'Day VLM':>12} {'AllTime ROI':>12}")
+    print("-"*80)
+    for i, t in enumerate(top, 1):
+        print(
+            f"{i:<4} {t['address'][:12]}… "
+            f"${t['alltime_pnl']:>13,.0f} "
+            f"${t['week_pnl']:>11,.0f} "
+            f"${t['day_vlm']:>11,.0f} "
+            f"{t['alltime_roi']:>11.1%}"
+        )
 
-    results = []
-    for trader, age_h in zip(candidates, ages):
-        trader["last_trade_h"] = age_h
-        if age_h <= MAX_LAST_TRADE_H:
-            results.append(trader)
-
-    results.sort(key=lambda t: t["pnl"], reverse=True)
-    top = results[:TOP_N]
-
-    # ── Output ─────────────────────────────────────────────────────────────────
-    print(f"\n{'='*70}")
-    print(f"TOP {len(top)} ACTIVE TRADERS (last {MAX_LAST_TRADE_H}h, PnL > ${MIN_PNL_USD:,})")
-    print(f"{'='*70}\n")
-
-    print("# Paste this into src/signals/leaderboard_copy.py KNOWN_TRADERS list:")
+    # ── Ready-to-paste output ──────────────────────────────────────────────────
+    print(f"\n{'='*80}")
+    print("# PASTE INTO src/signals/leaderboard_copy.py:")
     print("KNOWN_TRADERS = [")
     for t in top:
-        icon = "🔥" if t["last_trade_h"] < 1 else "✅" if t["last_trade_h"] < 6 else "⏰"
-        print(
-            f'    # {icon} PnL=${t["pnl"]:>12,.0f} | WR={t["win_rate"]:.0%} '
-            f'| trades={t["trade_count"]:>5} | last={t["last_trade_h"]:.1f}h ago'
-        )
         print(
             f'    ("{t["address"]}", '
-            f'{int(t["pnl"])}, '
-            f'{t["win_rate"]:.2f}, '
-            f'0.20, 10, '
-            f'{t["trade_count"]}, 60),'
+            f'{int(t["alltime_pnl"])}, '
+            f'0.60, 0.20, 10, 500, 60),  '
+            f'# AllTime=${t["alltime_pnl"]:,.0f} | Week=${t["week_pnl"]:,.0f} | DayVlm=${t["day_vlm"]:,.0f}'
         )
     print("]")
-
-    print(f"\n{'='*70}")
-    print(f"Total qualifying traders found: {len(results)}")
-    print(f"Showing top {len(top)} by all-time PnL")
+    print(f"\nTotal traders found passing filter: {len(filtered)}")
 
 
 if __name__ == "__main__":
