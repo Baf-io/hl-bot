@@ -17,8 +17,8 @@ dist/
 build/
 
 # Data / logs / DB
-data/
-logs/
+/data/
+/logs/
 *.db
 *.sqlite
 *.log

@@ -15,8 +15,9 @@ import asyncio
 import sys
 import os
 
-# Add src/ to path
-sys.path.insert(0, os.path.dirname(__file__))
+# Add src/ and project root to path
+sys.path.insert(0, os.path.dirname(__file__))                        # src/
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))       # project root (for config/)
 
 from loguru import logger
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
