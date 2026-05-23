@@ -39,6 +39,7 @@ class LeaderboardCopier:
         self.feed = feed
         self._tracked: dict[str, TrackedTrader] = {}
         self._signal_queue: Optional[asyncio.Queue] = None
+        self._recent_signals: set = set()   # dedup cache
 
     # ── Leaderboard polling ────────────────────────────────────────────────────
 
@@ -127,6 +128,11 @@ class LeaderboardCopier:
                 px        = float(fill.get("px", 0))
                 closed_pnl = float(fill.get("closedPnl", 0))
 
+                # Skip xyz: tokenized stocks/commodities — can't price them yet
+                if coin.startswith("xyz:") or coin.startswith("@"):
+                    logger.debug(f"[Leaderboard] Skipping RWA asset {coin}")
+                    continue
+
                 # Skip closing trades (closedPnl != 0 means they're exiting)
                 if closed_pnl != 0:
                     continue
@@ -139,28 +145,34 @@ class LeaderboardCopier:
                 else:
                     continue
 
-                our_size_usd = sz * px * settings.COPY_SIZE_SCALE
-
-                # Min trade size check
-                if our_size_usd < 1.0:
-                    logger.debug(f"[Leaderboard] Size too small ${our_size_usd:.2f} — skip")
+                # Dedup: skip if we already have this coin+direction open
+                dedup_key = f"{coin}:{direction}"
+                if dedup_key in self._recent_signals:
+                    logger.debug(f"[Leaderboard] Dedup skip {dedup_key}")
                     continue
+                self._recent_signals.add(dedup_key)
+                # Clear dedup after 10s to allow re-entry
+                asyncio.get_event_loop().call_later(10, self._recent_signals.discard, dedup_key)
+
+                # Let risk manager size it — pass 0 so it uses max_size * confidence
+                # Their notional is logged for reference only
+                their_notional = sz * px
 
                 logger.info(
                     f"[Leaderboard] 🔥 COPY {direction.upper()} {coin} "
-                    f"${our_size_usd:.2f} | lag={lag_ms:.0f}ms | from {address[:10]}…"
+                    f"(their ${their_notional:,.0f}) | lag={lag_ms:.0f}ms | from {address[:10]}…"
                 )
 
                 signal = TradeSignal(
                     strategy="leaderboard",
                     coin=coin,
                     direction=direction,
-                    size_usd=our_size_usd,
+                    size_usd=0,          # 0 = let risk manager size it (~$18 at 7%)
                     confidence=trader.score,
                     meta={
                         "source": address,
                         "lag_ms": lag_ms,
-                        "their_size_usd": sz * px,
+                        "their_size_usd": their_notional,
                         "action": "enter",
                     },
                 )
