@@ -266,11 +266,29 @@ class Executor:
             )
             return
 
-        # market_close is reduce-only by nature and derives size + szDecimals from the
-        # live on-exchange position. This avoids the flip-into-a-new-position risk of an
-        # offsetting market_open (e.g. if a native SL/TP already trimmed the size) and
-        # never rejects on lot-size rounding.
-        result = await self._place_market_close(signal.coin)
+        # Partial close (scale-out): fraction in (0,1) trims that share of the position
+        # and leaves a runner. fraction>=1 (or absent) = full close.
+        fraction = float(signal.meta.get("fraction", 1.0))
+        partial  = 0.0 < fraction < 1.0
+
+        # market_close is reduce-only by nature and derives szDecimals from the live
+        # on-exchange position. For a partial we pass an explicit sz (the trimmed coin
+        # amount); for a full close we pass sz=None so the SDK closes the whole position.
+        # This avoids the flip-into-a-new-position risk of an offsetting market_open
+        # (e.g. if a native SL/TP already trimmed the size).
+        trim_sz = None
+        if partial:
+            mid = await self._get_mid_price(signal.coin) or pos.entry_price
+            sz_decimals = self._get_sz_decimals(signal.coin)
+            trim_sz = round((pos.size_usd * fraction) / mid, sz_decimals)
+            if trim_sz <= 0:
+                logger.warning(
+                    f"[Executor] {signal.coin} trim size rounds to 0 "
+                    f"(${pos.size_usd * fraction:,.0f} @ {mid}) — skipping trim"
+                )
+                return
+
+        result = await self._place_market_close(signal.coin, sz=trim_sz)
 
         # The SDK returns {"status":"ok"} even on rejects — must parse the inner status.
         # If the close didn't actually fill, LEAVE the position in the tracker so the
@@ -284,6 +302,17 @@ class Executor:
             return
 
         exit_px = fill_px or await self._get_mid_price(signal.coin) or pos.entry_price
+
+        if partial:
+            # Book the banked tranche; the runner stays open (and is marked scaled_out
+            # so reconcile's RESIZE won't re-buy it). No squeeze-guard close — still open.
+            self.risk.reduce_position(pos.id, fraction, exit_px)
+            logger.success(
+                f"[Executor] TRIMMED {fraction:.0%} {signal.coin} pos#{pos.id} "
+                f"@ ${exit_px:,.4f} ({signal.meta.get('reason', 'scaleout')})"
+            )
+            return
+
         self.risk.close_position(pos.id, exit_px)
         logger.success(f"[Executor] CLOSED {signal.coin} pos#{pos.id} @ ${exit_px:,.4f}")
         # Notify squeeze guard with the real exit reason (trader_closed / zombie / nuclear)
@@ -306,19 +335,20 @@ class Executor:
             logger.error(f"[Executor] market_open failed: {e}")
             return None
 
-    async def _place_market_close(self, coin: str) -> dict | None:
+    async def _place_market_close(self, coin: str, sz: float | None = None) -> dict | None:
         """
-        Close the full live position for `coin`. Reduce-only by nature — the SDK reads
-        the on-exchange size/side and submits an aggressive IOC reduce-only order, so it
-        can never flip into a new position and never mis-rounds the lot size.
-        Returns None if there is no open position for the coin.
+        Close the live position for `coin`. Reduce-only by nature — the SDK reads the
+        on-exchange size/side and submits an aggressive IOC reduce-only order, so it can
+        never flip into a new position and never mis-rounds the lot size.
+        `sz` closes only that many coins (partial scale-out); sz=None closes the full
+        position. Returns None if there is no open position for the coin.
         """
         if not self._exchange:
             logger.error("Exchange not initialised — call init_client() first")
             return None
         try:
             # slippage=0.01 (1%) — a close prioritises getting filled over price
-            return self._exchange.market_close(coin, slippage=0.01)
+            return self._exchange.market_close(coin, sz=sz, slippage=0.01)
         except Exception as e:
             logger.error(f"[Executor] market_close failed: {e}")
             return None

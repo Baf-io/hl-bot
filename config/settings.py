@@ -74,6 +74,27 @@ PORTFOLIO_COMPOUND = os.getenv("PORTFOLIO_COMPOUND", "true").lower() == "true"
 TRAIL_ENABLED  = os.getenv("TRAIL_ENABLED", "true").lower() == "true"
 TRAIL_ARM_PCT  = 0.08    # only start protecting once +8% in price (a real move)
 TRAIL_GIVEBACK = 0.30    # exit on a 30% retrace from the peak favorable excursion
+
+# ── Scale-out profit-taking on copy positions (supersedes the flat trail) ───────
+# Two tranches, VOLATILITY-NORMALIZED (daily-ATR) and LEVERAGE-AWARE:
+#   • TP1 banks SCALEOUT_TP1_FRACTION of the position when the favorable price
+#     excursion clears  max(MIN_ATR_MULT × dailyATR%,  TP1_MARGIN_RET / leverage).
+#       - the ATR term is a noise floor: a move must be real *for this coin's vol*
+#         (fixes the flat +8% that's ~3 ATRs on BTC but <1 ATR on a small-cap);
+#       - the TP1_MARGIN_RET/leverage term is where LEVERAGE enters: a 10x position
+#         reaches +15% return-on-margin at a smaller price move than a 2x one, so it
+#         banks sooner. We trigger on the LARGER of the two (never trim on noise).
+#   • The runner (the rest) rides an ATR trailing stop: exit on a
+#     RUNNER_TRAIL_ATR × dailyATR% retrace from peak — keeps us in the trader's
+#     macro thesis (the actual edge) instead of dumping 100% on a wiggle.
+# When enabled this REPLACES the flat TRAIL_* logic for copy positions.
+SCALEOUT_ENABLED        = os.getenv("SCALEOUT_ENABLED", "true").lower() == "true"
+SCALEOUT_TP1_FRACTION   = 0.50   # bank 50% at the first tranche
+SCALEOUT_TP1_MARGIN_RET = 0.15   # ...target +15% return on MARGIN (price move × leverage)
+SCALEOUT_MIN_ATR_MULT   = 0.8    # ...but never before price clears 0.8 × daily ATR (noise floor)
+SCALEOUT_RUNNER_TRAIL_ATR = 1.5  # runner exits on a 1.5 × daily-ATR retrace from its peak
+ATR_PERIOD              = 14     # daily candles used for the ATR estimate
+ATR_REFRESH_S           = 3600   # re-fetch a coin's ATR at most this often (it moves slowly)
 COPY_MIN_THEIR_NOTIONAL   = 100         # position-aware tracking handles dedup; $100 = anti-dust
 COPY_MAX_POSITIONS_PER_TRADER = 5       # allow up to 5 (a9b95f has 3, fc667 has 6)
 # Margin-based sizing cap: cap is on MARGIN (not notional).
@@ -85,9 +106,18 @@ COPY_MAX_COPY_LEVERAGE    = 10          # don't mirror leverage above 10x
 # Prevents high-leverage traders from creating slots worth only a few dollars.
 # e.g. a9b95f 20x ETH: our_notional=$165 passes $50 notional floor but our_margin=$8 — skip.
 # At 1% of $1120 = $11.20 minimum margin.  ZEC/PAXG at ~$17 margin still allowed.
-COPY_MIN_MARGIN_PCT       = 0.03        # 3% of portfolio (~$34 on $1120) — no dust; only
-                                        # meaningful-margin trades. Excludes e.g. fc667's PAXG
-                                        # (1.4% of their acct -> ~$15 margin for us).
+COPY_MIN_MARGIN_PCT       = 0.03        # (legacy proportional floor — unused by equal-weight model)
+
+# ── Equal-weight sizing (decoupled from the trader's account size) ──────────────
+# Old proportional model sized our position to THEIR margin-% of THEIR account, so a big
+# fund's genuine bet (small % of a $15M acct) sized to dust for us. New model:
+#   1. Only copy a coin if it's a real conviction bet FOR THE TRADER (their margin on it
+#      >= COPY_MIN_CONVICTION_PCT of their account). This ALSO gates who "votes" on a
+#      coin's direction, so tiny dabbles can't spuriously contest a coin.
+#   2. Equal-weight OUR capital to COPY_TARGET_DEPLOY across the chosen coins, capped at
+#      MAX_POSITION_SIZE_PCT each. Deploys fully regardless of the trader's account size.
+COPY_MIN_CONVICTION_PCT   = 0.03        # their position must be >=3% of their acct to copy/vote
+COPY_TARGET_DEPLOY        = 0.85        # deploy ~85% of our capital, equal-weight
 
 # Whitelist: if set, ONLY copy from these trader addresses (comma-separated).
 # Leave empty to copy from all qualified traders.

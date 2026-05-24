@@ -12,16 +12,16 @@
     "account_age_days": 100
   },
   {
-    "address": "0x42b6d907f36255d48f70db8b4a2684088a162634",
-    "label":        "42b6d9",
-    "note":         "ZEC specialist, $3M account — single-thesis concentrated short",
+    "address": "0x4f7634c03ec4e87e14725c84913ade523c6fad5a",
+    "label":        "4f7634 (ZEC)",
+    "note":         "ZEC specialist — $40.8M all-time PnL on a $307K acct, conservative 10x, ZEC+TON shorts. Upgrade over 42b6d9.",
     "specialty":    "ZEC",
-    "alltime_pnl":  500000,
+    "alltime_pnl":  40800000,
     "win_rate":     0.65,
-    "max_drawdown": 0.12,
+    "max_drawdown": 0.15,
     "avg_leverage": 10,
-    "trade_count":  300,
-    "account_age_days": 90
+    "trade_count":  500,
+    "account_age_days": 120
   },
   {
     "address": "0xa9b95f2a2e7ef219021efc5c04c32761b8553bbd",
@@ -36,16 +36,16 @@
     "account_age_days": 120
   },
   {
-    "address": "0x6bea81d7a0c5939a5ce5552e125ab57216cc597f",
-    "label":        "6bea81 (SOL)",
-    "note":         "SOL specialist — 80% SOL volume, 8/8wk profitable, SHORT bias, $201K acct. Also holds BTC+ETH (deduped).",
+    "address": "0xfeec88b13fc0be31695069f02bac18538a154e9c",
+    "label":        "feec88 (SOL)",
+    "note":         "SOL specialist — $10.5M all-time PnL on a $697K acct, conservative 10x cap, concentrated SOL short. Upgrade over 6bea81.",
     "specialty":    "SOL",
-    "alltime_pnl":  1600000,
+    "alltime_pnl":  10500000,
     "win_rate":     0.62,
     "max_drawdown": 0.20,
     "avg_leverage": 10,
     "trade_count":  1024,
-    "account_age_days": 60
+    "account_age_days": 90
   },
   {
     "address": "0xa4dedda59f2908b92ae192cfd494839373bcb3c4",

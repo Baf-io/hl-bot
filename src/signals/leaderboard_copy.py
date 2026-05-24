@@ -32,6 +32,7 @@ HOW (now):
 """
 import asyncio
 import os
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional
@@ -102,6 +103,10 @@ class LeaderboardCopier:
         # Coins we trail-exited → locked from re-entry until the trader's position resets.
         # coin -> the direction we were in when we trail-exited.
         self._trail_locked: dict[str, str] = {}
+
+        # Daily-ATR cache for scale-out levels: coin -> (atr_pct, monotonic_ts).
+        # atr_pct is ATR(ATR_PERIOD) over daily candles divided by last close (a fraction).
+        self._atr_cache: dict[str, tuple[float, float]] = {}
 
     # ── Leaderboard / trader-list loading ───────────────────────────────────────
 
@@ -219,71 +224,90 @@ class LeaderboardCopier:
             + min(1 / max(t.avg_leverage, 1), 1.0) * 0.2
         )
 
-    # ── Sizing helper (unchanged margin-based logic) ─────────────────────────────
+    # ── Sizing helpers ───────────────────────────────────────────────────────────
 
-    def _compute_size(
-        self,
-        address: str,
-        coin: str,
-        their_notional: float,
-        their_acct_val: float,
-        trader: "TrackedTrader",
-    ) -> tuple[float, float]:
-        """
-        Margin-based proportional sizing. Returns (our_notional_usd, their_leverage).
-        Returns (0.0, lev) to signal SKIP (notional or margin below floor).
-        """
-        if their_acct_val <= 0:
-            return 0.0, 1.0
-
-        their_lev = self._trader_position_leverages.get(
-            (address, coin),
-            min(float(trader.avg_leverage), settings.COPY_MAX_COPY_LEVERAGE),
-        )
-        their_lev = max(min(their_lev, settings.COPY_MAX_COPY_LEVERAGE), 1.0)
-
-        their_margin     = their_notional / their_lev
-        their_margin_pct = their_margin / their_acct_val
-
-        our_margin   = self._portfolio_usd * their_margin_pct
-        our_notional = our_margin * their_lev
-
-        from config import settings as _s
-        if our_notional < _s.MIN_POSITION_NOTIONAL:
-            return 0.0, their_lev   # notional too small — skip
-
-        min_margin = self._portfolio_usd * _s.COPY_MIN_MARGIN_PCT
-        if our_margin < min_margin:
-            return 0.0, their_lev   # margin too small — skip
-
-        return our_notional, their_lev
-
-    def _conviction(self, address: str, coin: str, notional: float, acct: float) -> float:
-        """Their committed margin as a fraction of their account — used to rank holders."""
-        if acct <= 0:
-            return 0.0
+    def _lev_for(self, address: str, coin: str) -> float:
+        """Capped per-position leverage: cached notional/marginUsed, else trader avg."""
         lev = self._trader_position_leverages.get(
             (address, coin),
             min(float(self._tracked[address].avg_leverage), settings.COPY_MAX_COPY_LEVERAGE),
         )
-        lev = max(min(lev, settings.COPY_MAX_COPY_LEVERAGE), 1.0)
-        return (notional / lev) / acct
+        return max(min(lev, settings.COPY_MAX_COPY_LEVERAGE), 1.0)
+
+    def _conviction(self, address: str, coin: str, notional: float, acct: float) -> float:
+        """Their committed margin as a fraction of their account — gates + ranks holders."""
+        if acct <= 0:
+            return 0.0
+        return (notional / self._lev_for(address, coin)) / acct
+
+    # ── Daily-ATR for volatility-normalized scale-out ────────────────────────────
+
+    async def _atr_pct(self, coin: str) -> Optional[float]:
+        """
+        Daily ATR(ATR_PERIOD) as a fraction of the last close, e.g. 0.06 = 6%/day.
+        Cached per coin for ATR_REFRESH_S (ATR moves slowly). Returns None on any
+        failure or insufficient history — callers must SKIP scale-out rather than act
+        on a missing volatility estimate.
+        """
+        now = time.monotonic()
+        cached = self._atr_cache.get(coin)
+        if cached and (now - cached[1]) < settings.ATR_REFRESH_S:
+            return cached[0]
+
+        period = settings.ATR_PERIOD
+        end = int(time.time() * 1000)
+        start = end - (period + 5) * 86_400_000   # a few extra days of headroom
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    HL_REST,
+                    json={"type": "candleSnapshot", "req": {
+                        "coin": coin, "interval": "1d",
+                        "startTime": start, "endTime": end,
+                    }},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    candles = await resp.json(content_type=None)
+            if not isinstance(candles, list) or len(candles) < period + 1:
+                return None
+            # True range per day: max(h-l, |h-prevClose|, |l-prevClose|)
+            trs = []
+            for i in range(1, len(candles)):
+                h = float(candles[i]["h"]); l = float(candles[i]["l"])
+                pc = float(candles[i - 1]["c"])
+                trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+            atr = sum(trs[-period:]) / period
+            last_close = float(candles[-1]["c"])
+            if last_close <= 0:
+                return None
+            atr_pct = atr / last_close
+            self._atr_cache[coin] = (atr_pct, now)
+            return atr_pct
+        except Exception as e:
+            logger.debug(f"[Reconcile] ATR fetch failed for {coin}: {e}")
+            return None
 
     # ── Desired portfolio (routing + conflict resolution) ────────────────────────
 
     def _build_desired(self) -> dict[str, dict]:
         """
-        Decide the portfolio we WANT to hold right now, one entry per coin:
-            coin -> {dir, source, their_notional, their_acct, lev, size}
+        Decide the portfolio we WANT to hold, in two stages.
 
-        Routing:
-          • specialist coin → only that trader's position counts (skip if they're flat)
-          • generalist coin → all holders must agree on direction, else SKIP (contested)
-          • among eligible holders, pick the highest-conviction one
-          • size via _compute_size; drop coins that size to 0 (dust)
+        1. ROUTING (which coins / which direction):
+           • Only positions that are a real conviction bet FOR THE TRADER count
+             (their margin on the coin >= COPY_MIN_CONVICTION_PCT of their account).
+             Dabbles are ignored — not copied AND not allowed to vote on direction.
+           • specialist coin → only that trader's (gated) position counts.
+           • generalist coin → gated holders must agree on direction, else SKIP (contested).
+           • highest-conviction eligible holder wins the coin.
+
+        2. SIZING (how big — DECOUPLED from the trader's account size):
+           • equal-weight OUR capital to COPY_TARGET_DEPLOY across the chosen coins,
+             capped at MAX_POSITION_SIZE_PCT each; notional = margin × their leverage.
+           This is what lets us copy big funds whose bets are a small % of their account.
         """
-        # coin -> list of (addr, dir, notional, acct)
-        holders: dict[str, list] = defaultdict(list)
+        # ── Stage 1: conviction-gated holders per coin ───────────────────────────
+        holders: dict[str, list] = defaultdict(list)   # coin -> [(addr, dir, conviction)]
         for address, positions in self._trader_positions.items():
             if address not in self._tracked:
                 continue
@@ -292,47 +316,62 @@ class LeaderboardCopier:
                 continue
             for coin, direction in positions.items():
                 notional = self._trader_position_notionals.get((address, coin), 0)
-                if notional > 0:
-                    holders[coin].append((address, direction, notional, acct))
+                if notional <= 0:
+                    continue
+                cv = self._conviction(address, coin, notional, acct)
+                if cv < settings.COPY_MIN_CONVICTION_PCT:
+                    continue   # not a real bet for them — ignore (and it can't vote)
+                holders[coin].append((address, direction, cv))
 
-        desired: dict[str, dict] = {}
+        chosen: dict[str, tuple] = {}   # coin -> (addr, dir, lev)
         contested_now: set[str] = set()
         for coin, hs in holders.items():
             spec_addr = self._specialist.get(coin.upper())
             if spec_addr:
                 cand = [h for h in hs if h[0] == spec_addr]
                 if not cand:
-                    continue   # specialist is flat → we don't hold this coin
+                    continue   # specialist holds no conviction position here
             else:
-                directions = {h[1] for h in hs}
-                if len(directions) > 1:
+                if len({h[1] for h in hs}) > 1:
                     contested_now.add(coin)
                     if coin not in self._prev_contested:   # log only when newly contested
                         logger.info(
                             f"[Reconcile] {coin} CONTESTED "
-                            f"{[(a[:6], d) for a, d, _, _ in hs]} — skip"
+                            f"{[(a[:6], d) for a, d, _ in hs]} — skip"
                         )
                     continue
                 cand = hs
-
-            # Highest-conviction holder wins the coin
-            best = max(cand, key=lambda h: self._conviction(h[0], coin, h[2], h[3]))
-            addr, direction, notional, acct = best
-            trader = self._tracked.get(addr)
-            our_size, lev = self._compute_size(addr, coin, notional, acct, trader)
-            if our_size == 0:
-                continue   # below dust floors — skip
-
-            desired[coin] = {
-                "dir": direction, "source": addr, "their_notional": notional,
-                "their_acct": acct, "lev": lev, "size": our_size,
-            }
+            addr, direction, _ = max(cand, key=lambda h: h[2])
+            chosen[coin] = (addr, direction, self._lev_for(addr, coin))
         self._prev_contested = contested_now
+
+        # ── Stage 2: equal-weight sizing to target deployment ────────────────────
+        n = len(chosen)
+        if n == 0:
+            return {}
+        per_margin = min(
+            self._portfolio_usd * settings.COPY_TARGET_DEPLOY / n,
+            self._portfolio_usd * settings.MAX_POSITION_SIZE_PCT,
+        )
+        desired: dict[str, dict] = {}
+        for coin, (addr, direction, lev) in chosen.items():
+            our_notional = per_margin * lev
+            if our_notional < settings.MIN_POSITION_NOTIONAL:
+                continue   # sanity floor (shouldn't trigger at target deployment)
+            desired[coin] = {
+                "dir": direction, "source": addr,
+                "their_notional": self._trader_position_notionals.get((addr, coin), 0),
+                "their_acct": self._trader_acct_values.get(addr, 0),
+                "lev": lev, "size": our_notional,
+            }
         return desired
 
-    # Re-enter a held position if it's below this fraction of its capped target size
-    # (catches startup-synced positions the old engine left under-sized).
+    # Re-enter a held position if it's outside this band around its capped target size.
+    # Bidirectional: grows under-sized (e.g. startup-synced) AND trims over-sized (e.g.
+    # legacy proportional sizing) so the book converges to equal-weight. Wide band so it
+    # rebalances once and doesn't oscillate on small equity/position-count drift.
     _RESIZE_MIN_RATIO = 0.6
+    _RESIZE_MAX_RATIO = 1.6
 
     def _capped_target(self, d: dict) -> float:
         """Desired notional AFTER the risk manager's per-position margin cap, so the
@@ -376,12 +415,13 @@ class LeaderboardCopier:
 
             entries = exits = flips = resizes = trails = 0
 
-            # ── Trailing-profit exits ─────────────────────────────────────────────
-            # The traders only buy-and-hold; this banks gains they'd otherwise give
-            # back. Arm once +TRAIL_ARM_PCT in price, exit on TRAIL_GIVEBACK retrace
-            # from the peak. A trail-exited coin is LOCKED from re-entry until the
-            # trader's position resets — otherwise we'd instantly re-buy and churn.
-            if settings.TRAIL_ENABLED and self.store:
+            # ── Profit-taking on copied holds ─────────────────────────────────────
+            # The traders only buy-and-hold; this banks gains they'd otherwise give back.
+            # Preferred path: SCALE-OUT (2 tranches, ATR-normalized, leverage-aware) —
+            # see _scale_out. Falls back to the flat TRAIL_* logic when scale-out is off.
+            if settings.SCALEOUT_ENABLED and self.store:
+                trails += await self._scale_out(held)
+            elif settings.TRAIL_ENABLED and self.store:
                 for coin, p in list(held.items()):
                     px = self.store.latest_mid(coin)
                     if not px or not p.entry_price:
@@ -416,11 +456,18 @@ class LeaderboardCopier:
                     await self._emit_exit(coin, cur.direction, "trader_flipped")
                     await self._emit_entry(coin, d)
                     flips += 1
-                elif cur.size_usd < self._RESIZE_MIN_RATIO * self._capped_target(d):
-                    # Materially under-sized vs target — close & re-enter at correct size.
+                elif not cur.scaled_out and not (
+                        self._RESIZE_MIN_RATIO * self._capped_target(d)
+                        <= cur.size_usd
+                        <= self._RESIZE_MAX_RATIO * self._capped_target(d)):
+                    # Materially off target (under- OR over-sized) — close & re-enter at
+                    # the equal-weight target size.
+                    # (Skip scaled-out runners: their reduced size is intentional profit-
+                    #  taking, not a sizing artefact — re-buying would undo it and churn.)
+                    tgt = self._capped_target(d)
                     logger.info(
-                        f"[Reconcile] RESIZE {coin} ${cur.size_usd:,.0f} -> "
-                        f"~${self._capped_target(d):,.0f} (under-sized)"
+                        f"[Reconcile] RESIZE {coin} ${cur.size_usd:,.0f} -> ~${tgt:,.0f} "
+                        f"({'under' if cur.size_usd < tgt else 'over'}-sized)"
                     )
                     await self._emit_exit(coin, cur.direction, "resize")
                     await self._emit_entry(coin, d)
@@ -449,6 +496,65 @@ class LeaderboardCopier:
                     f"[Reconcile] in sync — desired={len(desired)} held={len(held)}"
                 )
 
+    async def _scale_out(self, held: dict) -> int:
+        """
+        Two-tranche, volatility-normalized, leverage-aware profit-taking.
+
+          TP1 — bank SCALEOUT_TP1_FRACTION once the favorable price excursion clears
+                max(MIN_ATR_MULT × dailyATR%, TP1_MARGIN_RET / leverage). The ATR term
+                is a per-coin noise floor; the margin-return/leverage term banks sooner
+                on higher-leverage positions. Trigger = the larger of the two.
+          Runner — the rest rides an ATR trailing stop: exit on a
+                RUNNER_TRAIL_ATR × dailyATR% retrace from peak. On exit the coin is
+                trail-locked until the trader resets (as before).
+
+        Returns the number of trim/exit actions emitted (for the reconcile counter).
+        Positions with no live mid or no ATR estimate are skipped (never act blind).
+        """
+        actions = 0
+        for coin, p in list(held.items()):
+            px = self.store.latest_mid(coin)
+            if not px or not p.entry_price:
+                continue
+            exc = ((px - p.entry_price) / p.entry_price) if p.direction == "long" \
+                  else ((p.entry_price - px) / p.entry_price)
+            if exc > p.peak_price_pct:
+                p.peak_price_pct = exc
+
+            atr = await self._atr_pct(coin)
+            if not atr or atr <= 0:
+                continue   # no volatility estimate → don't act
+            lev = max(p.leverage, 1.0)
+
+            if not p.scaled_out:
+                trig = max(settings.SCALEOUT_MIN_ATR_MULT * atr,
+                           settings.SCALEOUT_TP1_MARGIN_RET / lev)
+                if exc >= trig:
+                    logger.info(
+                        f"[Reconcile] SCALE-OUT TP1 {coin} {p.direction} "
+                        f"trim {settings.SCALEOUT_TP1_FRACTION:.0%} | move +{exc:.1%} "
+                        f"≥ trig +{trig:.1%} (ATR {atr:.1%}, lev {lev:.0f}x)"
+                    )
+                    await self._emit_exit(coin, p.direction, "scaleout_tp1",
+                                          settings.SCALEOUT_TP1_FRACTION)
+                    # Mark scaled_out optimistically so a second tick can't re-trim before
+                    # the partial close is processed (over-trim is worse than a missed one).
+                    p.scaled_out = True
+                    actions += 1
+            else:
+                giveback = settings.SCALEOUT_RUNNER_TRAIL_ATR * atr
+                if exc <= p.peak_price_pct - giveback:
+                    logger.info(
+                        f"[Reconcile] SCALE-OUT RUNNER EXIT {coin} {p.direction} | "
+                        f"peak +{p.peak_price_pct:.1%} -> +{exc:.1%} "
+                        f"(giveback {giveback:.1%} = {settings.SCALEOUT_RUNNER_TRAIL_ATR}×ATR)"
+                    )
+                    await self._emit_exit(coin, p.direction, "scaleout_runner")
+                    self._trail_locked[coin] = p.direction   # lock until trader resets
+                    del held[coin]
+                    actions += 1
+        return actions
+
     async def _emit_entry(self, coin: str, d: dict):
         logger.info(
             f"[Reconcile] ENTER {d['dir'].upper()} {coin} ${d['size']:,.0f} "
@@ -470,17 +576,20 @@ class LeaderboardCopier:
             },
         ))
 
-    async def _emit_exit(self, coin: str, held_direction: str, reason: str):
+    async def _emit_exit(self, coin: str, held_direction: str, reason: str,
+                         fraction: float = 1.0):
         # Exit signal direction = the side WE HOLD (the one being closed) — see
-        # executor._close_position matching convention.
-        logger.info(f"[Reconcile] EXIT {coin} {held_direction} — {reason}")
+        # executor._close_position matching convention. fraction<1 = partial scale-out
+        # (trim that share, keep a runner); fraction>=1 = full close.
+        label = f"{fraction:.0%} " if fraction < 1.0 else ""
+        logger.info(f"[Reconcile] EXIT {label}{coin} {held_direction} — {reason}")
         await self._signal_queue.put(TradeSignal(
             strategy="leaderboard",
             coin=coin,
             direction=held_direction,
             size_usd=0,
             confidence=1.0,
-            meta={"action": "exit", "reason": reason},
+            meta={"action": "exit", "reason": reason, "fraction": fraction},
         ))
 
     async def _fetch_our_state(self) -> tuple[Optional[set], Optional[float]]:

@@ -37,6 +37,7 @@ class OpenPosition:
     opened_at: datetime = field(default_factory=datetime.utcnow)
     unrealized_pnl: float = 0.0
     peak_price_pct: float = 0.0  # max favorable price excursion seen — for trailing-profit exit
+    scaled_out: bool = False     # True once the first profit tranche has been banked (TP1)
 
 
 class RiskManager:
@@ -163,6 +164,40 @@ class RiskManager:
             f"| day PnL={pct:+.2%}"
         )
 
+        if pct <= -settings.DAILY_LOSS_HALT_PCT:
+            self._trading_halted = True
+            logger.warning(
+                f"[Risk] ⛔ TRADING HALTED — daily loss {pct:.2%} "
+                f"exceeds -{settings.DAILY_LOSS_HALT_PCT:.0%} limit"
+            )
+
+    def reduce_position(self, position_id: int, fraction: float, exit_price: float):
+        """
+        Partially close a position (scale-out): book realized PnL on the closed
+        fraction, shrink size_usd to the remaining runner, and mark it scaled_out so
+        reconcile's RESIZE branch won't re-buy it back to full. The runner stays open.
+        Idempotent enough for our use: called only after a confirmed partial fill.
+        """
+        pos = next((p for p in self.open_positions if p.id == position_id), None)
+        if not pos:
+            logger.warning(f"[Risk] reduce_position: #{position_id} not found")
+            return
+        fraction = max(0.0, min(fraction, 1.0))
+        closed_notional = pos.size_usd * fraction
+        if pos.direction == "short":
+            pnl = closed_notional * (pos.entry_price - exit_price) / pos.entry_price
+        else:
+            pnl = closed_notional * (exit_price - pos.entry_price) / pos.entry_price
+
+        self._daily_pnl += pnl
+        pos.size_usd -= closed_notional
+        pos.scaled_out = True
+
+        pct = self._daily_pnl / self.portfolio_value
+        logger.info(
+            f"[Risk] Trimmed #{position_id} {pos.coin} {fraction:.0%} | "
+            f"banked=${pnl:+,.2f} | runner=${pos.size_usd:,.0f} | day PnL={pct:+.2%}"
+        )
         if pct <= -settings.DAILY_LOSS_HALT_PCT:
             self._trading_halted = True
             logger.warning(
