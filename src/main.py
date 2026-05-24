@@ -27,6 +27,7 @@ from data.store import MarketStore, FundingSnapshot, TradeSignal
 from risk.manager import RiskManager
 from execution.executor import Executor
 from monitoring.alerts import TelegramAlerter
+from monitoring.squeeze_guard import SqueezeGuard
 
 # Conditionally import enabled strategies
 if settings.STRATEGY_FUNDING_CARRY:
@@ -65,6 +66,8 @@ async def main():
     executor.init_client()
 
     alerter  = TelegramAlerter(settings.TELEGRAM_BOT_TOKEN, settings.TELEGRAM_CHAT_ID)
+    squeeze  = SqueezeGuard(store, alerter)
+    executor.squeeze_guard = squeeze   # give executor access to fire lifecycle events
     feed     = HyperliquidFeed()
 
     signal_queue: asyncio.Queue[TradeSignal] = asyncio.Queue()
@@ -93,7 +96,9 @@ async def main():
         try:
             mids = msg.get("data", {}).get("mids", {})
             for coin, price_str in mids.items():
-                store.update_mid(coin, float(price_str))
+                price = float(price_str)
+                store.update_mid(coin, price)
+                squeeze.update_price(coin, price)   # feed price ticks to squeeze guard
         except Exception as e:
             logger.debug(f"on_mids parse error: {e}")
 
@@ -183,6 +188,14 @@ async def main():
 
                 if reason:
                     logger.info(f"[Guardian] CLOSING {pos.coin} pos#{pos.id} — {reason}")
+                    # Classify exit reason for squeeze guard
+                    if "stop loss" in reason:
+                        exit_kind = "stop_loss"
+                    elif "take profit" in reason:
+                        exit_kind = "take_profit"
+                    else:
+                        exit_kind = "max_hold"
+                    squeeze.on_position_closed(pos.id, current_price or pos.entry_price, exit_kind)
                     await executor.enqueue(TradeSignal(
                         strategy=pos.strategy,
                         coin=pos.coin,
@@ -195,6 +208,7 @@ async def main():
     # Daily summary at 23:55 UTC
     async def daily_summary():
         await alerter.daily_summary(risk.status())
+        await alerter.send(squeeze.summary())
 
     scheduler.add_job(daily_summary, "cron", hour=23, minute=55, id="daily_summary")
     scheduler.start()

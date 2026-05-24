@@ -17,6 +17,7 @@ class Executor:
         self._exchange: Exchange | None = None
         self._info: Info | None = None
         self._signal_queue: asyncio.Queue = asyncio.Queue()
+        self.squeeze_guard = None   # injected by main.py after init
 
     def init_client(self):
         """
@@ -148,6 +149,12 @@ class Executor:
                 f"(${size_usd:,.0f}) pos#{position_id} [{signal.strategy}]"
             )
             await self.risk.store.log_trade(signal.strategy, coin, direction, size_usd, actual_px)
+            # Notify squeeze guard — start tracking MAE/MFE
+            if self.squeeze_guard:
+                source = signal.meta.get("source", signal.strategy)
+                self.squeeze_guard.on_position_opened(
+                    position_id, coin, direction, actual_px, source, size_usd
+                )
             # Place native SL/TP on HL — survive bot crashes
             await self._place_native_sltp(coin, is_buy, size_coin, actual_px)
         else:
@@ -174,6 +181,9 @@ class Executor:
         if result and result.get("status") == "ok":
             self.risk.close_position(pos.id, mid)
             logger.success(f"[Executor] CLOSED {signal.coin} pos#{pos.id} @ ${mid:,.2f}")
+            # Notify squeeze guard — trader closed (not SL/TP/guardian)
+            if self.squeeze_guard:
+                self.squeeze_guard.on_position_closed(pos.id, mid, "trader_closed")
 
     # ── SDK wrappers ───────────────────────────────────────────────────────────
 

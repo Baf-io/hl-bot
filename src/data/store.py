@@ -72,6 +72,24 @@ class MarketStore:
                 open_interest REAL
             )
         """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS position_log (
+                pos_id       INTEGER PRIMARY KEY,
+                coin         TEXT,
+                direction    TEXT,
+                source       TEXT,
+                entry_price  REAL,
+                entry_time   TEXT,
+                exit_price   REAL,
+                exit_time    TEXT,
+                exit_reason  TEXT,
+                pnl_pct      REAL,
+                mae          REAL,
+                mfe          REAL,
+                hold_seconds REAL,
+                size_usd     REAL
+            )
+        """)
         await self._db.commit()
         logger.info("DB initialised")
 
