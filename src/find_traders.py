@@ -1,28 +1,24 @@
 """
-find_traders.py — Hyperliquid Leaderboard Deep Scanner v2
+find_traders.py — Hyperliquid Leaderboard Deep Scanner v3
 ══════════════════════════════════════════════════════════
-Scans the full HL leaderboard, fetches recent fill history for top candidates,
-and scores them on what ACTUALLY matters for copy trading:
+3-stage scan. Finds the highest-frequency, strongest win-rate, hottest-streak
+traders on Hyperliquid for copy trading.
 
-  1. FREQUENCY     — trades per day (need steady signal flow, not 1/week)
-  2. RECENT WIN %  — last 50 closed trades (recency beats all-time)
-  3. WIN STREAK    — current consecutive winning trades (hot hand filter)
-  4. HOLD TIME     — shorter = cleaner copy window (we can mirror and exit fast)
-  5. REALIZED PNL  — absolute proof of edge, not just % return on small account
+  Stage 1 — leaderboard filter: PnL / volume / weekly positive
+  Stage 2 — fill history:       frequency, hold time, recent WR, streak
+  Stage 3 — deep dive (top 10): per-coin WR, weekly consistency,
+                                 max loss streak, live positions
 
-Two-stage approach:
-  Stage 1: cheap leaderboard filter (PnL, volume, alltime WR)
-  Stage 2: per-trader fill analysis (frequency, streak, hold time, recent WR)
-
-Output: data/traders.json  (bot loads this automatically)
+Output: data/traders.json  (bot loads this automatically on restart)
 
 Run on VPS:
     cd /root/hl-bot && python src/find_traders.py
 
 Then:
+    # Paste the .env lines printed at the end, then:
     sudo systemctl restart hl-bot
 """
-import asyncio, sys, json, time
+import asyncio, sys, json, time, os
 import pathlib as _pl
 sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 sys.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent))
@@ -32,21 +28,28 @@ STATS_URL   = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 HL_REST     = "https://api.hyperliquid.xyz/info"
 OUTPUT_FILE = "data/traders.json"
 
-# ── Stage 1 filters (leaderboard data only — fast) ───────────────────────────
-MIN_ALLTIME_PNL  = 50_000      # must have made at least $50K ever
-MIN_WEEK_PNL     = 0           # net positive this week
-MIN_DAY_VLM      = 2_000       # traded at least $2K today (active)
+# ── Stage 1 filters ───────────────────────────────────────────────────────────
+MIN_ALLTIME_PNL  = 50_000
+MIN_WEEK_PNL     = 0            # net positive this week
+MIN_DAY_VLM      = 2_000        # active today
 MIN_ALLTIME_VLM  = 100_000
-STAGE1_LIMIT     = 200         # deep-scan top 200 by alltime PnL
+STAGE1_LIMIT     = 200          # how many to deep-scan
 
-# ── Stage 2 filters (from fill history) — loose, let scoring do the ranking ──
-MIN_TRADES_PER_DAY   = 1.0     # at least 1 trade/day on average
-MAX_AVG_HOLD_HOURS   = 24.0    # exclude overnight bagholders
-MIN_WIN_RATE_RECENT  = 0.50    # at least 50% on last 50 closed trades
-MIN_FILLS            = 10      # need enough data
-MIN_TRADES_7D        = 3       # must have traded this week
-TOP_N                = 15      # traders written to traders.json
+# ── Stage 2 filters (loose — score does the real ranking) ────────────────────
+MIN_TRADES_PER_DAY  = 1.0
+MAX_AVG_HOLD_HOURS  = 24.0
+MIN_WIN_RATE_RECENT = 0.50
+MIN_FILLS           = 10
+MIN_TRADES_7D       = 3
+STAGE2_TOP_N        = 10        # feed best 10 into Stage 3
 
+# ── Final output ──────────────────────────────────────────────────────────────
+TOP_N = 15                      # traders written to traders.json
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
 def parse_windows(perfs):
     out = {}
@@ -61,48 +64,79 @@ def parse_windows(perfs):
     return out
 
 
-async def profile_trader(session, address: str) -> dict | None:
+def calc_streak(closes: list[dict]) -> int:
+    """Return current win (+) or loss (−) streak from a sorted close list."""
+    streak = 0
+    for f in reversed(closes):
+        pnl = float(f.get("closedPnl", 0))
+        if pnl == 0:
+            break
+        if streak == 0:
+            streak = 1 if pnl > 0 else -1
+        elif streak > 0 and pnl > 0:
+            streak += 1
+        elif streak < 0 and pnl < 0:
+            streak -= 1
+        else:
+            break
+    return streak
+
+
+def calc_hold_times(fills: list[dict], max_h: float = 168) -> list[float]:
+    """Match Open→Close pairs by coin and return hold durations in hours."""
+    hold_times = []
+    opens: dict[str, float] = {}
+    for fill in fills:
+        coin      = fill.get("coin", "")
+        direction = str(fill.get("dir", ""))
+        ts        = float(fill.get("time", 0))
+        cpnl      = float(fill.get("closedPnl", 0))
+        is_open   = "Open"  in direction or (cpnl == 0 and "Close" not in direction)
+        is_close  = "Close" in direction or cpnl != 0
+        if is_open and not is_close:
+            opens[coin] = ts
+        elif is_close and coin in opens:
+            h = (ts - opens.pop(coin)) / 3_600_000
+            if 0 < h < max_h:
+                hold_times.append(h)
+    return hold_times
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 2 — fill profile
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def profile_trader(session, address: str) -> tuple[dict | None, list]:
     """
-    Fetch full fill history and compute:
-      - trades_per_day  (last 30d)
-      - avg_hold_h      (open→close pairs)
-      - win_rate_recent (last 50 closes)
-      - win_rate_all    (all closes in history)
-      - current_streak  (+ = win streak, - = loss streak)
-      - trades_7d       (activity check)
-      - last_trade_h    (hours since last trade)
-      - avg_notional    (their typical position size)
+    Returns (stats_dict, raw_fills).
+    raw_fills is kept for Stage 3 re-use — avoids re-fetching.
     """
     try:
         async with session.post(
             HL_REST,
             json={"type": "userFills", "user": address},
-            timeout=aiohttp.ClientTimeout(total=15),
+            timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             fills = await resp.json(content_type=None)
 
         if not fills or len(fills) < MIN_FILLS:
-            return None
+            return None, []
 
         now_ms   = time.time() * 1000
         month_ms = 30 * 86_400_000
         week_ms  =  7 * 86_400_000
 
-        # Sort oldest → newest
         fills = sorted(fills, key=lambda f: float(f.get("time", 0)))
-
         recent30 = [f for f in fills if now_ms - float(f.get("time", 0)) < month_ms]
         last7d   = [f for f in fills if now_ms - float(f.get("time", 0)) < week_ms]
 
         if len(recent30) < MIN_FILLS:
-            return None
+            return None, fills
 
-        # ── Trades per day ─────────────────────────────────────────────────────
         trades_per_day = len(recent30) / 30
 
-        # ── Win rate (all closes & recent 50) ──────────────────────────────────
-        all_closes = [f for f in fills if float(f.get("closedPnl", 0)) != 0]
-        recent_closes = all_closes[-50:]   # last 50 closed trades
+        all_closes    = [f for f in fills    if float(f.get("closedPnl", 0)) != 0]
+        recent_closes = [f for f in recent30 if float(f.get("closedPnl", 0)) != 0]
 
         def wr(subset):
             if len(subset) < 3:
@@ -111,56 +145,20 @@ async def profile_trader(session, address: str) -> dict | None:
             return wins / len(subset)
 
         win_rate_all    = wr(all_closes)
-        win_rate_recent = wr(recent_closes)
+        win_rate_recent = wr(all_closes[-50:])   # last 50 across full history
 
-        # ── Current win/loss streak ────────────────────────────────────────────
-        streak = 0
-        for f in reversed(all_closes):
-            pnl = float(f.get("closedPnl", 0))
-            if pnl == 0:
-                break
-            if streak == 0:
-                streak = 1 if pnl > 0 else -1
-            elif streak > 0 and pnl > 0:
-                streak += 1
-            elif streak < 0 and pnl < 0:
-                streak -= 1
-            else:
-                break
+        streak    = calc_streak(all_closes)
+        hold_list = calc_hold_times(recent30)
+        avg_hold  = sum(hold_list) / len(hold_list) if hold_list else 99.0
 
-        # ── Avg hold time ──────────────────────────────────────────────────────
-        hold_times      = []
-        opens_by_coin: dict[str, float] = {}
-        for fill in recent30:
-            coin       = fill.get("coin", "")
-            direction  = str(fill.get("dir", ""))
-            ts         = float(fill.get("time", 0))
-            closed_pnl = float(fill.get("closedPnl", 0))
-
-            is_open  = "Open"  in direction or (closed_pnl == 0 and "Close" not in direction)
-            is_close = "Close" in direction or closed_pnl != 0
-
-            if is_open and not is_close:
-                opens_by_coin[coin] = ts
-            elif is_close and coin in opens_by_coin:
-                hold_h = (ts - opens_by_coin.pop(coin)) / 3_600_000
-                if 0 < hold_h < 168:   # sanity: 0–7 days
-                    hold_times.append(hold_h)
-
-        avg_hold_h = sum(hold_times) / len(hold_times) if hold_times else 99.0
-
-        # ── Average notional (their conviction per trade) ──────────────────────
-        notionals = [float(f.get("sz", 0)) * float(f.get("px", 0)) for f in recent30]
-        notionals = [n for n in notionals if n > 0]
+        notionals    = [float(f.get("sz", 0)) * float(f.get("px", 0)) for f in recent30 if float(f.get("sz", 0)) > 0]
         avg_notional = sum(notionals) / len(notionals) if notionals else 0
 
-        # ── Recency ────────────────────────────────────────────────────────────
-        last_ts = float(fills[-1].get("time", 0))
-        last_trade_h = (now_ms - last_ts) / 3_600_000
+        last_trade_h = (now_ms - float(fills[-1].get("time", 0))) / 3_600_000
 
         return {
             "trades_per_day":  trades_per_day,
-            "avg_hold_h":      avg_hold_h,
+            "avg_hold_h":      avg_hold,
             "win_rate_all":    win_rate_all,
             "win_rate_recent": win_rate_recent,
             "current_streak":  streak,
@@ -169,23 +167,23 @@ async def profile_trader(session, address: str) -> dict | None:
             "avg_notional":    avg_notional,
             "total_fills":     len(fills),
             "closes_found":    len(all_closes),
-        }
+        }, fills
 
     except Exception:
-        return None
+        return None, []
+
+
+def passes_stage2(p: dict) -> bool:
+    return (
+        p["trades_per_day"]      >= MIN_TRADES_PER_DAY
+        and p["avg_hold_h"]      <= MAX_AVG_HOLD_HOURS
+        and p["win_rate_recent"] >= MIN_WIN_RATE_RECENT
+        and p["trades_7d"]       >= MIN_TRADES_7D
+        and p["last_trade_h"]    <  72
+    )
 
 
 def composite_score(t: dict) -> float:
-    """
-    Copy-trading suitability score (0–1+ range).
-
-    Weights:
-      30% frequency     — need steady signal flow
-      25% recent WR     — edge RIGHT NOW, not historical luck
-      20% win streak    — hot hand / current form
-      15% hold time     — shorter = cleaner copy, less slippage
-      10% realized PnL  — proof the edge is real and large
-    """
     freq   = t.get("trades_per_day", 0)
     wr     = t.get("win_rate_recent", 0.5)
     streak = t.get("current_streak", 0)
@@ -193,30 +191,12 @@ def composite_score(t: dict) -> float:
     pnl    = t.get("alltime_pnl", 0)
     last_h = t.get("last_trade_h", 999)
 
-    # Frequency: 10+/day = 1.0, 5/day = 0.5, 1/day = 0.1
     freq_score   = min(freq / 10.0, 1.0)
-
-    # Recent WR: 50% = 0, 65% = 0.5, 80% = 1.0
     wr_score     = max(0, min((wr - 0.50) / 0.30, 1.0))
-
-    # Streak: +10 = 1.0, +5 = 0.5, 0 = 0, negative = penalty
     streak_score = max(-0.5, min(streak / 10.0, 1.0))
-
-    # Hold: 1h = 0.92, 4h = 0.67, 12h = 0, >12h = negative
     hold_score   = max(0, 1.0 - hold / 12.0)
-
-    # PnL: $500K = 0.5, $1M = 1.0
     pnl_score    = min(pnl / 1_000_000, 1.0)
-
-    # Recency bonus/penalty
-    if last_h < 6:
-        recency = +0.10
-    elif last_h < 24:
-        recency = 0.0
-    elif last_h < 72:
-        recency = -0.10
-    else:
-        recency = -0.30
+    recency      = +0.10 if last_h < 6 else (0.0 if last_h < 24 else (-0.10 if last_h < 72 else -0.30))
 
     return (
         freq_score   * 0.30
@@ -228,55 +208,209 @@ def composite_score(t: dict) -> float:
     )
 
 
-def passes_stage2(p: dict) -> bool:
-    return (
-        p["trades_per_day"]  >= MIN_TRADES_PER_DAY
-        and p["avg_hold_h"]  <= MAX_AVG_HOLD_HOURS
-        and p["win_rate_recent"] >= MIN_WIN_RATE_RECENT
-        and p["trades_7d"]   >= MIN_TRADES_7D
-        and p["last_trade_h"] < 72   # active in last 3 days
-    )
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 3 — deep dive (top 10 only)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def deep_dive(session, address: str, fills: list[dict]) -> dict:
+    """
+    Extra signals computed from cached fills + one live state call.
+    Returns dict merged into the trader record.
+    """
+    now_ms   = time.time() * 1000
+    week_ms  =  7 * 86_400_000
+
+    all_closes = [f for f in fills if float(f.get("closedPnl", 0)) != 0]
+
+    # ── Per-coin win rate (top 6 coins by trade count) ────────────────────────
+    coin_stats: dict[str, dict] = {}
+    for f in all_closes:
+        coin = f.get("coin", "?")
+        pnl  = float(f.get("closedPnl", 0))
+        if coin not in coin_stats:
+            coin_stats[coin] = {"wins": 0, "losses": 0, "pnl": 0.0}
+        if pnl > 0:
+            coin_stats[coin]["wins"] += 1
+        else:
+            coin_stats[coin]["losses"] += 1
+        coin_stats[coin]["pnl"] += pnl
+
+    top_coins = sorted(
+        coin_stats.items(),
+        key=lambda kv: kv[1]["wins"] + kv[1]["losses"],
+        reverse=True
+    )[:6]
+
+    coin_summary = []
+    for coin, s in top_coins:
+        total = s["wins"] + s["losses"]
+        coin_summary.append({
+            "coin": coin,
+            "trades": total,
+            "wr": round(s["wins"] / total, 3) if total else 0,
+            "pnl": round(s["pnl"]),
+        })
+
+    # ── Weekly PnL consistency (last 8 calendar weeks) ────────────────────────
+    weekly: dict[int, float] = {}
+    for f in all_closes:
+        ts_ms   = float(f.get("time", 0))
+        week_id = int(ts_ms / week_ms)
+        weekly[week_id] = weekly.get(week_id, 0) + float(f.get("closedPnl", 0))
+
+    recent_weeks = sorted(weekly.items())[-8:]
+    profitable_weeks = sum(1 for _, pnl in recent_weeks if pnl > 0)
+    week_consistency = profitable_weeks / len(recent_weeks) if recent_weeks else 0
+
+    # ── Max consecutive loss streak (risk calibration) ────────────────────────
+    max_loss_streak = 0
+    cur_losses      = 0
+    for f in all_closes:
+        if float(f.get("closedPnl", 0)) < 0:
+            cur_losses += 1
+            max_loss_streak = max(max_loss_streak, cur_losses)
+        else:
+            cur_losses = 0
+
+    # ── Live positions (what are they in RIGHT NOW?) ──────────────────────────
+    live_positions = []
+    try:
+        async with session.post(
+            HL_REST,
+            json={"type": "clearinghouseState", "user": address},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            state = await resp.json(content_type=None)
+        for ap in state.get("assetPositions", []):
+            pos  = ap.get("position", {})
+            szi  = float(pos.get("szi", 0))
+            if szi == 0:
+                continue
+            coin     = pos.get("coin", "")
+            entry_px = float(pos.get("entryPx") or 0)
+            notional = abs(szi) * entry_px
+            upnl     = float(pos.get("unrealizedPnl") or 0)
+            lev      = float(pos.get("leverage", {}).get("value", 1)) if isinstance(pos.get("leverage"), dict) else float(pos.get("leverage") or 1)
+            live_positions.append({
+                "coin": coin,
+                "side": "long" if szi > 0 else "short",
+                "notional": round(notional),
+                "upnl":     round(upnl, 2),
+                "leverage": round(lev, 1),
+            })
+    except Exception:
+        pass
+
+    return {
+        "coin_breakdown":     coin_summary,
+        "week_consistency":   round(week_consistency, 3),
+        "profitable_weeks":   profitable_weeks,
+        "total_weeks_scanned": len(recent_weeks),
+        "max_loss_streak":    max_loss_streak,
+        "live_positions":     live_positions,
+        "live_position_count": len(live_positions),
+    }
 
 
-def print_table(traders: list[dict], title: str):
-    print(f"\n{'═'*108}")
+# ══════════════════════════════════════════════════════════════════════════════
+# Output helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def print_summary_table(traders: list[dict], title: str):
+    print(f"\n{'═'*110}")
     print(f"  {title}")
-    print(f"{'═'*108}")
+    print(f"{'═'*110}")
     print(f"  {'#':<3} {'Address':<14} {'PnL':>10} {'WR-rec':>7} {'WR-all':>7} "
           f"{'T/day':>6} {'Hold':>7} {'Streak':>7} {'7d':>5} {'Active':>9} {'Score':>7}")
-    print(f"  {'-'*103}")
+    print(f"  {'-'*105}")
     for i, t in enumerate(traders, 1):
-        streak_s = f"+{t['current_streak']}" if t['current_streak'] > 0 else str(t['current_streak'])
-        last_s   = f"{t['last_trade_h']:.0f}h ago"
-        hold_s   = f"{t['avg_hold_h']:.1f}h" if t['avg_hold_h'] < 99 else "  ?"
+        ss   = f"+{t['current_streak']}" if t['current_streak'] > 0 else str(t['current_streak'])
+        lh   = f"{t['last_trade_h']:.0f}h ago"
+        hold = f"{t['avg_hold_h']:.1f}h" if t['avg_hold_h'] < 99 else "  ?"
         print(
             f"  {i:<3} {t['address'][:12]+'…':<14} "
             f"${t['alltime_pnl']:>9,.0f} "
             f"{t['win_rate_recent']:>7.1%} "
             f"{t['win_rate_all']:>7.1%} "
             f"{t['trades_per_day']:>6.1f} "
-            f"{hold_s:>7} "
-            f"{streak_s:>7} "
+            f"{hold:>7} "
+            f"{ss:>7} "
             f"{t['trades_7d']:>5} "
-            f"{last_s:>9} "
+            f"{lh:>9} "
             f"{t['score']:>7.4f}"
         )
 
 
+def print_deep_card(i: int, t: dict):
+    """Print the full Stage 3 card for one trader."""
+    dd = t.get("_deep", {})
+    ss = f"+{t['current_streak']}" if t['current_streak'] > 0 else str(t['current_streak'])
+
+    print(f"\n  ┌─ #{i} {t['address']} ({'score: ' + str(round(t['score'], 4))})")
+    print(f"  │  PnL=${t['alltime_pnl']:,.0f}  "
+          f"WR-recent={t['win_rate_recent']:.1%}  WR-all={t['win_rate_all']:.1%}  "
+          f"streak={ss}  T/day={t['trades_per_day']:.1f}  hold={t['avg_hold_h']:.1f}h")
+
+    # Weekly consistency
+    wc  = dd.get("week_consistency", 0)
+    pw  = dd.get("profitable_weeks", 0)
+    tw  = dd.get("total_weeks_scanned", 0)
+    mls = dd.get("max_loss_streak", 0)
+    print(f"  │  Weekly consistency: {pw}/{tw} profitable weeks ({wc:.0%})  |  Max loss streak: {mls}")
+
+    # Per-coin breakdown
+    coins = dd.get("coin_breakdown", [])
+    if coins:
+        parts = [f"{c['coin']}({c['wr']:.0%} WR, {c['trades']}T, ${c['pnl']:+,.0f})" for c in coins]
+        print(f"  │  Top coins: {' | '.join(parts)}")
+
+    # Live positions
+    live = dd.get("live_positions", [])
+    if live:
+        lp = [f"{p['side'].upper()} {p['coin']} ${p['notional']:,.0f} {p['leverage']}x (uPnL ${p['upnl']:+,.0f})" for p in live]
+        print(f"  │  LIVE NOW ({len(live)}): {' · '.join(lp)}")
+    else:
+        print(f"  │  LIVE NOW: flat (no open positions)")
+
+    # Verdict
+    issues = []
+    if t['avg_hold_h'] > 8:
+        issues.append(f"hold={t['avg_hold_h']:.1f}h (long)")
+    if mls >= 8:
+        issues.append(f"max_loss_streak={mls} (high)")
+    if wc < 0.6:
+        issues.append(f"weekly consistency={wc:.0%} (inconsistent)")
+    if t['current_streak'] < 0:
+        issues.append(f"currently on loss streak ({ss})")
+
+    if not issues:
+        verdict = "✅ STRONG — recommend whitelist"
+    elif len(issues) == 1:
+        verdict = f"⚠️  CAUTION — {issues[0]}"
+    else:
+        verdict = f"❌ SKIP — {', '.join(issues)}"
+
+    print(f"  └─ {verdict}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════════════════════════
+
 async def main():
     print("═" * 65)
-    print("  HL-BOT TRADER SCANNER v2")
-    print("  Scanning for: high frequency + strong recent WR + hot streak")
+    print("  HL-BOT TRADER SCANNER v3")
+    print("  3-stage: leaderboard → fill history → deep dive")
     print("═" * 65)
 
-    # ── Stage 1: fetch leaderboard ─────────────────────────────────────────────
+    # ── Stage 1 ────────────────────────────────────────────────────────────────
     print("\nSTAGE 1: Fetching leaderboard…")
     async with aiohttp.ClientSession() as s:
         async with s.get(STATS_URL, timeout=aiohttp.ClientTimeout(total=60)) as r:
             data = await r.json(content_type=None)
 
     rows = data.get("leaderboardRows", []) if isinstance(data, dict) else data
-    print(f"  Total traders: {len(rows):,}")
+    print(f"  Total traders on HL: {len(rows):,}")
 
     parsed = []
     for entry in rows:
@@ -302,87 +436,134 @@ async def main():
     ]
     s1.sort(key=lambda t: t["alltime_pnl"], reverse=True)
     candidates = s1[:STAGE1_LIMIT]
-    print(f"  Stage 1 filter: {len(s1):,} qualify → deep-scanning top {len(candidates)}")
+    print(f"  Stage 1 filter: {len(s1):,} qualify → scanning top {len(candidates)}")
 
-    # ── Stage 2: fill history analysis ────────────────────────────────────────
-    print(f"\nSTAGE 2: Profiling {len(candidates)} traders (fill history + streaks)…")
-    print("  This takes ~2 minutes…\n")
+    # ── Stage 2 ────────────────────────────────────────────────────────────────
+    print(f"\nSTAGE 2: Fill history + streak analysis ({len(candidates)} traders)…")
+    print("  (~2 min)\n")
 
-    results = []
+    results   = []
+    fill_cache: dict[str, list] = {}   # address → raw fills for Stage 3
+
     async with aiohttp.ClientSession() as session:
         for i in range(0, len(candidates), 15):
             batch = candidates[i:i+15]
-            profiles = await asyncio.gather(*[
-                profile_trader(session, t["address"]) for t in batch
-            ])
-            for trader, profile in zip(batch, profiles):
+            coros = [profile_trader(session, t["address"]) for t in batch]
+            outs  = await asyncio.gather(*coros)
+
+            for trader, (profile, fills) in zip(batch, outs):
                 if profile is None:
                     continue
                 merged = {**trader, **profile}
                 merged["score"] = composite_score(merged)
-                if passes_stage2(profile):
-                    results.append(merged)
-                    flag = "✅"
-                else:
-                    flag = "  "
-                streak_s = f"+{profile['current_streak']}" if profile['current_streak'] > 0 else str(profile['current_streak'])
+                fill_cache[trader["address"]] = fills
+
+                ok   = passes_stage2(profile)
+                flag = "✅" if ok else "  "
+                ss   = f"+{profile['current_streak']}" if profile['current_streak'] > 0 else str(profile['current_streak'])
                 print(
                     f"  {flag} {trader['address'][:14]}… "
                     f"WR={profile['win_rate_recent']:.0%} "
                     f"T/d={profile['trades_per_day']:.1f} "
                     f"hold={profile['avg_hold_h']:.1f}h "
-                    f"streak={streak_s} "
+                    f"streak={ss} "
                     f"score={merged['score']:.4f}"
                 )
+                if ok:
+                    results.append(merged)
+
             await asyncio.sleep(0.3)
 
-    # ── Rank and output ────────────────────────────────────────────────────────
     results.sort(key=lambda t: t["score"], reverse=True)
+
+    # ── Stage 3 ────────────────────────────────────────────────────────────────
+    stage3_targets = results[:STAGE2_TOP_N]
+
+    print(f"\nSTAGE 3: Deep dive on top {len(stage3_targets)} traders…")
+    print("  (per-coin WR, weekly consistency, max loss streak, live positions)\n")
+
+    async with aiohttp.ClientSession() as session:
+        for t in stage3_targets:
+            fills = fill_cache.get(t["address"], [])
+            dd    = await deep_dive(session, t["address"], fills)
+            t["_deep"] = dd
+            await asyncio.sleep(0.2)
+
+    # ── Summary table ──────────────────────────────────────────────────────────
     top = results[:TOP_N]
+    print_summary_table(top, f"🏆 TOP {len(top)} TRADERS — RANKED BY COPY-TRADING SCORE")
 
-    print_table(top, f"🏆 TOP {len(top)} COPY-TRADING CANDIDATES")
+    # ── Deep cards for top 10 ─────────────────────────────────────────────────
+    print(f"\n{'═'*65}")
+    print(f"  STAGE 3 DETAIL — TOP {len(stage3_targets)}")
+    print(f"{'═'*65}")
+    for i, t in enumerate(stage3_targets, 1):
+        print_deep_card(i, t)
 
-    # Write full stats to JSON
+    # ── Write output ───────────────────────────────────────────────────────────
     out = []
     for t in top:
+        dd = t.get("_deep", {})
         out.append({
-            "address":         t["address"],
-            "alltime_pnl":     round(t["alltime_pnl"]),
-            "win_rate_recent": round(t["win_rate_recent"], 4),
-            "win_rate_all":    round(t["win_rate_all"], 4),
-            "trades_per_day":  round(t["trades_per_day"], 2),
-            "avg_hold_h":      round(t["avg_hold_h"], 2),
-            "current_streak":  t["current_streak"],
-            "trades_7d":       t["trades_7d"],
-            "last_trade_h":    round(t["last_trade_h"], 1),
-            "avg_notional":    round(t.get("avg_notional", 0)),
-            "score":           round(t["score"], 5),
+            "address":            t["address"],
+            "alltime_pnl":        round(t["alltime_pnl"]),
+            "win_rate_recent":    round(t["win_rate_recent"], 4),
+            "win_rate_all":       round(t["win_rate_all"], 4),
+            "trades_per_day":     round(t["trades_per_day"], 2),
+            "avg_hold_h":         round(t["avg_hold_h"], 2),
+            "current_streak":     t["current_streak"],
+            "trades_7d":          t["trades_7d"],
+            "last_trade_h":       round(t["last_trade_h"], 1),
+            "avg_notional":       round(t.get("avg_notional", 0)),
+            "week_consistency":   dd.get("week_consistency", 0),
+            "max_loss_streak":    dd.get("max_loss_streak", 0),
+            "live_position_count": dd.get("live_position_count", 0),
+            "top_coins":          [c["coin"] for c in dd.get("coin_breakdown", [])[:3]],
+            "score":              round(t["score"], 5),
         })
 
-    import os
     os.makedirs("data", exist_ok=True)
     with open(OUTPUT_FILE, "w") as f:
         json.dump(out, f, indent=2)
 
-    print(f"\n✅ Wrote {len(top)} traders to {OUTPUT_FILE}")
+    print(f"\n\n✅ Wrote {len(out)} traders to {OUTPUT_FILE}")
 
-    if top:
-        print("\n📋 Suggested whitelist (top 5):")
-        for t in top[:5]:
-            streak_s = f"+{t['current_streak']}" if t['current_streak'] > 0 else str(t['current_streak'])
-            print(
-                f"   {t['address']}  "
-                f"WR={t['win_rate_recent']:.0%}  "
-                f"T/d={t['trades_per_day']:.1f}  "
-                f"hold={t['avg_hold_h']:.1f}h  "
-                f"streak={streak_s}  "
-                f"PnL=${t['alltime_pnl']:,.0f}"
-            )
-        whitelist = ",".join(t["address"] for t in top[:5])
-        print(f"\n.env line:")
-        print(f"  COPY_TRADER_WHITELIST={whitelist}")
-        print(f"  STRATEGY_LEADERBOARD_COPY=true")
-        print("\nThen: sudo systemctl restart hl-bot")
+    # ── Final whitelist recommendation ─────────────────────────────────────────
+    # Only recommend traders with ✅ STRONG verdict
+    def is_strong(t: dict) -> bool:
+        dd  = t.get("_deep", {})
+        mls = dd.get("max_loss_streak", 99)
+        wc  = dd.get("week_consistency", 0)
+        return (
+            t["avg_hold_h"]      <  8
+            and mls              <  8
+            and wc               >= 0.6
+            and t["current_streak"] >= 0
+        )
+
+    strong = [t for t in stage3_targets if is_strong(t)]
+    recommend = strong[:5] if strong else stage3_targets[:5]
+
+    print(f"\n{'═'*65}")
+    print("  📋 WHITELIST RECOMMENDATION")
+    print(f"{'═'*65}")
+    for t in recommend:
+        dd = t.get("_deep", {})
+        ss = f"+{t['current_streak']}" if t['current_streak'] >= 0 else str(t['current_streak'])
+        coins_str = ", ".join(c["coin"] for c in dd.get("coin_breakdown", [])[:3])
+        print(
+            f"  {t['address']}\n"
+            f"    WR={t['win_rate_recent']:.0%} | T/day={t['trades_per_day']:.1f} | "
+            f"hold={t['avg_hold_h']:.1f}h | streak={ss} | "
+            f"weeks={dd.get('profitable_weeks',0)}/{dd.get('total_weeks_scanned',0)} | "
+            f"max_loss={dd.get('max_loss_streak',0)} | coins={coins_str}"
+        )
+
+    whitelist = ",".join(t["address"] for t in recommend)
+    print(f"\n  Add to /root/hl-bot/.env:")
+    print(f"  COPY_TRADER_WHITELIST={whitelist}")
+    print(f"  STRATEGY_LEADERBOARD_COPY=true")
+    print(f"\n  Then: sudo systemctl restart hl-bot")
 
 
 if __name__ == "__main__":
