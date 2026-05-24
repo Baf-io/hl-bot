@@ -250,8 +250,10 @@ class LeaderboardCopier:
         their_margin     = their_notional / their_lev
         their_margin_pct = their_margin / their_acct_val
 
-        # Our equivalent margin, then scale to notional
-        our_margin   = max(20.0 / their_lev, self._portfolio_usd * their_margin_pct)
+        # Our equivalent margin, then scale to notional.
+        # Floor: $50 notional minimum — anything less isn't worth a position slot.
+        # (e.g. fc667's tiny XRP: 0.13% of $21M → $1.50 margin for us → skip)
+        our_margin   = max(50.0 / their_lev, self._portfolio_usd * their_margin_pct)
         our_notional = our_margin * their_lev
 
         return our_notional, their_lev

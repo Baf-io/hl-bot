@@ -100,6 +100,12 @@ class RiskManager:
         raw_size = signal.size_usd if signal.size_usd > 0 else max_size * signal.confidence
         size = min(raw_size, max_size)
 
+        # ── Rule 2b: minimum notional floor ──────────────────────────────────
+        # Reject positions too small to be worth the gas/slippage.
+        # A $50 notional at 10x = $5 margin — not worth occupying a slot.
+        if size < settings.MIN_POSITION_NOTIONAL:
+            return False, f"notional ${size:.0f} below min ${settings.MIN_POSITION_NOTIONAL}", 0
+
         # ── Rule 3: correlation check ─────────────────────────────────────────
         if self._too_correlated(signal.coin):
             return False, f"{signal.coin} would create 3+ correlated positions", 0

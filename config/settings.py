@@ -20,6 +20,7 @@ MAX_POSITION_SIZE_PCT   = 0.15          # 15% per position (~$165 on $1100)
 DAILY_LOSS_HALT_PCT     = 0.10          # halt at -10% (~$110) — unchanged
 MAX_LEVERAGE            = 20
 PORTFOLIO_DELTA_MAX     = 0.95          # near-full directional exposure allowed
+MIN_POSITION_NOTIONAL   = 50            # reject signals below $50 notional — not worth a slot
 
 # ── Per-strategy slot caps ────────────────────────────────────────────────────
 # leaderboard: 6 slots × $165 = $990 max (5 whitelisted traders, ~1-2 open each)

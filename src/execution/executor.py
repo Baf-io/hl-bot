@@ -55,7 +55,7 @@ class Executor:
 
     # Positions smaller than this are considered undersized from an old PORTFOLIO_USD
     # setting and will be closed on startup so backfill can re-enter them correctly.
-    _MIN_SYNC_SIZE_USD = 30.0
+    _MIN_SYNC_SIZE_USD = 50.0
 
     def _sync_positions_from_hl(self):
         """
