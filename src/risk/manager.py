@@ -71,6 +71,11 @@ class RiskManager:
         if signal.meta.get("action") == "exit":
             return True, "exit approved", signal.size_usd
 
+        # ── Rule 0: one position per coin ────────────────────────────────────
+        existing = next((p for p in self.open_positions if p.coin == signal.coin), None)
+        if existing:
+            return False, f"already have {signal.coin} open (#{existing.id} {existing.strategy})", 0
+
         # ── Rule 1: max positions (global + per-strategy) ─────────────────────
         if len(self.open_positions) >= settings.MAX_OPEN_POSITIONS:
             return False, f"max positions ({settings.MAX_OPEN_POSITIONS}) reached", 0
