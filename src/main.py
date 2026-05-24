@@ -142,14 +142,8 @@ async def main():
         copier = LeaderboardCopier(store, feed)
         copier.set_signal_queue(signal_queue)
 
-        async def relay_signals():
-            while not signal_queue.empty():
-                sig = await signal_queue.get()
-                await executor.enqueue(sig)
-
         # Run immediately on startup, then refresh list every 5 min
         scheduler.add_job(copier.refresh_leaderboard, "interval", minutes=5, id="lb_refresh")
-        scheduler.add_job(relay_signals, "interval", seconds=1, id="lb_relay")
         # Trigger immediately so we don't wait 5 min for first subscription
         scheduler.add_job(copier.refresh_leaderboard, "date", id="lb_startup")
         # After leaderboard loads, backfill positions opened before bot started
@@ -273,11 +267,19 @@ async def main():
     scheduler.start()
 
     # ── Run ────────────────────────────────────────────────────────────────────
+    # Event-driven relay: leaderboard signals forwarded to executor immediately.
+    # Replaces the old 1-second scheduler poll that added up to 1000ms of exit latency.
+    async def relay_signals():
+        while True:
+            sig = await signal_queue.get()
+            await executor.enqueue(sig)
+
     await alerter.send("🤖 *HL-Bot started*")
     await asyncio.gather(
         feed.run(),
         executor.run(),
         position_guardian(),
+        relay_signals(),
     )
 
 

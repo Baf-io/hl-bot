@@ -12,6 +12,7 @@ KEY DESIGN: Position-aware tracking
   This eliminates the 10-min dedup race that caused 16x HYPE entries in one day.
 """
 import asyncio
+import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -65,6 +66,9 @@ class LeaderboardCopier:
         # Exit dedup: coin → last_exit_timestamp
         # Prevents TWAP exits (N close fills for one position) from firing N exit signals.
         self._recent_exits: dict[str, float] = {}
+
+        # Cache portfolio size — read once at init, not on every fill
+        self._portfolio_usd: float = float(os.getenv("PORTFOLIO_USD", 1000))
 
     # ── Leaderboard polling ────────────────────────────────────────────────────
 
@@ -310,9 +314,7 @@ class LeaderboardCopier:
                 their_acct_val = self._trader_acct_values.get(address, 0)
                 if their_acct_val > 0:
                     their_pct = their_notional / their_acct_val
-                    import os
-                    our_portfolio = float(os.getenv("PORTFOLIO_USD", 1000))
-                    our_size = max(20.0, our_portfolio * their_pct)
+                    our_size = max(20.0, self._portfolio_usd * their_pct)
                 else:
                     our_size = 0   # 0 → risk manager uses max_size (safe fallback)
 
@@ -357,9 +359,6 @@ class LeaderboardCopier:
         logger.info(f"[Leaderboard] Backfilling from {len(self._tracked)} traders...")
         total = 0
 
-        import os
-        our_portfolio = float(os.getenv("PORTFOLIO_USD", 1000))
-
         for address, positions in self._trader_positions.items():
             if address not in self._tracked:
                 continue
@@ -369,7 +368,7 @@ class LeaderboardCopier:
                 # Use cached position notional for accurate proportional sizing
                 their_notional = self._trader_position_notionals.get((address, coin), 0)
                 if their_acct_val > 0 and their_notional > 0:
-                    our_size = max(20.0, our_portfolio * (their_notional / their_acct_val))
+                    our_size = max(20.0, self._portfolio_usd * (their_notional / their_acct_val))
                 else:
                     our_size = 0   # risk manager uses max_size
 
