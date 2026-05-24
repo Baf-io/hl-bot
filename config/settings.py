@@ -61,6 +61,19 @@ COPY_MAX_LAG_MS           = 3000        # (legacy, fill-stream only) unused by s
 # position changes. Traders hold for days, so 45s latency is irrelevant — and this is what
 # kills the fee-bleeding fill-stream churn (was reacting to every TWAP/trim fill).
 COPY_RECONCILE_INTERVAL_S = 45
+
+# Auto-compound: size off LIVE account equity instead of a frozen PORTFOLIO_USD, so gains
+# roll into bigger positions and drawdowns shrink them. Per-position (15%) + delta caps
+# still bound risk. PORTFOLIO_USD becomes the initial seed only.
+PORTFOLIO_COMPOUND = os.getenv("PORTFOLIO_COMPOUND", "true").lower() == "true"
+
+# Trailing-profit exit on copied positions (the traders only buy-and-hold, so this banks
+# gains they'd give back). Arm once a position is +TRAIL_ARM_PCT in price, then exit if it
+# retraces TRAIL_GIVEBACK of its peak run. A trail-exited coin is LOCKED from re-entry until
+# the trader's net position resets (close/flip) — otherwise reconcile would instantly re-buy.
+TRAIL_ENABLED  = os.getenv("TRAIL_ENABLED", "true").lower() == "true"
+TRAIL_ARM_PCT  = 0.08    # only start protecting once +8% in price (a real move)
+TRAIL_GIVEBACK = 0.30    # exit on a 30% retrace from the peak favorable excursion
 COPY_MIN_THEIR_NOTIONAL   = 100         # position-aware tracking handles dedup; $100 = anti-dust
 COPY_MAX_POSITIONS_PER_TRADER = 5       # allow up to 5 (a9b95f has 3, fc667 has 6)
 # Margin-based sizing cap: cap is on MARGIN (not notional).

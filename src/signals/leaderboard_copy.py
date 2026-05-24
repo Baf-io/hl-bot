@@ -99,6 +99,10 @@ class LeaderboardCopier:
         # Coins we've already logged as contested — so we log only on change, not every poll.
         self._prev_contested: set[str] = set()
 
+        # Coins we trail-exited → locked from re-entry until the trader's position resets.
+        # coin -> the direction we were in when we trail-exited.
+        self._trail_locked: dict[str, str] = {}
+
     # ── Leaderboard / trader-list loading ───────────────────────────────────────
 
     async def refresh_leaderboard(self):
@@ -353,11 +357,14 @@ class LeaderboardCopier:
             await self._refresh_account_values()
 
             # Sync our in-memory book with reality FIRST: drop any position closed
-            # outside the bot (manual close, liquidation, native SL/TP). Otherwise
-            # reconcile would think we still hold a ghost and never re-establish it.
-            actual = await self._fetch_our_open_coins()
+            # outside the bot (manual close, liquidation, native SL/TP). Also auto-compound
+            # sizing off live equity. Both come from one fetch of our wallet state.
+            actual, equity = await self._fetch_our_state()
             if actual is not None:
                 self.risk.drop_phantoms(actual)
+            if equity and settings.PORTFOLIO_COMPOUND:
+                self._portfolio_usd = equity
+                self.risk.portfolio_value = equity
 
             desired = self._build_desired()
 
@@ -367,10 +374,39 @@ class LeaderboardCopier:
                 if p.strategy in ("leaderboard", "synced")
             }
 
-            entries = exits = flips = resizes = 0
+            entries = exits = flips = resizes = trails = 0
 
-            # Entries / flips / resizes
+            # ── Trailing-profit exits ─────────────────────────────────────────────
+            # The traders only buy-and-hold; this banks gains they'd otherwise give
+            # back. Arm once +TRAIL_ARM_PCT in price, exit on TRAIL_GIVEBACK retrace
+            # from the peak. A trail-exited coin is LOCKED from re-entry until the
+            # trader's position resets — otherwise we'd instantly re-buy and churn.
+            if settings.TRAIL_ENABLED and self.store:
+                for coin, p in list(held.items()):
+                    px = self.store.latest_mid(coin)
+                    if not px or not p.entry_price:
+                        continue
+                    exc = ((px - p.entry_price) / p.entry_price) if p.direction == "long" \
+                          else ((p.entry_price - px) / p.entry_price)
+                    if exc > p.peak_price_pct:
+                        p.peak_price_pct = exc
+                    if (p.peak_price_pct >= settings.TRAIL_ARM_PCT
+                            and exc <= p.peak_price_pct * (1 - settings.TRAIL_GIVEBACK)):
+                        logger.info(
+                            f"[Reconcile] TRAIL EXIT {coin} {p.direction} | "
+                            f"peak +{p.peak_price_pct:.1%} -> now +{exc:.1%}"
+                        )
+                        await self._emit_exit(coin, p.direction, "trail")
+                        self._trail_locked[coin] = p.direction   # lock until trader resets
+                        del held[coin]
+                        trails += 1
+
+            # ── Entries / flips / resizes (respecting trail-lock suppression) ─────
             for coin, d in desired.items():
+                if coin in self._trail_locked:
+                    if self._trail_locked[coin] == d["dir"]:
+                        continue                       # still locked — trader hasn't reset
+                    del self._trail_locked[coin]       # trader flipped — re-arm
                 cur = held.get(coin)
                 if cur is None:
                     await self._emit_entry(coin, d)
@@ -381,8 +417,7 @@ class LeaderboardCopier:
                     await self._emit_entry(coin, d)
                     flips += 1
                 elif cur.size_usd < self._RESIZE_MIN_RATIO * self._capped_target(d):
-                    # Materially under-sized vs target (e.g. a startup-synced position
-                    # the old engine opened small). Close & re-enter at correct size.
+                    # Materially under-sized vs target — close & re-enter at correct size.
                     logger.info(
                         f"[Reconcile] RESIZE {coin} ${cur.size_usd:,.0f} -> "
                         f"~${self._capped_target(d):,.0f} (under-sized)"
@@ -398,10 +433,16 @@ class LeaderboardCopier:
                     await self._emit_exit(coin, p.direction, "trader_closed")
                     exits += 1
 
-            if entries or exits or flips or resizes:
+            # Re-arm trail-locks once the trader no longer holds the coin
+            for coin in list(self._trail_locked):
+                if coin not in desired:
+                    del self._trail_locked[coin]
+
+            if entries or exits or flips or resizes or trails:
                 logger.info(
                     f"[Reconcile] desired={len(desired)} held={len(held)} | "
-                    f"+{entries} entries, {exits} exits, {flips} flips, {resizes} resizes"
+                    f"+{entries} entries, {exits} exits, {flips} flips, "
+                    f"{resizes} resizes, {trails} trails"
                 )
             else:
                 logger.debug(
@@ -442,10 +483,11 @@ class LeaderboardCopier:
             meta={"action": "exit", "reason": reason},
         ))
 
-    async def _fetch_our_open_coins(self) -> Optional[set]:
+    async def _fetch_our_state(self) -> tuple[Optional[set], Optional[float]]:
         """
-        Our wallet's currently-open perp coins, straight from HL. Returns None on
-        any error (so callers skip pruning rather than wrongly dropping everything).
+        Our wallet's currently-open perp coins AND account equity, straight from HL.
+        Returns (None, None) on any error so callers skip pruning/compounding rather
+        than acting on a bad read.
         """
         try:
             async with aiohttp.ClientSession() as session:
@@ -455,16 +497,18 @@ class LeaderboardCopier:
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     st = await resp.json(content_type=None)
-            if "marginSummary" not in st:          # malformed/empty response — don't prune
-                return None
-            return {
+            if "marginSummary" not in st:          # malformed/empty response — don't act
+                return None, None
+            coins = {
                 ap["position"]["coin"]
                 for ap in st.get("assetPositions", [])
                 if float(ap["position"].get("szi", 0)) != 0
             }
+            equity = float(st["marginSummary"].get("accountValue", 0)) or None
+            return coins, equity
         except Exception as e:
             logger.debug(f"[Reconcile] our-state fetch failed: {e}")
-            return None
+            return None, None
 
     def set_signal_queue(self, queue: asyncio.Queue):
         self._signal_queue = queue

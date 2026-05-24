@@ -36,6 +36,7 @@ class OpenPosition:
     leverage: float = 1.0       # leverage used — needed for margin-equivalent delta tracking
     opened_at: datetime = field(default_factory=datetime.utcnow)
     unrealized_pnl: float = 0.0
+    peak_price_pct: float = 0.0  # max favorable price excursion seen — for trailing-profit exit
 
 
 class RiskManager:
