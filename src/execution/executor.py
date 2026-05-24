@@ -137,14 +137,24 @@ class Executor:
         if size_coin <= 0:
             logger.warning(f"[Executor] {coin} size rounds to 0 at ${size_usd} — skipping")
             return
-        is_buy = direction == "long"
+        is_buy    = direction == "long"
+        is_copy   = signal.strategy == "leaderboard"
+
+        # For copy trades: set leverage to 5x cross before opening.
+        # Traders use 3–40x on their $10M+ portfolios — we cap at 5x to protect
+        # our $1K account. Cross margin shares collateral across all positions.
+        if is_copy:
+            try:
+                self._exchange.update_leverage(5, coin, True)   # 5x cross
+            except Exception as e:
+                logger.warning(f"[Executor] Could not set leverage for {coin}: {e}")
 
         # All strategies use market orders — latency matters, maker rebate is tiny vs missed entry
         result = await self._place_market(coin, is_buy, size_coin)
 
         filled, fill_px, err = self._parse_fill(result)
         if filled:
-            actual_px = fill_px or mid
+            actual_px   = fill_px or mid
             position_id = self.risk.register_fill(signal, size_usd, actual_px)
             logger.success(
                 f"[Executor] FILLED {direction.upper()} {size_coin} {coin} @ ${actual_px:,.4f} "
@@ -157,8 +167,13 @@ class Executor:
                 self.squeeze_guard.on_position_opened(
                     position_id, coin, direction, actual_px, source, size_usd
                 )
-            # Place native SL/TP on HL — survive bot crashes
-            await self._place_native_sltp(coin, is_buy, size_coin, actual_px)
+            # SL/TP: copy trades trust the trader's exit signal + guardian.
+            # Native SL/TP killed positions that ran +50-80% for weeks.
+            # Own-signal strategies (cascade, funding) still get SL/TP protection.
+            if not is_copy:
+                await self._place_native_sltp(coin, is_buy, size_coin, actual_px)
+            else:
+                logger.debug(f"[Executor] Leaderboard copy — no native SL/TP, trusting trader exit")
         else:
             logger.warning(f"[Executor] Order not filled for {coin}: {err}")
 

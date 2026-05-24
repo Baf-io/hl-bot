@@ -222,8 +222,8 @@ async def main():
     # We do NOT close on small losses — these traders hold through dips.
     # Cutting them at -1% and watching them recover to +5% is the old mistake.
 
-    ZOMBIE_HOURS     = 12.0   # close if open longer than this with no exit signal
-    NUCLEAR_LOSS_PCT = 0.10   # -10%: SL should have fired at -3%, something is wrong
+    ZOMBIE_HOURS     = 24.0   # close if open 24h with no exit signal (traders hold for days)
+    NUCLEAR_LOSS_PCT = 0.15   # -15% price: at 5x leverage = -75% on position, true disaster only
 
     async def position_guardian():
         from datetime import datetime, timezone
