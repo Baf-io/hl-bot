@@ -55,9 +55,9 @@ COPY_MAX_DRAWDOWN         = 0.35
 COPY_MAX_AVG_LEVERAGE     = 20
 COPY_MIN_TRADE_COUNT      = 200
 COPY_SIZE_SCALE           = 0.005       # 0.5% of their notional (scales to $100 portfolio)
-COPY_MAX_LAG_MS           = 300         # tighter — only copy if fast enough
-COPY_MIN_THEIR_NOTIONAL   = 200         # traders TWAP in at $50-500/fill; $200 catches first chunk
-COPY_MAX_POSITIONS_PER_TRADER = 3       # allow up to 3 open from same trader (was 2)
+COPY_MAX_LAG_MS           = 3000        # macro traders, 3s lag is fine for new position entries
+COPY_MIN_THEIR_NOTIONAL   = 100         # position-aware tracking handles dedup; $100 = anti-dust
+COPY_MAX_POSITIONS_PER_TRADER = 5       # allow up to 5 (a9b95f has 3, fc667 has 6)
 
 # Whitelist: if set, ONLY copy from these trader addresses (comma-separated).
 # Leave empty to copy from all qualified traders.

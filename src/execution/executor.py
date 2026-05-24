@@ -178,25 +178,45 @@ class Executor:
             logger.warning(f"[Executor] Order not filled for {coin}: {err}")
 
     async def _close_position(self, signal: TradeSignal):
-        # Try exact match first (coin + strategy)
+        # The signal.direction for exit signals = the direction WE ARE CLOSING.
+        # e.g. "long" means "close a LONG position in this coin".
+        # Matching by direction prevents cross-trader conflicts: if trader A closes
+        # their LONG but we're SHORT (from trader B), we correctly ignore it.
+        close_dir = signal.direction   # "long" or "short"
+
+        # 1. Exact match: coin + strategy + direction
         pos = next(
-            (p for p in self.risk.open_positions if p.coin == signal.coin and p.strategy == signal.strategy),
+            (p for p in self.risk.open_positions
+             if p.coin == signal.coin
+             and p.strategy == signal.strategy
+             and p.direction == close_dir),
             None,
         )
-        # Fallback: coin-only match — covers positions synced from HL on startup
-        # (those are tagged "synced" but close signals arrive as "leaderboard")
+        # 2. Direction match: coin + direction (covers "synced" strategy positions)
         if pos is None:
             pos = next(
-                (p for p in self.risk.open_positions if p.coin == signal.coin),
+                (p for p in self.risk.open_positions
+                 if p.coin == signal.coin and p.direction == close_dir),
                 None,
             )
             if pos:
                 logger.debug(
-                    f"[Executor] Coin-only match for {signal.coin} close "
-                    f"(strategy {pos.strategy!r} ≠ {signal.strategy!r})"
+                    f"[Executor] Direction-match close {signal.coin} {close_dir} "
+                    f"(strategy {pos.strategy!r})"
                 )
+        # 3. Last resort: coin-only (handles guardian/zombie closes where direction may vary)
+        if pos is None and signal.meta.get("reason") in ("zombie", "nuclear"):
+            pos = next(
+                (p for p in self.risk.open_positions if p.coin == signal.coin),
+                None,
+            )
         if not pos:
-            logger.warning(f"[Executor] Close signal for {signal.coin} but no open position found")
+            logger.warning(
+                f"[Executor] Close signal for {signal.coin} {close_dir} "
+                f"but no matching position found (have: "
+                + str([(p.coin, p.direction) for p in self.risk.open_positions if p.coin == signal.coin])
+                + ")"
+            )
             return
 
         mid = await self._get_mid_price(signal.coin)

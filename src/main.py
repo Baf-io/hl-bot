@@ -222,8 +222,8 @@ async def main():
     # We do NOT close on small losses — these traders hold through dips.
     # Cutting them at -1% and watching them recover to +5% is the old mistake.
 
-    ZOMBIE_HOURS     = 24.0   # close if open 24h with no exit signal (traders hold for days)
-    NUCLEAR_LOSS_PCT = 0.15   # -15% price: at 5x leverage = -75% on position, true disaster only
+    ZOMBIE_HOURS     = 72.0   # macro traders hold for days — 72h before force-close
+    NUCLEAR_LOSS_PCT = 0.20   # -20% price move = true disaster (a9b95f held -6% BTC, we trust them)
 
     async def position_guardian():
         from datetime import datetime, timezone

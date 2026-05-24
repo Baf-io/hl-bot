@@ -2,10 +2,18 @@
 Strategy 2: Leaderboard Alpha Capture
 ──────────────────────────────────────
 Polls HL leaderboard, filters quality traders, mirrors their fills via WebSocket.
-Aggressive mode: loosened filters, faster lag cutoff, all signals relayed.
+
+KEY DESIGN: Position-aware tracking
+  • We track each trader's known open positions (coin → direction).
+  • Fills that add to an existing position (TWAP) are SKIPPED — we already entered.
+  • We only fire entry signals on genuinely NEW positions (coin not in tracker).
+  • On full close: remove from tracker, fire exit signal.
+  • On direction flip: fire exit for old side, then entry for new side.
+  This eliminates the 10-min dedup race that caused 16x HYPE entries in one day.
 """
 import asyncio
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional
 import aiohttp
@@ -19,6 +27,8 @@ HL_REST = (
     if settings.HL_TESTNET
     else "https://api.hyperliquid.xyz/info"
 )
+
+SKIP_PREFIXES = ("xyz:", "@", "km:", "k:")   # tokenized stocks / synthetic assets
 
 
 @dataclass
@@ -39,9 +49,22 @@ class LeaderboardCopier:
         self.feed = feed
         self._tracked: dict[str, TrackedTrader] = {}
         self._signal_queue: Optional[asyncio.Queue] = None
-        self._recent_signals: set = set()           # entry dedup cache
-        self._recent_exits: dict[str, float] = {}   # exit dedup: coin → timestamp
-        self._trader_acct_values: dict[str, float] = {}  # cached account equity per trader
+
+        # Position state per trader: address → {coin → "long"|"short"}
+        # Populated from API on startup and kept in sync by fill handler.
+        # This is the core guard against TWAP re-entries.
+        self._trader_positions: dict[str, dict[str, str]] = defaultdict(dict)
+
+        # Account equity per trader for proportional sizing
+        self._trader_acct_values: dict[str, float] = {}
+
+        # Position notionals from API: (address, coin) → their_notional_usd
+        # Seeded by _refresh_account_values, used by backfill for accurate sizing.
+        self._trader_position_notionals: dict[tuple, float] = {}
+
+        # Exit dedup: coin → last_exit_timestamp
+        # Prevents TWAP exits (N close fills for one position) from firing N exit signals.
+        self._recent_exits: dict[str, float] = {}
 
     # ── Leaderboard polling ────────────────────────────────────────────────────
 
@@ -55,41 +78,43 @@ class LeaderboardCopier:
         if settings.COPY_TRADER_WHITELIST:
             raw = [t for t in raw if t.address.lower() in settings.COPY_TRADER_WHITELIST]
             logger.info(
-                f"[Leaderboard] Whitelist active — filtering to "
-                f"{len(raw)} of {len(raw)} traders: "
-                + ", ".join(a[:10] + "…" for a in settings.COPY_TRADER_WHITELIST)
+                f"[Leaderboard] Whitelist — {len(raw)} traders: "
+                + ", ".join(a[:10] + "..." for a in settings.COPY_TRADER_WHITELIST)
             )
 
         for t in raw:
             t.score = self._score(t)
-        top = raw
 
-        new_addresses = {t.address for t in top}
+        new_addresses = {t.address for t in raw}
         old_addresses = set(self._tracked.keys())
 
-        for trader in top:
+        for trader in raw:
             if trader.address not in old_addresses:
                 channel = f"userFills:{trader.address}"
                 self.feed.subscribe(channel, self._make_fill_handler(trader.address))
                 logger.info(
-                    f"[Leaderboard] ✅ Tracking {trader.address[:10]}… "
-                    f"PnL=${trader.realized_pnl:,.0f} WR={trader.win_rate:.0%} "
-                    f"score={trader.score:.3f}"
+                    f"[Leaderboard] Tracking {trader.address[:10]}... "
+                    f"PnL=${trader.realized_pnl:,.0f} score={trader.score:.3f}"
                 )
 
         for addr in old_addresses - new_addresses:
-            logger.info(f"[Leaderboard] ❌ Dropping {addr[:10]}…")
+            logger.info(f"[Leaderboard] Dropping {addr[:10]}...")
 
-        self._tracked = {t.address: t for t in top}
+        self._tracked = {t.address: t for t in raw}
         logger.info(f"[Leaderboard] Tracking {len(self._tracked)} traders")
 
-        # Refresh cached account equity for proportional sizing
+        # Refresh account equity + position state for proportional sizing
         asyncio.get_event_loop().create_task(self._refresh_account_values())
 
     async def _refresh_account_values(self):
         """
-        Fetch each tracked trader's account equity so we can size proportionally.
-        Called after refresh_leaderboard(). Runs in background, failure is non-fatal.
+        Fetch each tracked trader's account equity and current positions.
+        Runs after refresh_leaderboard(). Failure is non-fatal.
+
+        Dual purpose:
+          1. Cache account equity for proportional size calculation.
+          2. Seed _trader_positions so backfill and fill handler know what
+             the trader already holds — prevents duplicate entries.
         """
         async with aiohttp.ClientSession() as session:
             for address in list(self._tracked.keys()):
@@ -100,16 +125,36 @@ class LeaderboardCopier:
                         timeout=aiohttp.ClientTimeout(total=10),
                     ) as resp:
                         state = await resp.json(content_type=None)
-                    ms = state.get("marginSummary", {})
+
+                    ms       = state.get("marginSummary", {})
                     acct_val = float(ms.get("accountValue", 0))
                     if acct_val > 0:
                         self._trader_acct_values[address] = acct_val
-                        logger.debug(
-                            f"[Leaderboard] Acct value {address[:10]}… = ${acct_val:,.0f}"
-                        )
+
+                    # Seed position tracker and notional cache from live API state
+                    known = self._trader_positions[address]
+                    for ap in state.get("assetPositions", []):
+                        pos  = ap.get("position", {})
+                        szi  = float(pos.get("szi", 0))
+                        coin = pos.get("coin", "")
+                        if coin.startswith(SKIP_PREFIXES):
+                            continue
+                        ep = float(pos.get("entryPx") or 0)
+                        notional = abs(szi) * ep
+                        if notional < 50:   # dust — ignore
+                            continue
+                        if szi != 0:
+                            known[coin] = "long" if szi > 0 else "short"
+                            self._trader_position_notionals[(address, coin)] = notional
+
+                    logger.debug(
+                        f"[Leaderboard] {address[:10]}... acct=${acct_val:,.0f} "
+                        f"known_pos={list(known.keys())}"
+                    )
                     await asyncio.sleep(0.4)
+
                 except Exception as e:
-                    logger.debug(f"[Leaderboard] Could not fetch acct value for {address[:10]}: {e}")
+                    logger.debug(f"[Leaderboard] acct refresh error {address[:10]}: {e}")
 
     def _passes_filter(self, t: TrackedTrader) -> bool:
         ok = (
@@ -142,7 +187,7 @@ class LeaderboardCopier:
         return on_fill
 
     async def _handle_fill(self, address: str, msg: dict):
-        now = time.time()
+        now   = time.time()
         fills = msg.get("data", {}).get("fills", [])
         if not fills:
             return
@@ -161,11 +206,11 @@ class LeaderboardCopier:
                 px         = float(fill.get("px", 0))
                 closed_pnl = float(fill.get("closedPnl", 0))
 
-                # Skip tokenized stocks/commodities — not tradeable on perp side
-                if coin.startswith("xyz:") or coin.startswith("@") or coin.startswith("km:") or coin.startswith("k:"):
+                # Skip tokenized stocks / synthetics
+                if coin.startswith(SKIP_PREFIXES):
                     continue
 
-                # dir: "Open Long" / "Open Short" / "Close Long" / "Close Short"
+                # Parse direction
                 if "Long" in side or side == "B":
                     direction = "long"
                 elif "Short" in side or side == "A":
@@ -175,16 +220,25 @@ class LeaderboardCopier:
 
                 is_close = closed_pnl != 0 or "Close" in side
 
-                # ── COPY EXIT — relay close signals (deduplicated per coin per 60s) ──
-                # We mirror their exit: if they close via SL/TP/manual, we follow.
-                # Dedup prevents the same close flooding N times (TWAP exits = many fills).
+                # ── EXIT: trader closed their position ────────────────────────
                 if is_close:
+                    # Remove from position tracker so next open is treated as new
+                    self._trader_positions[address].pop(coin, None)
+
+                    # Dedup: TWAP exits fire many close fills; only relay once per 60s
                     last_exit = self._recent_exits.get(coin, 0)
                     if now - last_exit < 60:
-                        logger.debug(f"[Leaderboard] Exit dedup skip {coin} (sent {now-last_exit:.0f}s ago)")
+                        logger.debug(
+                            f"[Leaderboard] Exit dedup skip {coin} "
+                            f"({now - last_exit:.0f}s ago)"
+                        )
                         continue
+
                     self._recent_exits[coin] = now
-                    logger.info(f"[Leaderboard] 🚪 COPY EXIT {coin} | lag={lag_ms:.0f}ms | from {address[:10]}…")
+                    logger.info(
+                        f"[Leaderboard] COPY EXIT {coin} | lag={lag_ms:.0f}ms | "
+                        f"from {address[:10]}..."
+                    )
                     if self._signal_queue:
                         await self._signal_queue.put(TradeSignal(
                             strategy="leaderboard",
@@ -196,78 +250,89 @@ class LeaderboardCopier:
                         ))
                     continue
 
-                # ── Entry filters (only applied to opens) ─────────────────────
-                # Lag: skip stale entries — entry price matters, exit doesn't
+                # ── ENTRY: trader opened a position ───────────────────────────
+
+                # Lag filter: entries need to be fast (exits can be slow — we'll follow)
                 if lag_ms > settings.COPY_MAX_LAG_MS:
-                    logger.debug(f"[Leaderboard] Entry lag too high {lag_ms:.0f}ms — skip")
+                    logger.debug(f"[Leaderboard] Entry lag {lag_ms:.0f}ms > {settings.COPY_MAX_LAG_MS}ms — skip")
                     continue
 
-                # Size: traders TWAP in at $50-500/fill; $200 catches first entry chunk
-                their_notional = sz * px
-                if their_notional < settings.COPY_MIN_THEIR_NOTIONAL:
+                # ── Position-aware dedup ──────────────────────────────────────
+                # This is the core fix: if trader already holds this coin, skip.
+                # Prevents copying every TWAP fill of a position build.
+                existing_dir = self._trader_positions[address].get(coin)
+
+                if existing_dir is not None:
+                    if existing_dir == direction:
+                        # Same-direction TWAP add — we already entered this one
+                        logger.debug(
+                            f"[Leaderboard] TWAP add skip {coin} {direction} "
+                            f"from {address[:10]} (already tracked)"
+                        )
+                        continue
+                    else:
+                        # Direction FLIP: exit old side first, then enter new
+                        logger.info(
+                            f"[Leaderboard] Direction flip {coin} "
+                            f"{existing_dir}->{direction} from {address[:10]}"
+                        )
+                        # Close signal direction = the direction WE ARE CLOSING.
+                        # existing_dir is what they had (and what we copied), so
+                        # we emit an exit for that direction.
+                        if self._signal_queue:
+                            await self._signal_queue.put(TradeSignal(
+                                strategy="leaderboard",
+                                coin=coin,
+                                direction=existing_dir,   # close the position we copied
+                                size_usd=0,
+                                confidence=1.0,
+                                meta={"action": "exit", "reason": "trader_flipped"},
+                            ))
+                        self._trader_positions[address].pop(coin, None)
+                        # Fall through to register and enter the new direction
+
+                # ── Per-trader slot cap ───────────────────────────────────────
+                n_open = len(self._trader_positions[address])
+                if n_open >= settings.COPY_MAX_POSITIONS_PER_TRADER:
                     logger.debug(
-                        f"[Leaderboard] Skip small entry {coin} "
-                        f"their=${their_notional:.0f} (<${settings.COPY_MIN_THEIR_NOTIONAL:,})"
+                        f"[Leaderboard] Trader cap {address[:10]} "
+                        f"({n_open}/{settings.COPY_MAX_POSITIONS_PER_TRADER})"
                     )
                     continue
 
-                # Per-trader slot cap: max N open positions per trader
-                trader_open_count = sum(
-                    1 for key in self._recent_signals if key.startswith(f"src:{address}:")
-                )
-                if trader_open_count >= settings.COPY_MAX_POSITIONS_PER_TRADER:
-                    logger.debug(
-                        f"[Leaderboard] Trader cap hit for {address[:10]} "
-                        f"({trader_open_count}/{settings.COPY_MAX_POSITIONS_PER_TRADER} slots)"
-                    )
-                    continue
+                # Register position in tracker (before emitting signal)
+                self._trader_positions[address][coin] = direction
 
-                # Dedup: skip if we already have ANY position in this coin
-                # (prevents long+short same coin from two different traders)
-                dedup_key = f"{coin}"
-                if dedup_key in self._recent_signals:
-                    logger.debug(f"[Leaderboard] Dedup skip {coin} (already in play)")
-                    continue
-                self._recent_signals.add(dedup_key)
-                # Track per-trader slots with source prefix
-                src_key = f"src:{address}:{coin}"
-                self._recent_signals.add(src_key)
-                # 10min dedup — traders build positions over 5-30min, don't re-enter
-                asyncio.get_event_loop().call_later(600, self._recent_signals.discard, dedup_key)
-                asyncio.get_event_loop().call_later(600, self._recent_signals.discard, src_key)
-
-                # ── Proportional sizing: mirror their exposure fraction ──────────
-                # our_size = our_portfolio × (their_fill / their_account_value)
+                # ── Proportional sizing ───────────────────────────────────────
+                # our_size = our_portfolio × (their_fill_notional / their_account_value)
                 # Capped at max_position_size by risk manager.
-                # Falls back to full slot if account value unknown.
-                their_notional   = sz * px
-                their_acct_val   = self._trader_acct_values.get(address, 0)
+                their_notional = sz * px
+                their_acct_val = self._trader_acct_values.get(address, 0)
                 if their_acct_val > 0:
                     their_pct = their_notional / their_acct_val
-                    # Clamp: don't size below $20 (noise) or above full slot
-                    from config import settings as _s
-                    our_portfolio = float(__import__("os").getenv("PORTFOLIO_USD", 1000))
+                    import os
+                    our_portfolio = float(os.getenv("PORTFOLIO_USD", 1000))
                     our_size = max(20.0, our_portfolio * their_pct)
                 else:
                     our_size = 0   # 0 → risk manager uses max_size (safe fallback)
 
                 logger.info(
-                    f"[Leaderboard] 🔥 COPY {direction.upper()} {coin} "
-                    f"(their ${their_notional:,.0f} / acct ${their_acct_val:,.0f} → us ${our_size:,.0f})"
-                    f" | lag={lag_ms:.0f}ms | from {address[:10]}…"
+                    f"[Leaderboard] COPY {direction.upper()} {coin} | "
+                    f"their=${their_notional:,.0f}/acct=${their_acct_val:,.0f} -> us=${our_size:,.0f} | "
+                    f"lag={lag_ms:.0f}ms | {address[:10]}..."
                 )
 
                 signal = TradeSignal(
                     strategy="leaderboard",
                     coin=coin,
                     direction=direction,
-                    size_usd=our_size,   # proportional; risk manager caps at max_position_size
+                    size_usd=our_size,
                     confidence=1.0,
                     meta={
-                        "source": address,
-                        "lag_ms": lag_ms,
+                        "source":         address,
+                        "lag_ms":         lag_ms,
                         "their_size_usd": their_notional,
-                        "action": "enter",
+                        "action":         "enter",
                     },
                 )
                 if self._signal_queue:
@@ -276,85 +341,61 @@ class LeaderboardCopier:
             except Exception as e:
                 logger.error(f"[Leaderboard] Fill parse error: {e}")
 
+    # ── Backfill on startup ────────────────────────────────────────────────────
+
     async def backfill_existing_positions(self):
         """
-        Called once on startup after refresh_leaderboard().
-        Fetches each tracked trader's LIVE positions and emits entry signals
-        for any copyable coin we don't already have in our dedup cache.
-        This catches positions opened before the bot started / subscribed.
+        Called once after refresh_leaderboard() + _refresh_account_values().
+        Emits entry signals for positions traders hold NOW that we don't already have.
+
+        _trader_positions is already seeded by _refresh_account_values(), so we
+        know what each trader holds. We just emit entry signals for those not yet
+        in our own account (risk manager handles the actual de-dup).
         """
         if not self._tracked:
             return
-        logger.info(f"[Leaderboard] 📥 Backfilling positions from {len(self._tracked)} traders…")
+        logger.info(f"[Leaderboard] Backfilling from {len(self._tracked)} traders...")
         total = 0
-        async with aiohttp.ClientSession() as session:
-            for address in self._tracked:
-                try:
-                    async with session.post(
-                        HL_REST,
-                        json={"type": "clearinghouseState", "user": address},
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as resp:
-                        state = await resp.json(content_type=None)
-                    await asyncio.sleep(0.4)
 
-                    for ap in state.get("assetPositions", []):
-                        pos = ap.get("position", {})
-                        szi = float(pos.get("szi", 0))
-                        if szi == 0:
-                            continue
-                        coin = pos.get("coin", "")
-                        if coin.startswith("xyz:") or coin.startswith("@") or coin.startswith("km:") or coin.startswith("k:"):
-                            continue
-                        # Skip dust: HL keeps near-zero szi positions in the API even after
-                        # they're effectively closed. Anything under $50 notional is noise.
-                        entry_px = float(pos.get("entryPx") or 0)
-                        if abs(szi) * entry_px < 50:
-                            continue
-                        # Skip if we already have a dedup entry (handled by live fill)
-                        if coin in self._recent_signals:
-                            continue
+        import os
+        our_portfolio = float(os.getenv("PORTFOLIO_USD", 1000))
 
-                        direction  = "long" if szi > 0 else "short"
-                        entry_px   = float(pos.get("entryPx") or 0)
-                        notional   = abs(szi) * entry_px
+        for address, positions in self._trader_positions.items():
+            if address not in self._tracked:
+                continue
+            their_acct_val = self._trader_acct_values.get(address, 0)
 
-                        logger.info(
-                            f"[Leaderboard] 📥 BACKFILL {direction.upper()} {coin} "
-                            f"(their ${notional:,.0f}) from {address[:10]}…"
-                        )
-                        # Mark dedup so live fills don't double-enter same coin
-                        self._recent_signals.add(coin)
-                        self._recent_signals.add(f"src:{address}:{coin}")
-                        asyncio.get_event_loop().call_later(3600, self._recent_signals.discard, coin)
-                        asyncio.get_event_loop().call_later(3600, self._recent_signals.discard, f"src:{address}:{coin}")
+            for coin, direction in list(positions.items()):
+                # Use cached position notional for accurate proportional sizing
+                their_notional = self._trader_position_notionals.get((address, coin), 0)
+                if their_acct_val > 0 and their_notional > 0:
+                    our_size = max(20.0, our_portfolio * (their_notional / their_acct_val))
+                else:
+                    our_size = 0   # risk manager uses max_size
 
-                        if self._signal_queue:
-                            their_acct_val = self._trader_acct_values.get(address, 0)
-                            if their_acct_val > 0:
-                                our_portfolio = float(__import__("os").getenv("PORTFOLIO_USD", 1000))
-                                our_size = max(20.0, our_portfolio * (notional / their_acct_val))
-                            else:
-                                our_size = 0
-                            await self._signal_queue.put(TradeSignal(
-                                strategy="leaderboard",
-                                coin=coin,
-                                direction=direction,
-                                size_usd=our_size,
-                                confidence=1.0,
-                                meta={
-                                    "source":        address,
-                                    "action":        "enter",
-                                    "backfill":      True,
-                                    "their_size_usd": notional,
-                                },
-                            ))
-                            total += 1
+                logger.info(
+                    f"[Leaderboard] BACKFILL {direction.upper()} {coin} "
+                    f"their=${their_notional:,.0f}/acct=${their_acct_val:,.0f} "
+                    f"-> us=${our_size:,.0f} | from {address[:10]}..."
+                )
 
-                except Exception as e:
-                    logger.warning(f"[Leaderboard] Backfill error for {address[:10]}: {e}")
+                if self._signal_queue:
+                    await self._signal_queue.put(TradeSignal(
+                        strategy="leaderboard",
+                        coin=coin,
+                        direction=direction,
+                        size_usd=our_size,
+                        confidence=1.0,
+                        meta={
+                            "source":         address,
+                            "action":         "enter",
+                            "backfill":       True,
+                            "their_size_usd": their_notional,
+                        },
+                    ))
+                    total += 1
 
-        logger.info(f"[Leaderboard] 📥 Backfill complete — {total} signals queued")
+        logger.info(f"[Leaderboard] Backfill complete — {total} signals queued")
 
     def set_signal_queue(self, queue: asyncio.Queue):
         self._signal_queue = queue
@@ -365,7 +406,6 @@ class LeaderboardCopier:
         """
         Load traders from data/traders.json (generated by find_traders.py).
         Falls back to hardcoded list if file not found.
-        Refresh by running: python src/find_traders.py
         """
         import json, os
         traders_file = os.path.join(
@@ -389,62 +429,19 @@ class LeaderboardCopier:
             logger.info(f"[Leaderboard] Loaded {len(traders)} traders from {traders_file}")
             return traders
 
-        # ── Fallback hardcoded list ────────────────────────────────────────────
-        logger.warning("[Leaderboard] data/traders.json not found — using hardcoded fallback. Run find_traders.py to generate.")
+        logger.warning("[Leaderboard] data/traders.json not found — using hardcoded fallback")
 
-        # Curated from beacontrade.io/leaderboard — all active accounts with positive PnL
-        # Updated: 2026-05-24 | Source: beacontrade.io/leaderboard
-        # Format: (address, est_pnl_usd, win_rate, max_dd, avg_lev, trade_count, age_days)
+        # Curated conviction traders — macro accounts, long hold times, clean thesis
+        # Updated: 2026-05-24
+        # WHITELIST in .env overrides this list entirely
         KNOWN_TRADERS = [
-            # ── Tier 1: Mega whales — $10M+ accounts, extremely active ───────────
-            # Rank 1  | $114M | 183 positions | +$3.6K
-            ("0x31ca8395cf837de08b24da3f660e77761dfb974b", 2_000_000, 0.62, 0.15, 8,  5000, 180),
-            # Rank 3  | $25M  | 87 positions  | +$762K
-            ("0xecb63caa47c7c4e77f60f1ce858cf28dc2b82b00", 1_500_000, 0.63, 0.18, 8,  3000, 90),
-            # Rank 4  | $22M  | 28 positions  | +$9M unrealized — best PnL on board
-            ("0x7fdafde5cfb5465924316eced2d3715494c517d1", 1_000_000, 0.65, 0.12, 7,  2000, 120),
-            # Rank 5  | $20M  | 6 positions   | +$91.9K
-            ("0xfc667adba8d4837586078f4fdcdc29804337ca06", 900_000,   0.62, 0.16, 8,  2000, 100),
-            # Rank 6  | $13M  | 6 positions   | +$493K
-            ("0x31dea2516beee92135b96f464eeec3cf292a13f2", 700_000,   0.63, 0.17, 9,  1800, 90),
-            # Rank 7  | $11M  | 76 positions  | +$716K
-            ("0x023a3d058020fb76cca98f01b3c48c8938a22355", 800_000,   0.61, 0.20, 10, 2500, 90),
-            # Rank 8  | $11M  | 150 positions | +$41K — highest frequency
-            ("0x57dd78cd36e76e2011e8f6dc25cabbaba994494b", 600_000,   0.60, 0.22, 9,  4000, 80),
-            # ── Tier 2: $1M–$10M accounts, active and profitable ─────────────────
-            # Rank 10 | $4M   | 176 positions | +$251K — extremely active
-            ("0x7717a7a245d9f950e586822b8c9b46863ed7bd7e", 400_000,   0.61, 0.20, 8,  3500, 75),
-            # Rank 11 | $4M   | 1 position    | +$397.8K — high conviction
-            ("0x9e8b1e51c642f4c8b87c6ba11c53d516a218afc4", 400_000,   0.64, 0.15, 7,  1500, 80),
-            # Rank 13 | $2.6M | 4 positions   | +$75.2K
-            ("0x61ceef212ff4a86933c69fb6aca2fe35d8f2a62b", 300_000,   0.61, 0.19, 8,  1600, 70),
-            # Rank 15 | $2M   | 102 positions | +$72.6K — very active
-            ("0x7c930969fcf3e5a5c78bcf2e1cefda3f53e3c8fd", 250_000,   0.60, 0.22, 10, 1800, 65),
-            # Rank 18 | $1.2M | 2 positions   | +$65.3K
-            ("0xa6ee1ed1ae80b8352603654b39f5e7b9bedd5078", 200_000,   0.61, 0.20, 9,  1200, 60),
-            # ── Tier 3: High ROI relative to account size ─────────────────────────
-            # Rank 20 | $827K | 9 positions   | +$1.12M — insane ROI ratio
-            ("0xf517639a8872e756ac98d3c65507d2ebc25cc032", 300_000,   0.64, 0.18, 12, 1500, 60),
-            # Rank 21 | $607K | 1 position    | +$3.5K
-            ("0x7839e2f2c375dd2935193f2736167514efff9916", 200_000,   0.60, 0.22, 10, 1500, 75),
-            # Rank 23 | $451K | 1 position    | +$94.4K
-            ("0xcab59c7a92b8f7c4d5cde72bb7669ee7d75b6e6e", 150_000,   0.61, 0.21, 9,  1000, 50),
-            # Rank 24 | $430K | 83 positions  | +$852K — best ROI ratio mid-tier
-            ("0xc926ddba8b7617dbc65712f20cf8e1b58b8598d3", 500_000,   0.62, 0.19, 8,  2000, 70),
-            # Rank 26 | $182K | 2 positions   | +$14K
-            ("0x535e34b5ada64997afc88444271ae9b3f82b3867", 80_000,    0.59, 0.25, 10, 600,  35),
-            # Rank 29 | $110K | 5 positions   | +$905
-            ("0x1c1c270b573d55b68b3d14722b5d5d401511bed0", 60_000,    0.58, 0.26, 9,  500,  30),
-            # Rank 31 | $67K  | 10 positions  | +$20.8K — active small account
-            ("0x53babe76166eae33c861aeddf9ce89af20311cd0", 50_000,    0.58, 0.27, 11, 400,  25),
+            # a9b95f | $7M account | BTC SHORT + ETH SHORT + HYPE LONG | macro conviction
+            ("0xa9b95f2a2e7ef219021efc5c04c32761b8553bbd", 2_000_000, 0.65, 0.15, 8, 500, 120),
+            # 42b6d9 | $3.1M account | ZEC SHORT specialist | clean, single-thesis
+            ("0x42b6d907f36255d48f70db8b4a2684088a162634", 1_000_000, 0.70, 0.12, 8, 500, 90),
+            # fc667  | $20M account | BTC/ETH/SOL SHORT + HYPE LONG | macro bears
+            ("0xfc667adba8d4837586078f4fdcdc29804337ca06", 900_000,   0.62, 0.16, 8, 2000, 100),
         ]
-
-        if not KNOWN_TRADERS:
-            logger.warning(
-                "[Leaderboard] No trader addresses configured. "
-                "Add addresses from app.hyperliquid.xyz/leaderboard to KNOWN_TRADERS in leaderboard_copy.py"
-            )
-            return []
 
         traders = []
         for addr, pnl, wr, dd, lev, tc, age in KNOWN_TRADERS:
@@ -462,13 +459,10 @@ class LeaderboardCopier:
     @staticmethod
     def _parse_leaderboard(data) -> list[TrackedTrader]:
         traders = []
-
-        # Handle both list and dict responses
         rows = data if isinstance(data, list) else data.get("leaderboardRows", [])
 
         for entry in rows:
             try:
-                # HL returns windowPerformances as list of [window, stats]
                 perfs = entry.get("windowPerformances", [])
                 stats = {}
                 for window, s in perfs:
@@ -478,13 +472,13 @@ class LeaderboardCopier:
                 if not stats and perfs:
                     stats = perfs[0][1] if isinstance(perfs[0], list) else {}
 
-                pnl        = float(stats.get("pnl", entry.get("pnl", 0)))
-                win_rate   = float(stats.get("winRate", 0.5))
-                drawdown   = float(stats.get("maxDrawdown", entry.get("maxDrawdown", 0.5)))
-                leverage   = float(stats.get("avgLeverage", entry.get("avgLeverage", 5)))
-                trades     = int(stats.get("tradeCount", entry.get("tradeCount", 0)))
-                age        = int(entry.get("accountAgeDays", 30))
-                address    = entry.get("ethAddress", entry.get("user", ""))
+                pnl      = float(stats.get("pnl", entry.get("pnl", 0)))
+                win_rate = float(stats.get("winRate", 0.5))
+                drawdown = float(stats.get("maxDrawdown", entry.get("maxDrawdown", 0.5)))
+                leverage = float(stats.get("avgLeverage", entry.get("avgLeverage", 5)))
+                trades   = int(stats.get("tradeCount", entry.get("tradeCount", 0)))
+                age      = int(entry.get("accountAgeDays", 30))
+                address  = entry.get("ethAddress", entry.get("user", ""))
 
                 if not address:
                     continue
