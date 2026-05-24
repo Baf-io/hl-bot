@@ -64,6 +64,11 @@ COPY_MAX_POSITIONS_PER_TRADER = 5       # allow up to 5 (a9b95f has 3, fc667 has
 # e.g. $1120 × 15% × 10x = $1,680 notional — but only $168 of real margin committed.
 # Prevents blindly copying 50x gamblers; real traders use 5-10x.
 COPY_MAX_COPY_LEVERAGE    = 10          # don't mirror leverage above 10x
+# Minimum margin (as % of portfolio) we must commit to open a copy position.
+# Prevents high-leverage traders from creating slots worth only a few dollars.
+# e.g. a9b95f 20x ETH: our_notional=$165 passes $50 notional floor but our_margin=$8 — skip.
+# At 1% of $1120 = $11.20 minimum margin.  ZEC/PAXG at ~$17 margin still allowed.
+COPY_MIN_MARGIN_PCT       = 0.01        # 1% of portfolio (~$11 on $1120)
 
 # Whitelist: if set, ONLY copy from these trader addresses (comma-separated).
 # Leave empty to copy from all qualified traders.

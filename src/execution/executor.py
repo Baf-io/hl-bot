@@ -87,14 +87,21 @@ class Executor:
                         f"[Executor] Dust position {direction} {coin} ${size_usd:.0f} "
                         f"< ${self._MIN_SYNC_SIZE_USD} — closing for re-entry at correct size"
                     )
+                    closed = False
                     try:
-                        is_buy = direction == "short"   # close short = buy
                         self._exchange.market_close(coin)
                         dust_closed.append(coin)
                         logger.info(f"[Executor] Dust closed: {coin}")
+                        closed = True
                     except Exception as e:
-                        logger.warning(f"[Executor] Could not close dust {coin}: {e}")
-                    continue  # don't register in risk manager — backfill will re-enter
+                        logger.warning(
+                            f"[Executor] Could not close dust {coin}: {e} "
+                            f"— registering so guardian/exit can clean it up"
+                        )
+                    if closed:
+                        continue  # successfully closed — skip registration
+                    # Fall through: register the position so the bot knows about it.
+                    # It will be closed when the trader exits or the guardian fires.
 
                 from data.store import TradeSignal
                 fake_signal = TradeSignal(

@@ -259,7 +259,15 @@ class LeaderboardCopier:
 
         from config import settings as _s
         if our_notional < _s.MIN_POSITION_NOTIONAL:
-            return 0.0, their_lev   # caller should skip this coin
+            return 0.0, their_lev   # notional too small — skip
+
+        # Margin floor: catch high-leverage dust that passes the notional check.
+        # e.g. a9b95f 20x ETH: our_notional=$165 (passes $50 floor) but our_margin=$8
+        # → $8 of real capital is not worth a position slot.
+        # At COPY_MIN_MARGIN_PCT=1%, floor = $11.20 on $1120 portfolio.
+        min_margin = self._portfolio_usd * _s.COPY_MIN_MARGIN_PCT
+        if our_margin < min_margin:
+            return 0.0, their_lev   # margin too small — skip
 
         return our_notional, their_lev
 
