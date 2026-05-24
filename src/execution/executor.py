@@ -140,12 +140,17 @@ class Executor:
         is_buy    = direction == "long"
         is_copy   = signal.strategy == "leaderboard"
 
-        # For copy trades: set leverage to 5x cross before opening.
-        # Traders use 3–40x on their $10M+ portfolios — we cap at 5x to protect
-        # our $1K account. Cross margin shares collateral across all positions.
+        # For copy trades: set leverage to match the trader's leverage (capped by COPY_MAX_COPY_LEVERAGE).
+        # Signal meta["leverage"] is already capped at settings.COPY_MAX_COPY_LEVERAGE (10x).
+        # Cross margin — shares collateral across all positions.
         if is_copy:
+            copy_lev = int(min(
+                max(float(signal.meta.get("leverage", 5)), 1),
+                settings.COPY_MAX_COPY_LEVERAGE,
+            ))
             try:
-                self._exchange.update_leverage(5, coin, True)   # 5x cross
+                self._exchange.update_leverage(copy_lev, coin, True)   # cross margin
+                logger.debug(f"[Executor] Set {coin} leverage to {copy_lev}x cross")
             except Exception as e:
                 logger.warning(f"[Executor] Could not set leverage for {coin}: {e}")
 
