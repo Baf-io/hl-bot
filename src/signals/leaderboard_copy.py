@@ -351,6 +351,14 @@ class LeaderboardCopier:
                 return
 
             await self._refresh_account_values()
+
+            # Sync our in-memory book with reality FIRST: drop any position closed
+            # outside the bot (manual close, liquidation, native SL/TP). Otherwise
+            # reconcile would think we still hold a ghost and never re-establish it.
+            actual = await self._fetch_our_open_coins()
+            if actual is not None:
+                self.risk.drop_phantoms(actual)
+
             desired = self._build_desired()
 
             # What we actually hold from this strategy (copy + startup-synced positions).
@@ -433,6 +441,30 @@ class LeaderboardCopier:
             confidence=1.0,
             meta={"action": "exit", "reason": reason},
         ))
+
+    async def _fetch_our_open_coins(self) -> Optional[set]:
+        """
+        Our wallet's currently-open perp coins, straight from HL. Returns None on
+        any error (so callers skip pruning rather than wrongly dropping everything).
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    HL_REST,
+                    json={"type": "clearinghouseState", "user": settings.HL_WALLET_ADDRESS},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    st = await resp.json(content_type=None)
+            if "marginSummary" not in st:          # malformed/empty response — don't prune
+                return None
+            return {
+                ap["position"]["coin"]
+                for ap in st.get("assetPositions", [])
+                if float(ap["position"].get("szi", 0)) != 0
+            }
+        except Exception as e:
+            logger.debug(f"[Reconcile] our-state fetch failed: {e}")
+            return None
 
     def set_signal_queue(self, queue: asyncio.Queue):
         self._signal_queue = queue

@@ -72,7 +72,9 @@ COPY_MAX_COPY_LEVERAGE    = 10          # don't mirror leverage above 10x
 # Prevents high-leverage traders from creating slots worth only a few dollars.
 # e.g. a9b95f 20x ETH: our_notional=$165 passes $50 notional floor but our_margin=$8 — skip.
 # At 1% of $1120 = $11.20 minimum margin.  ZEC/PAXG at ~$17 margin still allowed.
-COPY_MIN_MARGIN_PCT       = 0.01        # 1% of portfolio (~$11 on $1120)
+COPY_MIN_MARGIN_PCT       = 0.03        # 3% of portfolio (~$34 on $1120) — no dust; only
+                                        # meaningful-margin trades. Excludes e.g. fc667's PAXG
+                                        # (1.4% of their acct -> ~$15 margin for us).
 
 # Whitelist: if set, ONLY copy from these trader addresses (comma-separated).
 # Leave empty to copy from all qualified traders.

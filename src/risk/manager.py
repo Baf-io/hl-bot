@@ -178,6 +178,22 @@ class RiskManager:
             else:
                 pos.unrealized_pnl = pos.size_usd * (current_price - pos.entry_price) / pos.entry_price
 
+    def drop_phantoms(self, actual_coins: set[str]) -> list:
+        """
+        Remove open positions whose coin is no longer actually open on HL — e.g.
+        closed manually, liquidated, or by a native SL/TP fill. Keeps the in-memory
+        book in sync with reality so reconcile/guardian don't act on ghosts (and so a
+        coin we no longer hold can be re-established if still desired).
+        """
+        phantoms = [p for p in self.open_positions if p.coin not in actual_coins]
+        for p in phantoms:
+            self.open_positions.remove(p)
+            logger.warning(
+                f"[Risk] Dropped phantom #{p.id} {p.coin} {p.direction} "
+                f"({p.strategy}) — not open on HL"
+            )
+        return phantoms
+
     # ── Internal helpers ───────────────────────────────────────────────────────
 
     def _too_correlated(self, coin: str) -> bool:
