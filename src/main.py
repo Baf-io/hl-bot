@@ -203,19 +203,27 @@ async def main():
         logger.info("Strategy MOMENTUM IGNITION enabled")
 
     # ── Position guardian ─────────────────────────────────────────────────────
-    # Simple rules while we find the right traders to whitelist:
+    # Philosophy: trust the traders we whitelisted.
     #
-    #   RED  (pnl < 0)   → close immediately, every tick. No holding losers.
-    #   GREEN (pnl >= 0) → hands off. Native -3% SL on HL protects them.
-    #                      Copy trader's close signal will exit them too.
-    #   ZOMBIE (>8h old) → close regardless, just in case.
+    # Primary exits (handled elsewhere):
+    #   • Trader closes their position → leaderboard copier sends exit signal
+    #   • Native SL at -3% on HL exchange → fires even if bot is offline
+    #   • Native TP at +8% on HL exchange → locks in profit automatically
+    #
+    # Guardian only handles edge cases the above can't catch:
+    #   ZOMBIE  (>12h open) → WebSocket probably missed the trader's close signal
+    #   NUCLEAR (>-10% loss) → SL failed somehow (extreme gap / liquidation cascade)
+    #
+    # We do NOT close on small losses — these traders hold through dips.
+    # Cutting them at -1% and watching them recover to +5% is the old mistake.
 
-    MAX_HOLD_HOURS = 8.0
+    ZOMBIE_HOURS     = 12.0   # close if open longer than this with no exit signal
+    NUCLEAR_LOSS_PCT = 0.10   # -10%: SL should have fired at -3%, something is wrong
 
     async def position_guardian():
         from datetime import datetime, timezone
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(60)   # check every minute — less noise
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             for pos in list(risk.open_positions):
                 current_price = store.latest_mid(pos.coin)
@@ -225,16 +233,22 @@ async def main():
                 pnl_pct = pos.unrealized_pnl / pos.size_usd if pos.size_usd else 0
                 age_h   = (now - pos.opened_at).total_seconds() / 3600
 
+                # Log status every hour so we can see what's running
+                if int(age_h * 60) % 60 == 0 and age_h > 0:
+                    logger.debug(
+                        f"[Guardian] {pos.coin} pos#{pos.id} | "
+                        f"age={age_h:.1f}h pnl={pnl_pct:+.1%} [{pos.strategy}]"
+                    )
+
                 reason = None
-                if pnl_pct < 0:
-                    reason = f"red {pnl_pct:.1%}"
-                elif age_h >= MAX_HOLD_HOURS:
-                    reason = f"max hold {age_h:.1f}h"
-                # green and <8h → do nothing, native SL on HL handles -3% reversal
+                if age_h >= ZOMBIE_HOURS:
+                    reason = f"zombie {age_h:.1f}h — missed close signal?"
+                elif pnl_pct < -NUCLEAR_LOSS_PCT:
+                    reason = f"nuclear loss {pnl_pct:.1%} — SL failed"
 
                 if reason:
-                    logger.info(f"[Guardian] 🔴 CLOSING {pos.coin} pos#{pos.id} — {reason}")
-                    exit_kind = "stop_loss" if "red" in reason else "max_hold"
+                    logger.warning(f"[Guardian] 🚨 FORCE CLOSE {pos.coin} pos#{pos.id} — {reason}")
+                    exit_kind = "nuclear" if "nuclear" in reason else "zombie"
                     squeeze.on_position_closed(pos.id, current_price or pos.entry_price, exit_kind)
                     await executor.enqueue(TradeSignal(
                         strategy=pos.strategy,

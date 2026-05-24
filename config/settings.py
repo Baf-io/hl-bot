@@ -11,25 +11,26 @@ HL_WALLET_ADDRESS   = os.getenv("HL_WALLET_ADDRESS", "")
 HL_PRIVATE_KEY      = os.getenv("HL_PRIVATE_KEY", "")
 HL_TESTNET          = os.getenv("HL_TESTNET", "true").lower() == "true"
 
-# ── Risk limits ── SCALED FOR $1000 PORTFOLIO ────────────────────────────────
-MAX_OPEN_POSITIONS      = 15            # global ceiling across all strategies
-MAX_POSITION_SIZE_PCT   = 0.05          # 5% per position (~$50 on $1000)
-DAILY_LOSS_HALT_PCT     = 0.10          # halt at -10% ($100 on $1000)
-MAX_LEVERAGE            = 20            # allow higher leverage for leaderboard copies
-PORTFOLIO_DELTA_MAX     = 0.90          # allow high directional exposure
+# ── Risk limits ── FULL STACK MODE (~$1100 portfolio) ────────────────────────
+# Position sizing: 15% per trade = ~$165 on $1100
+# Max leaderboard slots: 6 × $165 = $990 deployed (90% stack)
+# Remaining 10% = buffer for fees, SL slippage, funding
+MAX_OPEN_POSITIONS      = 12            # global ceiling (leaderboard dominates now)
+MAX_POSITION_SIZE_PCT   = 0.15          # 15% per position (~$165 on $1100)
+DAILY_LOSS_HALT_PCT     = 0.10          # halt at -10% (~$110) — unchanged
+MAX_LEVERAGE            = 20
+PORTFOLIO_DELTA_MAX     = 0.95          # near-full directional exposure allowed
 
-# ── Per-strategy slot caps (slots × $50 = capital reserved per strategy) ─────
-# leaderboard:  7 slots × $50 = $350 max deployed (copy trades)
-# funding:      1 slot  × $50 = $50  (one carry at a time)
-# cascade:      3 slots × $50 = $150 (momentum/squeeze)
-# arb:          3 slots × $50 = $150 (future stat-arb)
-# remaining:    global MAX_OPEN_POSITIONS = 15 safety ceiling
+# ── Per-strategy slot caps ────────────────────────────────────────────────────
+# leaderboard: 6 slots × $165 = $990 max (5 whitelisted traders, ~1-2 open each)
+# funding:     1 slot  × $165 = $165 (one carry — avoid fighting copy trades)
+# cascade:     2 slots × $165 = $330 (reduced — leaderboard is primary now)
 STRATEGY_MAX_POSITIONS = {
-    "leaderboard": 4,   # focused on top 1-2 traders — 4 slots max (was 7)
+    "leaderboard": 6,
     "funding":     1,
-    "cascade":     3,
-    "squeeze":     3,
-    "arb":         3,
+    "cascade":     2,
+    "squeeze":     2,
+    "arb":         2,
 }
 
 # ── Strategy toggles ──────────────────────────────────────────────────────────
