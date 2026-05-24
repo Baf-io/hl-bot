@@ -306,6 +306,11 @@ class LeaderboardCopier:
                         coin = pos.get("coin", "")
                         if coin.startswith("xyz:") or coin.startswith("@") or coin.startswith("km:") or coin.startswith("k:"):
                             continue
+                        # Skip dust: HL keeps near-zero szi positions in the API even after
+                        # they're effectively closed. Anything under $50 notional is noise.
+                        entry_px = float(pos.get("entryPx") or 0)
+                        if abs(szi) * entry_px < 50:
+                            continue
                         # Skip if we already have a dedup entry (handled by live fill)
                         if coin in self._recent_signals:
                             continue
