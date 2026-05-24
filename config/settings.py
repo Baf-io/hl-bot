@@ -25,7 +25,7 @@ PORTFOLIO_DELTA_MAX     = 0.90          # allow high directional exposure
 # arb:          3 slots × $50 = $150 (future stat-arb)
 # remaining:    global MAX_OPEN_POSITIONS = 15 safety ceiling
 STRATEGY_MAX_POSITIONS = {
-    "leaderboard": 7,
+    "leaderboard": 4,   # focused on top 1-2 traders — 4 slots max (was 7)
     "funding":     1,
     "cascade":     3,
     "squeeze":     3,
@@ -46,15 +46,27 @@ FUNDING_ENTRY_THRESHOLD   = 0.0003      # lower bar — catch more opportunities
 FUNDING_EXIT_THRESHOLD    = 0.0001
 FUNDING_MAX_POSITIONS     = 1           # only 1 carry at a time (capital is small)
 
-# ── Leaderboard copy params ── loosened for more signals ─────────────────────
-COPY_MIN_ACCOUNT_AGE_DAYS = 20          # lowered from 45
-COPY_MIN_REALIZED_PNL_USD = 50_000      # lowered from 150k
-COPY_MIN_WIN_RATE         = 0.52        # lowered from 0.58
-COPY_MAX_DRAWDOWN         = 0.35        # more lenient
-COPY_MAX_AVG_LEVERAGE     = 20          # allow higher leverage traders
-COPY_MIN_TRADE_COUNT      = 200         # lowered from 500
+# ── Leaderboard copy params ──────────────────────────────────────────────────
+COPY_MIN_ACCOUNT_AGE_DAYS = 20
+COPY_MIN_REALIZED_PNL_USD = 50_000
+COPY_MIN_WIN_RATE         = 0.52
+COPY_MAX_DRAWDOWN         = 0.35
+COPY_MAX_AVG_LEVERAGE     = 20
+COPY_MIN_TRADE_COUNT      = 200
 COPY_SIZE_SCALE           = 0.005       # 0.5% of their notional (scales to $100 portfolio)
 COPY_MAX_LAG_MS           = 300         # tighter — only copy if fast enough
+COPY_MIN_THEIR_NOTIONAL   = 1_000       # only copy when they put ≥$1K in (high conviction)
+COPY_MAX_POSITIONS_PER_TRADER = 3       # allow up to 3 open from same trader (was 2)
+
+# Whitelist: if set, ONLY copy from these trader addresses (comma-separated).
+# Leave empty to copy from all qualified traders.
+# Use this to focus on your top 1-2 performers after reviewing position_log.
+# Example in .env: COPY_TRADER_WHITELIST=0xabc123...,0xdef456...
+_whitelist_raw = os.getenv("COPY_TRADER_WHITELIST", "")
+COPY_TRADER_WHITELIST: set[str] = (
+    {a.strip().lower() for a in _whitelist_raw.split(",") if a.strip()}
+    if _whitelist_raw.strip() else set()
+)
 
 # ── Cascade params ── more sensitive triggers ─────────────────────────────────
 CASCADE_OI_PERCENTILE     = 75          # lowered from 90 — fires more often

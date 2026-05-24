@@ -74,7 +74,9 @@ class Executor:
 
                 from data.store import TradeSignal
                 fake_signal = TradeSignal(
-                    strategy="leaderboard",   # assume leaderboard — conservative
+                    # Tag as "synced" — not "leaderboard" — so these don't eat strategy slots.
+                    # Close signals will still find them via coin-fallback in _close_position().
+                    strategy="synced",
                     coin=coin, direction=direction,
                     size_usd=size_usd, confidence=1.0, meta={"action": "enter"},
                 )
@@ -161,11 +163,23 @@ class Executor:
             logger.warning(f"[Executor] Order not filled for {coin}: {err}")
 
     async def _close_position(self, signal: TradeSignal):
-        # Find matching open position
+        # Try exact match first (coin + strategy)
         pos = next(
             (p for p in self.risk.open_positions if p.coin == signal.coin and p.strategy == signal.strategy),
             None,
         )
+        # Fallback: coin-only match — covers positions synced from HL on startup
+        # (those are tagged "synced" but close signals arrive as "leaderboard")
+        if pos is None:
+            pos = next(
+                (p for p in self.risk.open_positions if p.coin == signal.coin),
+                None,
+            )
+            if pos:
+                logger.debug(
+                    f"[Executor] Coin-only match for {signal.coin} close "
+                    f"(strategy {pos.strategy!r} ≠ {signal.strategy!r})"
+                )
         if not pos:
             logger.warning(f"[Executor] Close signal for {signal.coin} but no open position found")
             return

@@ -49,10 +49,18 @@ class LeaderboardCopier:
             logger.warning("[Leaderboard] No traders returned")
             return
 
-        # Manually curated addresses — skip filter, trust the list
+        # Whitelist mode: only track explicitly approved traders
+        if settings.COPY_TRADER_WHITELIST:
+            raw = [t for t in raw if t.address.lower() in settings.COPY_TRADER_WHITELIST]
+            logger.info(
+                f"[Leaderboard] Whitelist active — filtering to "
+                f"{len(raw)} of {len(raw)} traders: "
+                + ", ".join(a[:10] + "…" for a in settings.COPY_TRADER_WHITELIST)
+            )
+
         for t in raw:
             t.score = self._score(t)
-        top = raw  # use all of them
+        top = raw
 
         new_addresses = {t.address for t in top}
         old_addresses = set(self._tracked.keys())
@@ -134,10 +142,13 @@ class LeaderboardCopier:
                     continue
 
                 # Skip low-conviction trades — basket rebalancers open 50+ coins at $12-100 each.
-                # Only copy when they put real size in ($500+) = actual directional conviction.
+                # Only copy when they put real size in ($1K+) = actual directional conviction.
                 their_notional_preview = sz * px
-                if their_notional_preview < 500:
-                    logger.debug(f"[Leaderboard] Skip low-conviction {coin} their=${their_notional_preview:.0f} (<$500)")
+                if their_notional_preview < settings.COPY_MIN_THEIR_NOTIONAL:
+                    logger.debug(
+                        f"[Leaderboard] Skip low-conviction {coin} "
+                        f"their=${their_notional_preview:.0f} (<${settings.COPY_MIN_THEIR_NOTIONAL:,})"
+                    )
                     continue
 
                 # dir: "Open Long" / "Open Short" / "Close Long" / "Close Short"
@@ -164,13 +175,15 @@ class LeaderboardCopier:
                         ))
                     continue
 
-                # Per-trader slot cap: max 2 open positions per trader
-                # Prevents basket rebalancers from filling all 7 slots
+                # Per-trader slot cap: max N open positions per trader
                 trader_open_count = sum(
                     1 for key in self._recent_signals if key.startswith(f"src:{address}:")
                 )
-                if trader_open_count >= 2:
-                    logger.debug(f"[Leaderboard] Trader cap hit for {address[:10]} ({trader_open_count} slots)")
+                if trader_open_count >= settings.COPY_MAX_POSITIONS_PER_TRADER:
+                    logger.debug(
+                        f"[Leaderboard] Trader cap hit for {address[:10]} "
+                        f"({trader_open_count}/{settings.COPY_MAX_POSITIONS_PER_TRADER} slots)"
+                    )
                     continue
 
                 # Dedup: skip if we already have ANY position in this coin

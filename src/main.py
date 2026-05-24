@@ -202,43 +202,39 @@ async def main():
         feed.subscribe("allMids", on_price_tick_for_momentum)
         logger.info("Strategy MOMENTUM IGNITION enabled")
 
-    # ── Position guardian — max hold, stop loss, take profit ─────────────────
-    # Primary exit = copy trader's close (mirrored in leaderboard_copy.py)
-    # These are SAFETY NETS only — should rarely trigger
-    MAX_HOLD_HOURS  = 2.0    # force close after 2h (high frequency)
-    STOP_LOSS_PCT   = 0.03   # safety net: close at -3% (tight, cut bad copies fast)
-    TAKE_PROFIT_PCT = 0.08   # let winners run to +8% (trader usually exits before this)
+    # ── Position guardian ─────────────────────────────────────────────────────
+    # Simple rules while we find the right traders to whitelist:
+    #
+    #   RED  (pnl < 0)   → close immediately, every tick. No holding losers.
+    #   GREEN (pnl >= 0) → hands off. Native -3% SL on HL protects them.
+    #                      Copy trader's close signal will exit them too.
+    #   ZOMBIE (>8h old) → close regardless, just in case.
+
+    MAX_HOLD_HOURS = 8.0
 
     async def position_guardian():
-        from datetime import datetime, timedelta
+        from datetime import datetime
         while True:
-            await asyncio.sleep(30)   # check every 30s
+            await asyncio.sleep(30)
             now = datetime.utcnow()
             for pos in list(risk.open_positions):
                 current_price = store.latest_mid(pos.coin)
                 if current_price:
                     risk.update_unrealized(pos.coin, current_price)
 
-                age_h = (now - pos.opened_at).total_seconds() / 3600
                 pnl_pct = pos.unrealized_pnl / pos.size_usd if pos.size_usd else 0
+                age_h   = (now - pos.opened_at).total_seconds() / 3600
 
                 reason = None
-                if age_h >= MAX_HOLD_HOURS:
+                if pnl_pct < 0:
+                    reason = f"red {pnl_pct:.1%}"
+                elif age_h >= MAX_HOLD_HOURS:
                     reason = f"max hold {age_h:.1f}h"
-                elif pnl_pct <= -STOP_LOSS_PCT:
-                    reason = f"stop loss {pnl_pct:.1%}"
-                elif pnl_pct >= TAKE_PROFIT_PCT:
-                    reason = f"take profit {pnl_pct:.1%}"
+                # green and <8h → do nothing, native SL on HL handles -3% reversal
 
                 if reason:
-                    logger.info(f"[Guardian] CLOSING {pos.coin} pos#{pos.id} — {reason}")
-                    # Classify exit reason for squeeze guard
-                    if "stop loss" in reason:
-                        exit_kind = "stop_loss"
-                    elif "take profit" in reason:
-                        exit_kind = "take_profit"
-                    else:
-                        exit_kind = "max_hold"
+                    logger.info(f"[Guardian] 🔴 CLOSING {pos.coin} pos#{pos.id} — {reason}")
+                    exit_kind = "stop_loss" if "red" in reason else "max_hold"
                     squeeze.on_position_closed(pos.id, current_price or pos.entry_price, exit_kind)
                     await executor.enqueue(TradeSignal(
                         strategy=pos.strategy,
