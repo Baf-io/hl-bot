@@ -36,6 +36,12 @@ if settings.STRATEGY_LEADERBOARD_COPY:
     from signals.leaderboard_copy import LeaderboardCopier
 if settings.STRATEGY_CASCADE:
     from signals.cascade_detector import CascadeDetector
+if settings.STRATEGY_OI_SQUEEZE:
+    from signals.oi_funding_squeeze import OIFundingSqueeze
+if settings.STRATEGY_STAT_ARB:
+    from signals.stat_arb import StatArbScanner
+if settings.STRATEGY_MOMENTUM:
+    from signals.momentum_ignition import MomentumIgnition
 
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
@@ -52,7 +58,10 @@ async def main():
     logger.info(f"Testnet: {settings.HL_TESTNET}")
     logger.info(f"Strategies: funding={settings.STRATEGY_FUNDING_CARRY} "
                 f"leaderboard={settings.STRATEGY_LEADERBOARD_COPY} "
-                f"cascade={settings.STRATEGY_CASCADE}")
+                f"cascade={settings.STRATEGY_CASCADE} "
+                f"oi_squeeze={settings.STRATEGY_OI_SQUEEZE} "
+                f"stat_arb={settings.STRATEGY_STAT_ARB} "
+                f"momentum={settings.STRATEGY_MOMENTUM}")
     logger.info("=" * 60)
 
     # ── Init components ────────────────────────────────────────────────────────
@@ -157,6 +166,41 @@ async def main():
 
         feed.subscribe("allMids", on_price_tick_for_cascade)
         logger.info("Strategy CASCADE enabled")
+
+    if settings.STRATEGY_OI_SQUEEZE:
+        oi_squeeze = OIFundingSqueeze(store)
+
+        async def run_oi_squeeze():
+            signals = await oi_squeeze.scan()
+            for sig in signals:
+                await executor.enqueue(sig)
+
+        scheduler.add_job(run_oi_squeeze, "interval", seconds=30, id="oi_squeeze")
+        logger.info("Strategy OI/FUNDING SQUEEZE enabled")
+
+    if settings.STRATEGY_STAT_ARB:
+        stat_arb = StatArbScanner(store)
+
+        async def run_stat_arb():
+            signals = await stat_arb.scan()
+            for sig in signals:
+                await executor.enqueue(sig)
+
+        scheduler.add_job(run_stat_arb, "interval", seconds=15, id="stat_arb")
+        logger.info("Strategy STAT ARB enabled")
+
+    if settings.STRATEGY_MOMENTUM:
+        momentum = MomentumIgnition(store)
+
+        async def on_price_tick_for_momentum(msg):
+            mids = msg.get("data", {}).get("mids", {})
+            for coin, price_str in mids.items():
+                sigs = await momentum.on_price_update(coin, float(price_str))
+                for sig in sigs:
+                    await executor.enqueue(sig)
+
+        feed.subscribe("allMids", on_price_tick_for_momentum)
+        logger.info("Strategy MOMENTUM IGNITION enabled")
 
     # ── Position guardian — max hold, stop loss, take profit ─────────────────
     # Primary exit = copy trader's close (mirrored in leaderboard_copy.py)

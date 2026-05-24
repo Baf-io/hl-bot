@@ -36,6 +36,10 @@ STRATEGY_MAX_POSITIONS = {
 STRATEGY_FUNDING_CARRY    = os.getenv("STRATEGY_FUNDING_CARRY", "true").lower() == "true"
 STRATEGY_LEADERBOARD_COPY = os.getenv("STRATEGY_LEADERBOARD_COPY", "true").lower() == "true"
 STRATEGY_CASCADE          = os.getenv("STRATEGY_CASCADE", "true").lower() == "true"
+# Phase 2-4 — disabled until calibrated; set to "true" in .env to enable
+STRATEGY_OI_SQUEEZE       = os.getenv("STRATEGY_OI_SQUEEZE", "false").lower() == "true"
+STRATEGY_STAT_ARB         = os.getenv("STRATEGY_STAT_ARB", "false").lower() == "true"
+STRATEGY_MOMENTUM         = os.getenv("STRATEGY_MOMENTUM", "false").lower() == "true"
 
 # ── Funding carry params ──────────────────────────────────────────────────────
 FUNDING_ENTRY_THRESHOLD   = 0.0003      # lower bar — catch more opportunities
