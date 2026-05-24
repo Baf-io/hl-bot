@@ -250,11 +250,16 @@ class LeaderboardCopier:
         their_margin     = their_notional / their_lev
         their_margin_pct = their_margin / their_acct_val
 
-        # Our equivalent margin, then scale to notional.
-        # Floor: $50 notional minimum — anything less isn't worth a position slot.
-        # (e.g. fc667's tiny XRP: 0.13% of $21M → $1.50 margin for us → skip)
-        our_margin   = max(50.0 / their_lev, self._portfolio_usd * their_margin_pct)
+        # Proportional notional — no floor, no fake inflation.
+        # If proportional size is below MIN_POSITION_NOTIONAL, return 0 to signal SKIP.
+        # Flooring to a minimum wastes a slot on a coin the trader barely holds.
+        # (e.g. fc667's XRP = 0.13% of $21M → $29 for us → not worth a slot)
+        our_margin   = self._portfolio_usd * their_margin_pct
         our_notional = our_margin * their_lev
+
+        from config import settings as _s
+        if our_notional < _s.MIN_POSITION_NOTIONAL:
+            return 0.0, their_lev   # caller should skip this coin
 
         return our_notional, their_lev
 
@@ -380,15 +385,26 @@ class LeaderboardCopier:
                     )
                     continue
 
-                # Register position in tracker (before emitting signal)
-                self._trader_positions[address][coin] = direction
-
                 # ── Margin-based proportional sizing ─────────────────────────
                 their_notional = sz * px
                 their_acct_val = self._trader_acct_values.get(address, 0)
                 our_size, their_lev = self._compute_size(
                     address, coin, their_notional, their_acct_val, trader
                 )
+
+                # Skip coins where proportional size is below minimum threshold.
+                # _compute_size returns 0.0 to signal "don't trade this coin".
+                if our_size == 0:
+                    logger.info(
+                        f"[Leaderboard] SKIP {coin} — proportional size below "
+                        f"${settings.MIN_POSITION_NOTIONAL} min "
+                        f"(their={their_notional:,.0f}/acct={their_acct_val:,.0f})"
+                    )
+                    self._trader_positions[address].pop(coin, None)  # undo registration
+                    continue
+
+                # Register position in tracker (after size check — don't claim the slot for skipped coins)
+                self._trader_positions[address][coin] = direction
 
                 logger.info(
                     f"[Leaderboard] COPY {direction.upper()} {coin} | "
@@ -452,6 +468,14 @@ class LeaderboardCopier:
                     our_size, their_lev = self._compute_size(
                         address, coin, their_notional, their_acct_val, trader
                     )
+                    # Skip coins where proportional size is too small
+                    if our_size == 0:
+                        logger.info(
+                            f"[Leaderboard] BACKFILL SKIP {coin} — "
+                            f"proportional size below ${settings.MIN_POSITION_NOTIONAL} min "
+                            f"(their={their_notional:,.0f}/acct={their_acct_val:,.0f})"
+                        )
+                        continue
                 else:
                     our_size, their_lev = 0.0, 1.0   # risk manager uses max_size
 
