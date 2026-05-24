@@ -30,8 +30,9 @@ Runs 24/7 on a Linux VPS as `hl-bot.service`.
 - **Portfolio:** $1120 USDC (PORTFOLIO_USD=1120 in VPS .env)
 - **Active traders:** fc667, a9b95f (generalists); 42b6d9→ZEC, 6bea81→SOL, a4dedd→LIT (specialists via `specialty` in traders.json)
 - **COPY_TRADER_WHITELIST:** must be empty in .env — traders.json is the source
-- **Copy model:** STATE-BASED. `reconcile()` polls each trader's net `clearinghouseState` every `COPY_RECONCILE_INTERVAL_S=45s`, builds a desired portfolio (specialist routing, skip contested coins, highest-conviction holder), diffs vs held, mirrors net changes. NOT fill-driven.
-- **Sizing:** margin-based proportional; `COPY_MIN_MARGIN_PCT=0.01` ($11.20 floor); `MIN_POSITION_NOTIONAL=50`; `COPY_MAX_COPY_LEVERAGE=10`
+- **Copy model:** STATE-BASED. `reconcile()` (every `COPY_RECONCILE_INTERVAL_S=45s`) rebuilds each trader's net `clearinghouseState`, prunes phantom held positions vs OUR live HL state (`drop_phantoms`), builds a desired portfolio (specialist routing, skip contested coins, highest-conviction holder), diffs vs held, mirrors net changes incl. RESIZE of under-sized holdings. NOT fill-driven.
+- **Sizing:** margin-based proportional; `COPY_MIN_MARGIN_PCT=0.03` (~$34 floor, no dust); `MIN_POSITION_NOTIONAL=50`; `COPY_MAX_COPY_LEVERAGE=10`
+- **Alerts:** Telegram + ntfy phone push (`NTFY_TOPIC` in .env) — high-signal ONLY (halt / guardian force-close / daily summary), never per-trade.
 
 ---
 
@@ -55,26 +56,28 @@ their_margin_pct = their_margin / their_acct_val
 our_margin      = PORTFOLIO_USD × their_margin_pct
 our_notional    = our_margin × their_lev
 → skip if our_notional < MIN_POSITION_NOTIONAL ($50)
-→ skip if our_margin   < PORTFOLIO_USD × COPY_MIN_MARGIN_PCT ($11.20)
+→ skip if our_margin   < PORTFOLIO_USD × COPY_MIN_MARGIN_PCT (~$34)
 ```
 
 ---
 
 ## Open issues
 - Conviction weighting is mostly flattened by the risk manager's 15% margin cap (big holds all clamp to ~$168 margin). Fine for risk; revisit if we want to over-weight top-conviction coins.
-- Reconcile does not RESIZE: a held position whose trader changed size is left as-is until they flip/close. Acceptable (avoids churn); revisit if drift matters.
-- Native SL/TP fills (own-signal strategies) close on-exchange but the bot never reconciles them, so the position lingers in `risk.open_positions` until guardian/trader-exit. Low priority (copy trades have no SL/TP).
+- "Faster in-and-out" framework requested (2026-05-24): user wants higher-margin, more active trades. These 5 traders are slow macro holders, so faster trading needs a different alpha sleeve (momentum/cascade) — see `docs/FRAMEWORK_PLAN.md` (pending). NOT yet implemented; copy core is the proven base.
 
 ---
 
 ## Fix log (newest first, keep last 10)
-- `(uncommitted)` STATE-BASED reconcile rewrite: copier now polls trader net positions every 45s and mirrors only real changes (was fill-stream → churned on TWAP/trim fills, 238 fills/48h, fees > gross loss). Adds specialist routing (ZEC/SOL/LIT) + contested-coin skip (BTC long-vs-short) + conviction pick. Removed fill handler / userFills subs / one-shot backfill.
-- `c99e55a` Guardian force-close was dead: sent offsetting direction + full-string reason → never matched. Now sends held direction + bare reason. Close path uses reduce-only `market_close` + `_parse_fill` (was `market_open` + bare `status=="ok"`). Nuclear trigger now margin-based (70%).
-- `ce54c96` Add margin floor `COPY_MIN_MARGIN_PCT=0.01` + fix orphaned dust if market_close fails
+- `637ed6e` reconcile prunes phantom positions vs OUR live HL state (`drop_phantoms`) — fixes ghosts left by manual close/liquidation/SL-TP. Raise `COPY_MIN_MARGIN_PCT` 0.01→0.03 (no $15 dust trades).
+- `8140e87` synced positions now carry real leverage (notional/marginUsed); was defaulting lev=1.0 → full notional counted as margin-delta → delta limit spuriously blocked entries after restarts.
+- `a2b3804` ntfy phone alerts, high-signal only (halt / force-close / daily summary).
+- `94fc6ca` reconcile RESIZEs under-sized holdings (vs post-cap target, no oscillation); dedupe contested log.
+- `f33477a` STATE-BASED reconcile rewrite: poll trader net positions every 45s, mirror only real changes (was fill-stream → churned on TWAP/trim fills, 238 fills/48h, fees > gross loss). Specialist routing + contested skip + conviction pick. Removed fill handler/userFills/backfill.
+- `c99e55a` Guardian force-close was dead (offsetting dir + full-string reason never matched). Now held dir + bare reason. Close via reduce-only `market_close` + `_parse_fill`. Nuclear now margin-based (70%).
+- `ce54c96` Add margin floor `COPY_MIN_MARGIN_PCT` + fix orphaned dust if market_close fails
 - `2665b56` Skip dust coins entirely (return 0.0 from _compute_size) instead of flooring
 - `7c8a8f1` MIN_POSITION_NOTIONAL=50 backstop in risk manager + executor dust cleanup
 - `b5a08ef` asyncio.Event for backfill sync (killed sleep race); dust close on startup
-- `9a78997` Executor uses signal leverage not hardcoded 5x
 - `5ed2e66` 5-trader whitelist; traders.json path fix; full addresses (lookup script used)
 - `b7ae1db` Margin-based sizing (was notional-based — wrong at high leverage)
 
