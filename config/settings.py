@@ -94,3 +94,7 @@ CASCADE_IMBALANCE_MIN     = 0.62        # lower bar (was 0.70)
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 LOG_LEVEL           = os.getenv("LOG_LEVEL", "INFO")
+
+# ── ntfy phone push (high-signal only: halt / force-close / daily summary) ──────
+NTFY_TOPIC          = os.getenv("NTFY_TOPIC", "")          # set in .env to enable
+NTFY_SERVER         = os.getenv("NTFY_SERVER", "https://ntfy.sh")

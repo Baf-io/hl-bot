@@ -74,7 +74,8 @@ async def main():
     executor = Executor(risk)
     executor.init_client()
 
-    alerter  = TelegramAlerter(settings.TELEGRAM_BOT_TOKEN, settings.TELEGRAM_CHAT_ID)
+    alerter  = TelegramAlerter(settings.TELEGRAM_BOT_TOKEN, settings.TELEGRAM_CHAT_ID,
+                               ntfy_topic=settings.NTFY_TOPIC, ntfy_server=settings.NTFY_SERVER)
     squeeze  = SqueezeGuard(store, alerter)
     executor.squeeze_guard = squeeze   # give executor access to fire lifecycle events
     feed     = HyperliquidFeed()
@@ -233,9 +234,16 @@ async def main():
 
     async def position_guardian():
         from datetime import datetime, timezone
+        was_halted = False   # track the trading-halt transition for a one-shot phone push
         while True:
             await asyncio.sleep(60)   # check every minute — less noise
             now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+            # Phone alert exactly once when the bot transitions into a trading halt
+            # (daily loss limit hit → "we're really down and the bot stopped trading").
+            if risk._trading_halted and not was_halted:
+                await alerter.halt_alert(risk._daily_pnl / risk.portfolio_value)
+            was_halted = risk._trading_halted
             for pos in list(risk.open_positions):
                 current_price = store.latest_mid(pos.coin)
                 if current_price:
@@ -263,6 +271,9 @@ async def main():
 
                 if exit_kind:
                     logger.warning(f"[Guardian] 🚨 FORCE CLOSE {pos.coin} pos#{pos.id} — {detail}")
+                    # Phone alert: a bad action was taken (force-close). pnl is the live
+                    # unrealized estimate — the exact realized figure lands in the logs.
+                    await alerter.force_close_alert(pos.coin, exit_kind, detail, pos.unrealized_pnl)
                     # Exit signal direction = the direction WE HOLD (the side being closed).
                     # _close_position matches the held direction, not the offsetting side.
                     # `reason` carries the bare kind so the executor's coin-only fallback
