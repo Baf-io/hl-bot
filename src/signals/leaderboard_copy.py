@@ -315,8 +315,22 @@ class LeaderboardCopier:
 
                 # ── EXIT: trader closed their position ────────────────────────
                 if is_close:
+                    # Guard against replayed fills on WebSocket reconnect.
+                    # HL replays recent fills when we (re)subscribe to userFills.
+                    # If the coin isn't in our tracker, the trader already closed
+                    # BEFORE this session started — it's a stale replay, not a
+                    # live close. Ignore it; our synced positions stay open until
+                    # the trader closes again live (or guardian fires at 72h).
+                    was_tracking = coin in self._trader_positions[address]
                     # Remove from position tracker so next open is treated as new
                     self._trader_positions[address].pop(coin, None)
+
+                    if not was_tracking:
+                        logger.debug(
+                            f"[Leaderboard] Stale close ignored {coin} "
+                            f"(not tracked this session — WS reconnect replay?)"
+                        )
+                        continue
 
                     # Dedup: TWAP exits fire many close fills; only relay once per 60s
                     last_exit = self._recent_exits.get(coin, 0)
