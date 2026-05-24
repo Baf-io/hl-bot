@@ -104,12 +104,20 @@ class Executor:
                     # It will be closed when the trader exits or the guardian fires.
 
                 from data.store import TradeSignal
+                # Leverage from the live position (notional / marginUsed) so the risk
+                # manager's margin-equiv delta check is correct. Without this, synced
+                # positions defaulted to lev=1.0 → their FULL notional counted as delta
+                # → the delta limit spuriously blocked new entries/flips after restarts.
+                margin_used = float(pos.get("marginUsed") or 0)
+                synced_lev  = (min(size_usd / margin_used, float(settings.MAX_LEVERAGE))
+                               if margin_used > 0 else 1.0)
                 fake_signal = TradeSignal(
                     # Tag as "synced" — not "leaderboard" — so these don't eat strategy slots.
                     # Close signals will still find them via coin-fallback in _close_position().
                     strategy="synced",
                     coin=coin, direction=direction,
-                    size_usd=size_usd, confidence=1.0, meta={"action": "enter"},
+                    size_usd=size_usd, confidence=1.0,
+                    meta={"action": "enter", "leverage": round(synced_lev, 1)},
                 )
                 self.risk.register_fill(fake_signal, size_usd, entry_px)
                 count += 1
