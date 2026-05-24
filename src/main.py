@@ -139,19 +139,27 @@ async def main():
         logger.info("Strategy FUNDING CARRY enabled")
 
     if settings.STRATEGY_LEADERBOARD_COPY:
+        from datetime import datetime as _dt, timedelta as _td
         copier = LeaderboardCopier(store, feed)
         copier.set_signal_queue(signal_queue)
+        copier.risk = risk   # reconcile needs to see what we already hold
 
-        # Run immediately on startup, then refresh list every 5 min
+        # Load the trader list + specialist routing once at startup, refresh every 5 min.
         scheduler.add_job(copier.refresh_leaderboard, "interval", minutes=5, id="lb_refresh")
-        # Trigger immediately so we don't wait 5 min for first subscription
         scheduler.add_job(copier.refresh_leaderboard, "date", id="lb_startup")
-        # After leaderboard loads, backfill positions opened before bot started
-        async def do_backfill():
-            await asyncio.sleep(5)   # let refresh_leaderboard finish first
-            await copier.backfill_existing_positions()
-        scheduler.add_job(do_backfill, "date", id="lb_backfill")
-        logger.info("Strategy LEADERBOARD COPY enabled")
+
+        # State-based reconcile: poll each trader's NET position and mirror only real
+        # position changes. Replaces the fill-stream handler + one-shot backfill that
+        # caused the open/close fee-bleed churn. First run a few seconds after startup
+        # so the trader list and executor position-sync are both in place.
+        async def run_reconcile():
+            await copier.reconcile()
+
+        scheduler.add_job(run_reconcile, "interval",
+                          seconds=settings.COPY_RECONCILE_INTERVAL_S, id="lb_reconcile")
+        scheduler.add_job(run_reconcile, "date",
+                          run_date=_dt.now() + _td(seconds=8), id="lb_reconcile_startup")
+        logger.info("Strategy LEADERBOARD COPY enabled (state-based reconcile)")
 
     if settings.STRATEGY_CASCADE:
         cascade = CascadeDetector(store)

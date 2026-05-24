@@ -18,7 +18,7 @@ Runs 24/7 on a Linux VPS as `hl-bot.service`.
 | File | Role |
 |---|---|
 | `src/main.py` | Wiring, scheduler, guardian loop |
-| `src/signals/leaderboard_copy.py` | Copy engine: fill handler, sizing, backfill |
+| `src/signals/leaderboard_copy.py` | Copy engine: STATE-BASED reconcile (polls trader net positions), specialist routing, sizing |
 | `src/execution/executor.py` | Order placement, startup position sync |
 | `src/risk/manager.py` | Risk gating (one-per-coin, margin/notional caps) |
 | `config/settings.py` | All tunable constants |
@@ -28,22 +28,22 @@ Runs 24/7 on a Linux VPS as `hl-bot.service`.
 
 ## Current state (update after each deploy)
 - **Portfolio:** $1120 USDC (PORTFOLIO_USD=1120 in VPS .env)
-- **Active traders:** fc667, 42b6d9, a9b95f, 6bea81 (SOL), a4dedd (LIT)
+- **Active traders:** fc667, a9b95f (generalists); 42b6d9→ZEC, 6bea81→SOL, a4dedd→LIT (specialists via `specialty` in traders.json)
 - **COPY_TRADER_WHITELIST:** must be empty in .env — traders.json is the source
-- **Sizing:** margin-based proportional; `COPY_MIN_MARGIN_PCT=0.01` (1% = $11.20 floor)
-- **Min notional:** `MIN_POSITION_NOTIONAL=50`
-- **Leverage cap:** `COPY_MAX_COPY_LEVERAGE=10`
+- **Copy model:** STATE-BASED. `reconcile()` polls each trader's net `clearinghouseState` every `COPY_RECONCILE_INTERVAL_S=45s`, builds a desired portfolio (specialist routing, skip contested coins, highest-conviction holder), diffs vs held, mirrors net changes. NOT fill-driven.
+- **Sizing:** margin-based proportional; `COPY_MIN_MARGIN_PCT=0.01` ($11.20 floor); `MIN_POSITION_NOTIONAL=50`; `COPY_MAX_COPY_LEVERAGE=10`
 
 ---
 
 ## Critical rules — never break these
 1. `_compute_size` returns `(0.0, lev)` to signal SKIP — callers check `our_size == 0`
-2. Never emit an exit signal for a coin not in `_trader_positions[address]` — it's a WS replay
-3. Leverage is read from `signal.meta["leverage"]`, never hardcoded
-4. `_sync_positions_from_hl` runs sync at startup — all HL positions registered before backfill
-5. Backfill waits on `_refresh_done` event, NOT a sleep
-6. Exit signal `direction` = the side WE HOLD (the one being closed), NOT the offsetting side. Guardian/flip/trader-close all follow this. `_close_position` matches on it.
-7. Closes go through `_place_market_close` (reduce-only `market_close`) + `_parse_fill` — never `market_open`, never trust bare `status=="ok"`. A failed close leaves the position in the tracker.
+2. Copier is STATE-BASED (`reconcile()` diffs trader net positions vs held). NEVER reintroduce `userFills`/fill-stream copying — it churned on TWAP/trim fills and bled fees.
+3. `_refresh_account_values` REBUILDS each trader's snapshot fresh every poll (closed coins must vanish) — don't make it additive.
+4. `reconcile` is idempotent: desired-vs-actual diff. A failed/missed action re-applies next tick. `copier.risk` must be wired so it can see held positions.
+5. Routing: specialist coins (traders.json `specialty`) → that trader only; generalist coins require all holders agree on direction else SKIP (contested); pick highest-conviction holder.
+6. Leverage read from `signal.meta["leverage"]`, never hardcoded. `_sync_positions_from_hl` runs at startup before first reconcile.
+7. Exit signal `direction` = the side WE HOLD (the one being closed), NOT the offsetting side. Guardian/flip/close all follow this; `_close_position` matches on it.
+8. Closes go through `_place_market_close` (reduce-only `market_close`) + `_parse_fill` — never `market_open`, never trust bare `status=="ok"`. A failed close leaves the position in the tracker.
 
 ---
 
@@ -61,13 +61,15 @@ our_notional    = our_margin × their_lev
 ---
 
 ## Open issues
-- **Per-trader adaptive logic (not started):** copy sizing/entry is one-size-fits-all. Traders differ in sizing style & entry cadence (scaling in vs single-shot) — needs per-trader handling. Also unresolved: coin-conflict when a copy signal hits a coin already held by cascade/funding (currently first-come-wins, copy silently blocked).
+- Conviction weighting is mostly flattened by the risk manager's 15% margin cap (big holds all clamp to ~$168 margin). Fine for risk; revisit if we want to over-weight top-conviction coins.
+- Reconcile does not RESIZE: a held position whose trader changed size is left as-is until they flip/close. Acceptable (avoids churn); revisit if drift matters.
 - Native SL/TP fills (own-signal strategies) close on-exchange but the bot never reconciles them, so the position lingers in `risk.open_positions` until guardian/trader-exit. Low priority (copy trades have no SL/TP).
 
 ---
 
 ## Fix log (newest first, keep last 10)
-- `(uncommitted)` Guardian force-close was dead: sent offsetting direction + full-string reason → never matched. Now sends held direction + bare reason. Close path now uses reduce-only `market_close` + `_parse_fill` (was `market_open` + bare `status=="ok"` → orphaned live positions / flip risk). Nuclear trigger now margin-based (70% of margin), was price-move % that couldn't fire before liquidation on leverage.
+- `(uncommitted)` STATE-BASED reconcile rewrite: copier now polls trader net positions every 45s and mirrors only real changes (was fill-stream → churned on TWAP/trim fills, 238 fills/48h, fees > gross loss). Adds specialist routing (ZEC/SOL/LIT) + contested-coin skip (BTC long-vs-short) + conviction pick. Removed fill handler / userFills subs / one-shot backfill.
+- `c99e55a` Guardian force-close was dead: sent offsetting direction + full-string reason → never matched. Now sends held direction + bare reason. Close path uses reduce-only `market_close` + `_parse_fill` (was `market_open` + bare `status=="ok"`). Nuclear trigger now margin-based (70%).
 - `ce54c96` Add margin floor `COPY_MIN_MARGIN_PCT=0.01` + fix orphaned dust if market_close fails
 - `2665b56` Skip dust coins entirely (return 0.0 from _compute_size) instead of flooring
 - `7c8a8f1` MIN_POSITION_NOTIONAL=50 backstop in risk manager + executor dust cleanup
@@ -93,4 +95,4 @@ python -c "import requests; r=requests.post('https://api.hyperliquid.xyz/info', 
 - `Exchange.market_open()` — no `reduce_only` param; use `.order()` for reduce-only
 - `Exchange.market_close()` makes an extra `user_state` API call internally
 - SDK always returns `{"status":"ok"}` even on errors — must check `response.data.statuses[0]`
-- WS channel `userFills:{addr}` **replays recent fills on reconnect** — guard with `was_tracking` check
+- WS channel `userFills:{addr}` replays recent fills on reconnect — was a churn source; copier no longer subscribes (state-based). Don't reintroduce it.

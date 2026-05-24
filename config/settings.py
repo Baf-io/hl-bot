@@ -56,7 +56,11 @@ COPY_MAX_DRAWDOWN         = 0.35
 COPY_MAX_AVG_LEVERAGE     = 20
 COPY_MIN_TRADE_COUNT      = 200
 COPY_SIZE_SCALE           = 0.005       # 0.5% of their notional (scales to $100 portfolio)
-COPY_MAX_LAG_MS           = 3000        # macro traders, 3s lag is fine for new position entries
+COPY_MAX_LAG_MS           = 3000        # (legacy, fill-stream only) unused by state-based reconcile
+# State-based reconcile: poll each trader's NET position this often and mirror only real
+# position changes. Traders hold for days, so 45s latency is irrelevant — and this is what
+# kills the fee-bleeding fill-stream churn (was reacting to every TWAP/trim fill).
+COPY_RECONCILE_INTERVAL_S = 45
 COPY_MIN_THEIR_NOTIONAL   = 100         # position-aware tracking handles dedup; $100 = anti-dust
 COPY_MAX_POSITIONS_PER_TRADER = 5       # allow up to 5 (a9b95f has 3, fc667 has 6)
 # Margin-based sizing cap: cap is on MARGIN (not notional).
