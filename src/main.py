@@ -213,10 +213,10 @@ async def main():
     MAX_HOLD_HOURS = 8.0
 
     async def position_guardian():
-        from datetime import datetime
+        from datetime import datetime, timezone
         while True:
             await asyncio.sleep(30)
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
             for pos in list(risk.open_positions):
                 current_price = store.latest_mid(pos.coin)
                 if current_price:
