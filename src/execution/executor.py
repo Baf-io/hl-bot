@@ -273,8 +273,8 @@ class Executor:
         is_buy=True means we entered LONG → SL is a sell below, TP is a sell above.
         is_buy=False means we entered SHORT → SL is a buy above, TP is a buy below.
         """
-        SL_PCT = 0.03   # -3% stop loss
-        TP_PCT = 0.08   # +8% take profit
+        SL_PCT = 0.06   # -6% stop loss (widened from -3% — traders hold through dips)
+        TP_PCT = 0.12   # +12% take profit (widened from 8% — let winners breathe)
 
         if is_buy:  # long position
             sl_px = round(entry_px * (1 - SL_PCT), 4)
