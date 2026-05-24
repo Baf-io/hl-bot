@@ -96,6 +96,9 @@ class LeaderboardCopier:
         # Guards against overlapping reconcile runs if one is slow.
         self._reconcile_lock = asyncio.Lock()
 
+        # Coins we've already logged as contested — so we log only on change, not every poll.
+        self._prev_contested: set[str] = set()
+
     # ── Leaderboard / trader-list loading ───────────────────────────────────────
 
     async def refresh_leaderboard(self):
@@ -289,6 +292,7 @@ class LeaderboardCopier:
                     holders[coin].append((address, direction, notional, acct))
 
         desired: dict[str, dict] = {}
+        contested_now: set[str] = set()
         for coin, hs in holders.items():
             spec_addr = self._specialist.get(coin.upper())
             if spec_addr:
@@ -298,10 +302,12 @@ class LeaderboardCopier:
             else:
                 directions = {h[1] for h in hs}
                 if len(directions) > 1:
-                    logger.info(
-                        f"[Reconcile] {coin} CONTESTED "
-                        f"{[(a[:6], d) for a, d, _, _ in hs]} — skip"
-                    )
+                    contested_now.add(coin)
+                    if coin not in self._prev_contested:   # log only when newly contested
+                        logger.info(
+                            f"[Reconcile] {coin} CONTESTED "
+                            f"{[(a[:6], d) for a, d, _, _ in hs]} — skip"
+                        )
                     continue
                 cand = hs
 
@@ -317,7 +323,18 @@ class LeaderboardCopier:
                 "dir": direction, "source": addr, "their_notional": notional,
                 "their_acct": acct, "lev": lev, "size": our_size,
             }
+        self._prev_contested = contested_now
         return desired
+
+    # Re-enter a held position if it's below this fraction of its capped target size
+    # (catches startup-synced positions the old engine left under-sized).
+    _RESIZE_MIN_RATIO = 0.6
+
+    def _capped_target(self, d: dict) -> float:
+        """Desired notional AFTER the risk manager's per-position margin cap, so the
+        resize check compares like-for-like and never oscillates."""
+        cap = self._portfolio_usd * settings.MAX_POSITION_SIZE_PCT * max(d["lev"], 1.0)
+        return min(d["size"], cap)
 
     # ── Reconcile loop ───────────────────────────────────────────────────────────
 
@@ -342,9 +359,9 @@ class LeaderboardCopier:
                 if p.strategy in ("leaderboard", "synced")
             }
 
-            entries = exits = flips = 0
+            entries = exits = flips = resizes = 0
 
-            # Entries + flips
+            # Entries / flips / resizes
             for coin, d in desired.items():
                 cur = held.get(coin)
                 if cur is None:
@@ -355,7 +372,17 @@ class LeaderboardCopier:
                     await self._emit_exit(coin, cur.direction, "trader_flipped")
                     await self._emit_entry(coin, d)
                     flips += 1
-                # else: same coin, same direction → HOLD (this is the whole point)
+                elif cur.size_usd < self._RESIZE_MIN_RATIO * self._capped_target(d):
+                    # Materially under-sized vs target (e.g. a startup-synced position
+                    # the old engine opened small). Close & re-enter at correct size.
+                    logger.info(
+                        f"[Reconcile] RESIZE {coin} ${cur.size_usd:,.0f} -> "
+                        f"~${self._capped_target(d):,.0f} (under-sized)"
+                    )
+                    await self._emit_exit(coin, cur.direction, "resize")
+                    await self._emit_entry(coin, d)
+                    resizes += 1
+                # else: correct coin/direction/size → HOLD (this is the whole point)
 
             # Exits: we hold it but no trader wants it any more
             for coin, p in held.items():
@@ -363,10 +390,10 @@ class LeaderboardCopier:
                     await self._emit_exit(coin, p.direction, "trader_closed")
                     exits += 1
 
-            if entries or exits or flips:
+            if entries or exits or flips or resizes:
                 logger.info(
                     f"[Reconcile] desired={len(desired)} held={len(held)} | "
-                    f"+{entries} entries, {exits} exits, {flips} flips"
+                    f"+{entries} entries, {exits} exits, {flips} flips, {resizes} resizes"
                 )
             else:
                 logger.debug(
