@@ -26,11 +26,11 @@ PORTFOLIO_DELTA_MAX     = 0.95          # near-full directional exposure allowed
 # funding:     1 slot  × $165 = $165 (one carry — avoid fighting copy trades)
 # cascade:     2 slots × $165 = $330 (reduced — leaderboard is primary now)
 STRATEGY_MAX_POSITIONS = {
-    "leaderboard": 6,
-    "funding":     1,
-    "cascade":     2,
-    "squeeze":     2,
-    "arb":         2,
+    "leaderboard": 10,   # 4 traders × max 3 each = 12 theoretical; 10 covers 95%
+    "funding":      1,
+    "cascade":      2,
+    "squeeze":      2,
+    "arb":          2,
 }
 
 # ── Strategy toggles ──────────────────────────────────────────────────────────
