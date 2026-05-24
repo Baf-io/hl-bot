@@ -42,6 +42,8 @@ Runs 24/7 on a Linux VPS as `hl-bot.service`.
 3. Leverage is read from `signal.meta["leverage"]`, never hardcoded
 4. `_sync_positions_from_hl` runs sync at startup — all HL positions registered before backfill
 5. Backfill waits on `_refresh_done` event, NOT a sleep
+6. Exit signal `direction` = the side WE HOLD (the one being closed), NOT the offsetting side. Guardian/flip/trader-close all follow this. `_close_position` matches on it.
+7. Closes go through `_place_market_close` (reduce-only `market_close`) + `_parse_fill` — never `market_open`, never trust bare `status=="ok"`. A failed close leaves the position in the tracker.
 
 ---
 
@@ -59,11 +61,13 @@ our_notional    = our_margin × their_lev
 ---
 
 ## Open issues
-_None known — update this section when bugs are found_
+- **Per-trader adaptive logic (not started):** copy sizing/entry is one-size-fits-all. Traders differ in sizing style & entry cadence (scaling in vs single-shot) — needs per-trader handling. Also unresolved: coin-conflict when a copy signal hits a coin already held by cascade/funding (currently first-come-wins, copy silently blocked).
+- Native SL/TP fills (own-signal strategies) close on-exchange but the bot never reconciles them, so the position lingers in `risk.open_positions` until guardian/trader-exit. Low priority (copy trades have no SL/TP).
 
 ---
 
 ## Fix log (newest first, keep last 10)
+- `(uncommitted)` Guardian force-close was dead: sent offsetting direction + full-string reason → never matched. Now sends held direction + bare reason. Close path now uses reduce-only `market_close` + `_parse_fill` (was `market_open` + bare `status=="ok"` → orphaned live positions / flip risk). Nuclear trigger now margin-based (70% of margin), was price-move % that couldn't fire before liquidation on leverage.
 - `ce54c96` Add margin floor `COPY_MIN_MARGIN_PCT=0.01` + fix orphaned dust if market_close fails
 - `2665b56` Skip dust coins entirely (return 0.0 from _compute_size) instead of flooring
 - `7c8a8f1` MIN_POSITION_NOTIONAL=50 backstop in risk manager + executor dust cleanup

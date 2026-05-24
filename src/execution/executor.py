@@ -258,20 +258,31 @@ class Executor:
             )
             return
 
-        mid = await self._get_mid_price(signal.coin)
-        if mid is None:
+        # market_close is reduce-only by nature and derives size + szDecimals from the
+        # live on-exchange position. This avoids the flip-into-a-new-position risk of an
+        # offsetting market_open (e.g. if a native SL/TP already trimmed the size) and
+        # never rejects on lot-size rounding.
+        result = await self._place_market_close(signal.coin)
+
+        # The SDK returns {"status":"ok"} even on rejects — must parse the inner status.
+        # If the close didn't actually fill, LEAVE the position in the tracker so the
+        # guardian/next signal retries, rather than orphaning a still-open HL position.
+        filled, fill_px, err = self._parse_fill(result)
+        if not filled:
+            logger.error(
+                f"[Executor] CLOSE FAILED {signal.coin} pos#{pos.id}: {err} "
+                f"— position still open on HL, leaving in tracker"
+            )
             return
 
-        size_coin = round(pos.size_usd / pos.entry_price, 6)
-        is_buy = pos.direction == "short"   # closing short → buy; closing long → sell
-
-        result = await self._place_market(signal.coin, is_buy, size_coin)
-        if result and result.get("status") == "ok":
-            self.risk.close_position(pos.id, mid)
-            logger.success(f"[Executor] CLOSED {signal.coin} pos#{pos.id} @ ${mid:,.2f}")
-            # Notify squeeze guard — trader closed (not SL/TP/guardian)
-            if self.squeeze_guard:
-                self.squeeze_guard.on_position_closed(pos.id, mid, "trader_closed")
+        exit_px = fill_px or await self._get_mid_price(signal.coin) or pos.entry_price
+        self.risk.close_position(pos.id, exit_px)
+        logger.success(f"[Executor] CLOSED {signal.coin} pos#{pos.id} @ ${exit_px:,.4f}")
+        # Notify squeeze guard with the real exit reason (trader_closed / zombie / nuclear)
+        if self.squeeze_guard:
+            reason = signal.meta.get("reason", "trader_closed")
+            kind   = reason if reason in ("zombie", "nuclear") else "trader_closed"
+            self.squeeze_guard.on_position_closed(pos.id, exit_px, kind)
 
     # ── SDK wrappers ───────────────────────────────────────────────────────────
 
@@ -285,6 +296,23 @@ class Executor:
             return result
         except Exception as e:
             logger.error(f"[Executor] market_open failed: {e}")
+            return None
+
+    async def _place_market_close(self, coin: str) -> dict | None:
+        """
+        Close the full live position for `coin`. Reduce-only by nature — the SDK reads
+        the on-exchange size/side and submits an aggressive IOC reduce-only order, so it
+        can never flip into a new position and never mis-rounds the lot size.
+        Returns None if there is no open position for the coin.
+        """
+        if not self._exchange:
+            logger.error("Exchange not initialised — call init_client() first")
+            return None
+        try:
+            # slippage=0.01 (1%) — a close prioritises getting filled over price
+            return self._exchange.market_close(coin, slippage=0.01)
+        except Exception as e:
+            logger.error(f"[Executor] market_close failed: {e}")
             return None
 
     async def _place_limit(

@@ -216,8 +216,12 @@ async def main():
     # We do NOT close on small losses — these traders hold through dips.
     # Cutting them at -1% and watching them recover to +5% is the old mistake.
 
-    ZOMBIE_HOURS     = 72.0   # macro traders hold for days — 72h before force-close
-    NUCLEAR_LOSS_PCT = 0.20   # -20% price move = true disaster (a9b95f held -6% BTC, we trust them)
+    ZOMBIE_HOURS        = 72.0   # macro traders hold for days — 72h before force-close
+    # Nuclear trigger is on MARGIN lost, not raw price move. A 20% *price* move on a
+    # 10x position is already past liquidation, so the old price-based threshold could
+    # never fire on a leveraged copy. 70% margin loss fires before the ~100% (liquidation)
+    # point at every leverage while staying clear of the dips these traders hold through.
+    NUCLEAR_MARGIN_LOSS = 0.70
 
     async def position_guardian():
         from datetime import datetime, timezone
@@ -229,7 +233,10 @@ async def main():
                 if current_price:
                     risk.update_unrealized(pos.coin, current_price)
 
-                pnl_pct = pos.unrealized_pnl / pos.size_usd if pos.size_usd else 0
+                # pnl as % of MARGIN committed (notional / leverage), not raw price move,
+                # so the nuclear trigger is leverage-aware. pos.size_usd is NOTIONAL.
+                margin_usd = pos.size_usd / max(pos.leverage, 1.0)
+                pnl_pct = pos.unrealized_pnl / margin_usd if margin_usd else 0
                 age_h   = (now - pos.opened_at).total_seconds() / 3600
 
                 # Log status every hour so we can see what's running
@@ -239,23 +246,28 @@ async def main():
                         f"age={age_h:.1f}h pnl={pnl_pct:+.1%} [{pos.strategy}]"
                     )
 
-                reason = None
+                exit_kind = None
+                detail    = None
                 if age_h >= ZOMBIE_HOURS:
-                    reason = f"zombie {age_h:.1f}h — missed close signal?"
-                elif pnl_pct < -NUCLEAR_LOSS_PCT:
-                    reason = f"nuclear loss {pnl_pct:.1%} — SL failed"
+                    exit_kind, detail = "zombie", f"zombie {age_h:.1f}h — missed close signal?"
+                elif pnl_pct < -NUCLEAR_MARGIN_LOSS:
+                    exit_kind, detail = "nuclear", f"nuclear loss {pnl_pct:.1%} of margin — SL failed"
 
-                if reason:
-                    logger.warning(f"[Guardian] 🚨 FORCE CLOSE {pos.coin} pos#{pos.id} — {reason}")
-                    exit_kind = "nuclear" if "nuclear" in reason else "zombie"
-                    squeeze.on_position_closed(pos.id, current_price or pos.entry_price, exit_kind)
+                if exit_kind:
+                    logger.warning(f"[Guardian] 🚨 FORCE CLOSE {pos.coin} pos#{pos.id} — {detail}")
+                    # Exit signal direction = the direction WE HOLD (the side being closed).
+                    # _close_position matches the held direction, not the offsetting side.
+                    # `reason` carries the bare kind so the executor's coin-only fallback
+                    # (step 3) recognises it. Squeeze notification now happens inside
+                    # _close_position AFTER the close is confirmed filled — so we don't
+                    # mark it closed here, where the close might still fail.
                     await executor.enqueue(TradeSignal(
                         strategy=pos.strategy,
                         coin=pos.coin,
-                        direction="long" if pos.direction == "short" else "short",
+                        direction=pos.direction,
                         size_usd=0,
                         confidence=1.0,
-                        meta={"action": "exit", "reason": reason},
+                        meta={"action": "exit", "reason": exit_kind, "detail": detail},
                     ))
 
     # Daily summary at 23:55 UTC
