@@ -89,10 +89,12 @@ TRAIL_GIVEBACK = 0.30    # exit on a 30% retrace from the peak favorable excursi
 #     macro thesis (the actual edge) instead of dumping 100% on a wiggle.
 # When enabled this REPLACES the flat TRAIL_* logic for copy positions.
 SCALEOUT_ENABLED        = os.getenv("SCALEOUT_ENABLED", "true").lower() == "true"
-SCALEOUT_TP1_FRACTION   = 0.50   # bank 50% at the first tranche
-SCALEOUT_TP1_MARGIN_RET = 0.15   # ...target +15% return on MARGIN (price move × leverage)
-SCALEOUT_MIN_ATR_MULT   = 0.8    # ...but never before price clears 0.8 × daily ATR (noise floor)
-SCALEOUT_RUNNER_TRAIL_ATR = 1.5  # runner exits on a 1.5 × daily-ATR retrace from its peak
+# Tightened for MORE ACTIVE exits: we adopt positions at the trader's EXTENDED entry
+# (copy-lag) with no profit cushion, so banking forward gains beats riding their thesis.
+SCALEOUT_TP1_FRACTION   = 0.60   # bank 60% at the first tranche (was 0.50)
+SCALEOUT_TP1_MARGIN_RET = 0.10   # ...target +10% return on MARGIN (was 0.15)
+SCALEOUT_MIN_ATR_MULT   = 0.5    # ...noise floor lowered to 0.5 × daily ATR (was 0.8)
+SCALEOUT_RUNNER_TRAIL_ATR = 1.0  # runner exits on a 1.0 × daily-ATR retrace from peak (was 1.5)
 ATR_PERIOD              = 14     # daily candles used for the ATR estimate
 ATR_REFRESH_S           = 3600   # re-fetch a coin's ATR at most this often (it moves slowly)
 COPY_MIN_THEIR_NOTIONAL   = 100         # position-aware tracking handles dedup; $100 = anti-dust
