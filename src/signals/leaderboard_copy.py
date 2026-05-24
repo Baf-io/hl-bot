@@ -123,32 +123,16 @@ class LeaderboardCopier:
 
         for fill in fills:
             try:
-                fill_ts  = float(fill.get("time", now * 1000)) / 1000
-                lag_ms   = (now - fill_ts) * 1000
-
-                if lag_ms > settings.COPY_MAX_LAG_MS:
-                    logger.debug(f"[Leaderboard] Lag too high {lag_ms:.0f}ms — skip")
-                    continue
-
-                coin      = fill.get("coin", "")
-                side      = fill.get("dir", fill.get("side", ""))
-                sz        = float(fill.get("sz", 0))
-                px        = float(fill.get("px", 0))
+                fill_ts    = float(fill.get("time", now * 1000)) / 1000
+                lag_ms     = (now - fill_ts) * 1000
+                coin       = fill.get("coin", "")
+                side       = fill.get("dir", fill.get("side", ""))
+                sz         = float(fill.get("sz", 0))
+                px         = float(fill.get("px", 0))
                 closed_pnl = float(fill.get("closedPnl", 0))
 
-                # Skip xyz: tokenized stocks/commodities — can't price them yet
+                # Skip xyz:/@ tokenized stocks/commodities — not tradeable on perp side
                 if coin.startswith("xyz:") or coin.startswith("@"):
-                    logger.debug(f"[Leaderboard] Skipping RWA asset {coin}")
-                    continue
-
-                # Skip low-conviction trades — basket rebalancers open 50+ coins at $12-100 each.
-                # Only copy when they put real size in ($1K+) = actual directional conviction.
-                their_notional_preview = sz * px
-                if their_notional_preview < settings.COPY_MIN_THEIR_NOTIONAL:
-                    logger.debug(
-                        f"[Leaderboard] Skip low-conviction {coin} "
-                        f"their=${their_notional_preview:.0f} (<${settings.COPY_MIN_THEIR_NOTIONAL:,})"
-                    )
                     continue
 
                 # dir: "Open Long" / "Open Short" / "Close Long" / "Close Short"
@@ -161,9 +145,10 @@ class LeaderboardCopier:
 
                 is_close = closed_pnl != 0 or "Close" in side
 
-                # ── COPY EXIT — trader is closing, we close too ────────────────
+                # ── COPY EXIT — always relay close signals, no lag/size filter ──
+                # We never want to miss an exit — latency doesn't matter for risk mgmt
                 if is_close:
-                    logger.info(f"[Leaderboard] 🚪 COPY EXIT {coin} | trader closed | from {address[:10]}…")
+                    logger.info(f"[Leaderboard] 🚪 COPY EXIT {coin} | lag={lag_ms:.0f}ms | from {address[:10]}…")
                     if self._signal_queue:
                         await self._signal_queue.put(TradeSignal(
                             strategy="leaderboard",
@@ -173,6 +158,21 @@ class LeaderboardCopier:
                             confidence=1.0,
                             meta={"action": "exit", "reason": "trader_closed"},
                         ))
+                    continue
+
+                # ── Entry filters (only applied to opens) ─────────────────────
+                # Lag: skip stale entries — entry price matters, exit doesn't
+                if lag_ms > settings.COPY_MAX_LAG_MS:
+                    logger.debug(f"[Leaderboard] Entry lag too high {lag_ms:.0f}ms — skip")
+                    continue
+
+                # Size: traders TWAP in at $50-500/fill; $200 catches first entry chunk
+                their_notional = sz * px
+                if their_notional < settings.COPY_MIN_THEIR_NOTIONAL:
+                    logger.debug(
+                        f"[Leaderboard] Skip small entry {coin} "
+                        f"their=${their_notional:.0f} (<${settings.COPY_MIN_THEIR_NOTIONAL:,})"
+                    )
                     continue
 
                 # Per-trader slot cap: max N open positions per trader
@@ -196,8 +196,9 @@ class LeaderboardCopier:
                 # Track per-trader slots with source prefix
                 src_key = f"src:{address}:{coin}"
                 self._recent_signals.add(src_key)
-                asyncio.get_event_loop().call_later(120, self._recent_signals.discard, dedup_key)
-                asyncio.get_event_loop().call_later(120, self._recent_signals.discard, src_key)
+                # 10min dedup — traders build positions over 5-30min, don't re-enter
+                asyncio.get_event_loop().call_later(600, self._recent_signals.discard, dedup_key)
+                asyncio.get_event_loop().call_later(600, self._recent_signals.discard, src_key)
 
                 # Let risk manager size it — pass 0 so it uses max_size * confidence
                 # Their notional is logged for reference only
@@ -226,6 +227,75 @@ class LeaderboardCopier:
 
             except Exception as e:
                 logger.error(f"[Leaderboard] Fill parse error: {e}")
+
+    async def backfill_existing_positions(self):
+        """
+        Called once on startup after refresh_leaderboard().
+        Fetches each tracked trader's LIVE positions and emits entry signals
+        for any copyable coin we don't already have in our dedup cache.
+        This catches positions opened before the bot started / subscribed.
+        """
+        if not self._tracked:
+            return
+        logger.info(f"[Leaderboard] 📥 Backfilling positions from {len(self._tracked)} traders…")
+        total = 0
+        async with aiohttp.ClientSession() as session:
+            for address in self._tracked:
+                try:
+                    async with session.post(
+                        HL_REST,
+                        json={"type": "clearinghouseState", "user": address},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        state = await resp.json(content_type=None)
+                    await asyncio.sleep(0.4)
+
+                    for ap in state.get("assetPositions", []):
+                        pos = ap.get("position", {})
+                        szi = float(pos.get("szi", 0))
+                        if szi == 0:
+                            continue
+                        coin = pos.get("coin", "")
+                        if coin.startswith("xyz:") or coin.startswith("@"):
+                            continue
+                        # Skip if we already have a dedup entry (handled by live fill)
+                        if coin in self._recent_signals:
+                            continue
+
+                        direction  = "long" if szi > 0 else "short"
+                        entry_px   = float(pos.get("entryPx") or 0)
+                        notional   = abs(szi) * entry_px
+
+                        logger.info(
+                            f"[Leaderboard] 📥 BACKFILL {direction.upper()} {coin} "
+                            f"(their ${notional:,.0f}) from {address[:10]}…"
+                        )
+                        # Mark dedup so live fills don't double-enter same coin
+                        self._recent_signals.add(coin)
+                        self._recent_signals.add(f"src:{address}:{coin}")
+                        asyncio.get_event_loop().call_later(3600, self._recent_signals.discard, coin)
+                        asyncio.get_event_loop().call_later(3600, self._recent_signals.discard, f"src:{address}:{coin}")
+
+                        if self._signal_queue:
+                            await self._signal_queue.put(TradeSignal(
+                                strategy="leaderboard",
+                                coin=coin,
+                                direction=direction,
+                                size_usd=0,
+                                confidence=1.0,
+                                meta={
+                                    "source":        address,
+                                    "action":        "enter",
+                                    "backfill":      True,
+                                    "their_size_usd": notional,
+                                },
+                            ))
+                            total += 1
+
+                except Exception as e:
+                    logger.warning(f"[Leaderboard] Backfill error for {address[:10]}: {e}")
+
+        logger.info(f"[Leaderboard] 📥 Backfill complete — {total} signals queued")
 
     def set_signal_queue(self, queue: asyncio.Queue):
         self._signal_queue = queue

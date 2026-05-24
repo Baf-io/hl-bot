@@ -152,6 +152,11 @@ async def main():
         scheduler.add_job(relay_signals, "interval", seconds=1, id="lb_relay")
         # Trigger immediately so we don't wait 5 min for first subscription
         scheduler.add_job(copier.refresh_leaderboard, "date", id="lb_startup")
+        # After leaderboard loads, backfill positions opened before bot started
+        async def do_backfill():
+            await asyncio.sleep(5)   # let refresh_leaderboard finish first
+            await copier.backfill_existing_positions()
+        scheduler.add_job(do_backfill, "date", id="lb_backfill")
         logger.info("Strategy LEADERBOARD COPY enabled")
 
     if settings.STRATEGY_CASCADE:
