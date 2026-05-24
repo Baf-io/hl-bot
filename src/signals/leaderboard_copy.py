@@ -39,7 +39,9 @@ class LeaderboardCopier:
         self.feed = feed
         self._tracked: dict[str, TrackedTrader] = {}
         self._signal_queue: Optional[asyncio.Queue] = None
-        self._recent_signals: set = set()   # dedup cache
+        self._recent_signals: set = set()           # entry dedup cache
+        self._recent_exits: dict[str, float] = {}   # exit dedup: coin → timestamp
+        self._trader_acct_values: dict[str, float] = {}  # cached account equity per trader
 
     # ── Leaderboard polling ────────────────────────────────────────────────────
 
@@ -80,6 +82,34 @@ class LeaderboardCopier:
 
         self._tracked = {t.address: t for t in top}
         logger.info(f"[Leaderboard] Tracking {len(self._tracked)} traders")
+
+        # Refresh cached account equity for proportional sizing
+        asyncio.get_event_loop().create_task(self._refresh_account_values())
+
+    async def _refresh_account_values(self):
+        """
+        Fetch each tracked trader's account equity so we can size proportionally.
+        Called after refresh_leaderboard(). Runs in background, failure is non-fatal.
+        """
+        async with aiohttp.ClientSession() as session:
+            for address in list(self._tracked.keys()):
+                try:
+                    async with session.post(
+                        HL_REST,
+                        json={"type": "clearinghouseState", "user": address},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        state = await resp.json(content_type=None)
+                    ms = state.get("marginSummary", {})
+                    acct_val = float(ms.get("accountValue", 0))
+                    if acct_val > 0:
+                        self._trader_acct_values[address] = acct_val
+                        logger.debug(
+                            f"[Leaderboard] Acct value {address[:10]}… = ${acct_val:,.0f}"
+                        )
+                    await asyncio.sleep(0.4)
+                except Exception as e:
+                    logger.debug(f"[Leaderboard] Could not fetch acct value for {address[:10]}: {e}")
 
     def _passes_filter(self, t: TrackedTrader) -> bool:
         ok = (
@@ -131,8 +161,8 @@ class LeaderboardCopier:
                 px         = float(fill.get("px", 0))
                 closed_pnl = float(fill.get("closedPnl", 0))
 
-                # Skip xyz:/@ tokenized stocks/commodities — not tradeable on perp side
-                if coin.startswith("xyz:") or coin.startswith("@"):
+                # Skip tokenized stocks/commodities — not tradeable on perp side
+                if coin.startswith("xyz:") or coin.startswith("@") or coin.startswith("km:") or coin.startswith("k:"):
                     continue
 
                 # dir: "Open Long" / "Open Short" / "Close Long" / "Close Short"
@@ -145,9 +175,15 @@ class LeaderboardCopier:
 
                 is_close = closed_pnl != 0 or "Close" in side
 
-                # ── COPY EXIT — always relay close signals, no lag/size filter ──
-                # We never want to miss an exit — latency doesn't matter for risk mgmt
+                # ── COPY EXIT — relay close signals (deduplicated per coin per 60s) ──
+                # We mirror their exit: if they close via SL/TP/manual, we follow.
+                # Dedup prevents the same close flooding N times (TWAP exits = many fills).
                 if is_close:
+                    last_exit = self._recent_exits.get(coin, 0)
+                    if now - last_exit < 60:
+                        logger.debug(f"[Leaderboard] Exit dedup skip {coin} (sent {now-last_exit:.0f}s ago)")
+                        continue
+                    self._recent_exits[coin] = now
                     logger.info(f"[Leaderboard] 🚪 COPY EXIT {coin} | lag={lag_ms:.0f}ms | from {address[:10]}…")
                     if self._signal_queue:
                         await self._signal_queue.put(TradeSignal(
@@ -200,21 +236,33 @@ class LeaderboardCopier:
                 asyncio.get_event_loop().call_later(600, self._recent_signals.discard, dedup_key)
                 asyncio.get_event_loop().call_later(600, self._recent_signals.discard, src_key)
 
-                # Let risk manager size it — pass 0 so it uses max_size * confidence
-                # Their notional is logged for reference only
-                their_notional = sz * px
+                # ── Proportional sizing: mirror their exposure fraction ──────────
+                # our_size = our_portfolio × (their_fill / their_account_value)
+                # Capped at max_position_size by risk manager.
+                # Falls back to full slot if account value unknown.
+                their_notional   = sz * px
+                their_acct_val   = self._trader_acct_values.get(address, 0)
+                if their_acct_val > 0:
+                    their_pct = their_notional / their_acct_val
+                    # Clamp: don't size below $20 (noise) or above full slot
+                    from config import settings as _s
+                    our_portfolio = float(__import__("os").getenv("PORTFOLIO_USD", 1000))
+                    our_size = max(20.0, our_portfolio * their_pct)
+                else:
+                    our_size = 0   # 0 → risk manager uses max_size (safe fallback)
 
                 logger.info(
                     f"[Leaderboard] 🔥 COPY {direction.upper()} {coin} "
-                    f"(their ${their_notional:,.0f}) | lag={lag_ms:.0f}ms | from {address[:10]}…"
+                    f"(their ${their_notional:,.0f} / acct ${their_acct_val:,.0f} → us ${our_size:,.0f})"
+                    f" | lag={lag_ms:.0f}ms | from {address[:10]}…"
                 )
 
                 signal = TradeSignal(
                     strategy="leaderboard",
                     coin=coin,
                     direction=direction,
-                    size_usd=0,          # 0 = let risk manager size it at full max_size
-                    confidence=1.0,      # trust all filtered traders fully — score used for ranking only
+                    size_usd=our_size,   # proportional; risk manager caps at max_position_size
+                    confidence=1.0,
                     meta={
                         "source": address,
                         "lag_ms": lag_ms,
@@ -256,7 +304,7 @@ class LeaderboardCopier:
                         if szi == 0:
                             continue
                         coin = pos.get("coin", "")
-                        if coin.startswith("xyz:") or coin.startswith("@"):
+                        if coin.startswith("xyz:") or coin.startswith("@") or coin.startswith("km:") or coin.startswith("k:"):
                             continue
                         # Skip if we already have a dedup entry (handled by live fill)
                         if coin in self._recent_signals:
@@ -277,11 +325,17 @@ class LeaderboardCopier:
                         asyncio.get_event_loop().call_later(3600, self._recent_signals.discard, f"src:{address}:{coin}")
 
                         if self._signal_queue:
+                            their_acct_val = self._trader_acct_values.get(address, 0)
+                            if their_acct_val > 0:
+                                our_portfolio = float(__import__("os").getenv("PORTFOLIO_USD", 1000))
+                                our_size = max(20.0, our_portfolio * (notional / their_acct_val))
+                            else:
+                                our_size = 0
                             await self._signal_queue.put(TradeSignal(
                                 strategy="leaderboard",
                                 coin=coin,
                                 direction=direction,
-                                size_usd=0,
+                                size_usd=our_size,
                                 confidence=1.0,
                                 meta={
                                     "source":        address,
