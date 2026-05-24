@@ -133,6 +133,13 @@ class LeaderboardCopier:
                     logger.debug(f"[Leaderboard] Skipping RWA asset {coin}")
                     continue
 
+                # Skip low-conviction trades — basket rebalancers open 50+ coins at $12-100 each.
+                # Only copy when they put real size in ($500+) = actual directional conviction.
+                their_notional_preview = sz * px
+                if their_notional_preview < 500:
+                    logger.debug(f"[Leaderboard] Skip low-conviction {coin} their=${their_notional_preview:.0f} (<$500)")
+                    continue
+
                 # dir: "Open Long" / "Open Short" / "Close Long" / "Close Short"
                 if "Long" in side or side == "B":
                     direction = "long"
@@ -157,6 +164,15 @@ class LeaderboardCopier:
                         ))
                     continue
 
+                # Per-trader slot cap: max 2 open positions per trader
+                # Prevents basket rebalancers from filling all 7 slots
+                trader_open_count = sum(
+                    1 for key in self._recent_signals if key.startswith(f"src:{address}:")
+                )
+                if trader_open_count >= 2:
+                    logger.debug(f"[Leaderboard] Trader cap hit for {address[:10]} ({trader_open_count} slots)")
+                    continue
+
                 # Dedup: skip if we already have ANY position in this coin
                 # (prevents long+short same coin from two different traders)
                 dedup_key = f"{coin}"
@@ -164,8 +180,11 @@ class LeaderboardCopier:
                     logger.debug(f"[Leaderboard] Dedup skip {coin} (already in play)")
                     continue
                 self._recent_signals.add(dedup_key)
-                # Clear dedup after 30s to allow re-entry
-                asyncio.get_event_loop().call_later(30, self._recent_signals.discard, dedup_key)
+                # Track per-trader slots with source prefix
+                src_key = f"src:{address}:{coin}"
+                self._recent_signals.add(src_key)
+                asyncio.get_event_loop().call_later(120, self._recent_signals.discard, dedup_key)
+                asyncio.get_event_loop().call_later(120, self._recent_signals.discard, src_key)
 
                 # Let risk manager size it — pass 0 so it uses max_size * confidence
                 # Their notional is logged for reference only
