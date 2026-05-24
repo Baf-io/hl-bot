@@ -30,9 +30,10 @@ class OpenPosition:
     id: int
     coin: str
     direction: str              # "long" | "short"
-    size_usd: float
+    size_usd: float             # NOTIONAL in USD (size_usd / leverage = margin committed)
     entry_price: float
     strategy: str
+    leverage: float = 1.0       # leverage used — needed for margin-equivalent delta tracking
     opened_at: datetime = field(default_factory=datetime.utcnow)
     unrealized_pnl: float = 0.0
 
@@ -86,8 +87,16 @@ class RiskManager:
             if strategy_count >= strategy_cap:
                 return False, f"{signal.strategy} at cap ({strategy_cap} slots)", 0
 
-        # ── Rule 2: max per-position size ─────────────────────────────────────
-        max_size = self.portfolio_value * settings.MAX_POSITION_SIZE_PCT
+        # ── Rule 2: margin-based per-position cap ────────────────────────────
+        # Cap is on MARGIN, not notional:
+        #   max_margin  = portfolio × MAX_POSITION_SIZE_PCT  (e.g. $168 on $1120)
+        #   max_notional = max_margin × leverage              (e.g. $168 × 10 = $1680)
+        # This lets leveraged positions use their full capital allocation without
+        # being squeezed to a fraction of the intended margin.
+        leverage  = max(float(signal.meta.get("leverage", 1)), 1.0)
+        leverage  = min(leverage, settings.MAX_LEVERAGE)
+        max_margin   = self.portfolio_value * settings.MAX_POSITION_SIZE_PCT
+        max_size     = max_margin * leverage
         raw_size = signal.size_usd if signal.size_usd > 0 else max_size * signal.confidence
         size = min(raw_size, max_size)
 
@@ -122,6 +131,7 @@ class RiskManager:
             size_usd=filled_size_usd,
             entry_price=price,
             strategy=signal.strategy,
+            leverage=max(float(signal.meta.get("leverage", 1)), 1.0),
         )
         self.open_positions.append(pos)
         logger.info(f"[Risk] Position registered #{pos.id} {pos.coin} {pos.direction}")
@@ -174,15 +184,23 @@ class RiskManager:
         return False
 
     def _delta_check(self, signal: TradeSignal, size: float) -> tuple[bool, str]:
+        # Delta tracked in MARGIN-EQUIVALENT terms (notional / leverage).
+        # Rationale: a $1,680 notional at 10x uses only $168 of real capital —
+        # the same as a $168 notional at 1x. Tracking notional would make the
+        # delta limit fire immediately on any leveraged position.
+        def margin_equiv(p: OpenPosition) -> float:
+            return p.size_usd / max(p.leverage, 1.0)
+
+        sig_lev = max(float(signal.meta.get("leverage", 1)), 1.0)
         current_delta = sum(
-            p.size_usd if p.direction == "long" else -p.size_usd
+            margin_equiv(p) if p.direction == "long" else -margin_equiv(p)
             for p in self.open_positions
         )
-        new_delta = size if signal.direction == "long" else -size
+        new_delta = (size / sig_lev) if signal.direction == "long" else -(size / sig_lev)
         total_delta = abs(current_delta + new_delta)
         max_delta = self.portfolio_value * settings.PORTFOLIO_DELTA_MAX
         if total_delta > max_delta:
-            return False, f"net delta ${total_delta:,.0f} would exceed ${max_delta:,.0f} limit"
+            return False, f"net margin-delta ${total_delta:,.0f} would exceed ${max_delta:,.0f} limit"
         return True, ""
 
     # ── Status ─────────────────────────────────────────────────────────────────

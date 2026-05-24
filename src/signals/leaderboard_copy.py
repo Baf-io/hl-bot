@@ -63,6 +63,11 @@ class LeaderboardCopier:
         # Seeded by _refresh_account_values, used by backfill for accurate sizing.
         self._trader_position_notionals: dict[tuple, float] = {}
 
+        # Leverage per position: (address, coin) → leverage multiplier
+        # e.g. 10.0 for 10x.  Used to convert margin-cap → notional in sizing.
+        # Seeded from marginUsed / positionValue in _refresh_account_values.
+        self._trader_position_leverages: dict[tuple, float] = {}
+
         # Exit dedup: coin → last_exit_timestamp
         # Prevents TWAP exits (N close fills for one position) from firing N exit signals.
         self._recent_exits: dict[str, float] = {}
@@ -135,7 +140,7 @@ class LeaderboardCopier:
                     if acct_val > 0:
                         self._trader_acct_values[address] = acct_val
 
-                    # Seed position tracker and notional cache from live API state
+                    # Seed position tracker, notional cache, and leverage cache from live state
                     known = self._trader_positions[address]
                     for ap in state.get("assetPositions", []):
                         pos  = ap.get("position", {})
@@ -150,6 +155,11 @@ class LeaderboardCopier:
                         if szi != 0:
                             known[coin] = "long" if szi > 0 else "short"
                             self._trader_position_notionals[(address, coin)] = notional
+                            # Cache leverage: notional / marginUsed
+                            margin_used = float(pos.get("marginUsed") or 0)
+                            if margin_used > 0:
+                                lev = min(notional / margin_used, settings.COPY_MAX_COPY_LEVERAGE)
+                                self._trader_position_leverages[(address, coin)] = round(lev, 1)
 
                     logger.debug(
                         f"[Leaderboard] {address[:10]}... acct=${acct_val:,.0f} "
@@ -181,6 +191,56 @@ class LeaderboardCopier:
             + (1 - t.max_drawdown) * 0.2
             + min(1 / max(t.avg_leverage, 1), 1.0) * 0.2
         )
+
+    # ── Sizing helper ──────────────────────────────────────────────────────────
+
+    def _compute_size(
+        self,
+        address: str,
+        coin: str,
+        their_notional: float,
+        their_acct_val: float,
+        trader: "TrackedTrader",
+    ) -> tuple[float, float]:
+        """
+        Margin-based proportional sizing.
+
+        Old (notional-based):
+          our_notional = portfolio × (their_notional / their_acct)
+          → capped by risk manager at portfolio × 15% = ~$168 notional
+          → at 10x leverage that's only $16.8 of real margin
+
+        New (margin-based):
+          their_leverage  = cached notional / marginUsed  (or trader avg, max COPY_MAX_COPY_LEVERAGE)
+          their_margin    = their_notional / their_leverage
+          their_margin_pct = their_margin / their_acct
+          our_margin      = portfolio × their_margin_pct        (same margin % of our account)
+          our_notional    = our_margin × their_leverage         (scale back up with leverage)
+          → risk manager caps at (portfolio × 15%) × leverage   = ~$168 × lev notional
+          → actual margin committed stays ≤ $168 regardless of leverage
+
+        Returns (our_notional_usd, their_leverage) — leverage goes into signal.meta
+        so the risk manager can compute the correct margin-based cap.
+        """
+        if their_acct_val <= 0:
+            return 0.0, 1.0  # fallback: risk manager uses max_size
+
+        # Leverage: cached value or trader average (capped)
+        their_lev = self._trader_position_leverages.get(
+            (address, coin),
+            min(float(trader.avg_leverage), settings.COPY_MAX_COPY_LEVERAGE),
+        )
+        their_lev = max(min(their_lev, settings.COPY_MAX_COPY_LEVERAGE), 1.0)
+
+        # Their margin for this position
+        their_margin     = their_notional / their_lev
+        their_margin_pct = their_margin / their_acct_val
+
+        # Our equivalent margin, then scale to notional
+        our_margin   = max(20.0 / their_lev, self._portfolio_usd * their_margin_pct)
+        our_notional = our_margin * their_lev
+
+        return our_notional, their_lev
 
     # ── Fill handler ───────────────────────────────────────────────────────────
 
@@ -307,20 +367,18 @@ class LeaderboardCopier:
                 # Register position in tracker (before emitting signal)
                 self._trader_positions[address][coin] = direction
 
-                # ── Proportional sizing ───────────────────────────────────────
-                # our_size = our_portfolio × (their_fill_notional / their_account_value)
-                # Capped at max_position_size by risk manager.
+                # ── Margin-based proportional sizing ─────────────────────────
                 their_notional = sz * px
                 their_acct_val = self._trader_acct_values.get(address, 0)
-                if their_acct_val > 0:
-                    their_pct = their_notional / their_acct_val
-                    our_size = max(20.0, self._portfolio_usd * their_pct)
-                else:
-                    our_size = 0   # 0 → risk manager uses max_size (safe fallback)
+                our_size, their_lev = self._compute_size(
+                    address, coin, their_notional, their_acct_val, trader
+                )
 
                 logger.info(
                     f"[Leaderboard] COPY {direction.upper()} {coin} | "
-                    f"their=${their_notional:,.0f}/acct=${their_acct_val:,.0f} -> us=${our_size:,.0f} | "
+                    f"their=${their_notional:,.0f}/acct=${their_acct_val:,.0f} "
+                    f"lev={their_lev:.0f}x -> us=${our_size:,.0f} "
+                    f"(margin≈${our_size/their_lev:,.0f}) | "
                     f"lag={lag_ms:.0f}ms | {address[:10]}..."
                 )
 
@@ -334,6 +392,7 @@ class LeaderboardCopier:
                         "source":         address,
                         "lag_ms":         lag_ms,
                         "their_size_usd": their_notional,
+                        "leverage":       their_lev,
                         "action":         "enter",
                     },
                 )
@@ -365,17 +424,21 @@ class LeaderboardCopier:
             their_acct_val = self._trader_acct_values.get(address, 0)
 
             for coin, direction in list(positions.items()):
-                # Use cached position notional for accurate proportional sizing
+                # Use cached position notional + leverage for margin-based sizing
                 their_notional = self._trader_position_notionals.get((address, coin), 0)
-                if their_acct_val > 0 and their_notional > 0:
-                    our_size = max(20.0, self._portfolio_usd * (their_notional / their_acct_val))
+                trader = self._tracked.get(address)
+                if trader and their_acct_val > 0 and their_notional > 0:
+                    our_size, their_lev = self._compute_size(
+                        address, coin, their_notional, their_acct_val, trader
+                    )
                 else:
-                    our_size = 0   # risk manager uses max_size
+                    our_size, their_lev = 0.0, 1.0   # risk manager uses max_size
 
                 logger.info(
                     f"[Leaderboard] BACKFILL {direction.upper()} {coin} "
                     f"their=${their_notional:,.0f}/acct=${their_acct_val:,.0f} "
-                    f"-> us=${our_size:,.0f} | from {address[:10]}..."
+                    f"lev={their_lev:.0f}x -> us=${our_size:,.0f} "
+                    f"(margin≈${our_size/max(their_lev,1):,.0f}) | from {address[:10]}..."
                 )
 
                 if self._signal_queue:
@@ -390,6 +453,7 @@ class LeaderboardCopier:
                             "action":         "enter",
                             "backfill":       True,
                             "their_size_usd": their_notional,
+                            "leverage":       their_lev,
                         },
                     ))
                     total += 1

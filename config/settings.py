@@ -58,6 +58,11 @@ COPY_SIZE_SCALE           = 0.005       # 0.5% of their notional (scales to $100
 COPY_MAX_LAG_MS           = 3000        # macro traders, 3s lag is fine for new position entries
 COPY_MIN_THEIR_NOTIONAL   = 100         # position-aware tracking handles dedup; $100 = anti-dust
 COPY_MAX_POSITIONS_PER_TRADER = 5       # allow up to 5 (a9b95f has 3, fc667 has 6)
+# Margin-based sizing cap: cap is on MARGIN (not notional).
+# max_notional = (portfolio × MAX_POSITION_SIZE_PCT) × their_leverage
+# e.g. $1120 × 15% × 10x = $1,680 notional — but only $168 of real margin committed.
+# Prevents blindly copying 50x gamblers; real traders use 5-10x.
+COPY_MAX_COPY_LEVERAGE    = 10          # don't mirror leverage above 10x
 
 # Whitelist: if set, ONLY copy from these trader addresses (comma-separated).
 # Leave empty to copy from all qualified traders.
