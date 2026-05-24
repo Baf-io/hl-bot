@@ -75,6 +75,11 @@ class LeaderboardCopier:
         # Cache portfolio size — read once at init, not on every fill
         self._portfolio_usd: float = float(os.getenv("PORTFOLIO_USD", 1000))
 
+        # Event set by _refresh_account_values() when all traders are fetched.
+        # backfill_existing_positions() waits on this instead of a fixed sleep,
+        # so it never fires before all _trader_positions are populated.
+        self._refresh_done: asyncio.Event = asyncio.Event()
+
     # ── Leaderboard polling ────────────────────────────────────────────────────
 
     async def refresh_leaderboard(self):
@@ -112,7 +117,9 @@ class LeaderboardCopier:
         self._tracked = {t.address: t for t in raw}
         logger.info(f"[Leaderboard] Tracking {len(self._tracked)} traders")
 
-        # Refresh account equity + position state for proportional sizing
+        # Refresh account equity + position state for proportional sizing.
+        # Reset the done-event first so backfill (on startup) waits for the new fetch.
+        self._refresh_done.clear()
         asyncio.get_event_loop().create_task(self._refresh_account_values())
 
     async def _refresh_account_values(self):
@@ -124,6 +131,9 @@ class LeaderboardCopier:
           1. Cache account equity for proportional size calculation.
           2. Seed _trader_positions so backfill and fill handler know what
              the trader already holds — prevents duplicate entries.
+
+        Sets self._refresh_done event when all traders have been fetched so
+        backfill_existing_positions() can wait on it instead of a fixed sleep.
         """
         async with aiohttp.ClientSession() as session:
             for address in list(self._tracked.keys()):
@@ -169,6 +179,10 @@ class LeaderboardCopier:
 
                 except Exception as e:
                     logger.debug(f"[Leaderboard] acct refresh error {address[:10]}: {e}")
+
+        # Signal that all traders have been fetched — backfill can now proceed safely
+        self._refresh_done.set()
+        logger.info("[Leaderboard] Account refresh complete — backfill unlocked")
 
     def _passes_filter(self, t: TrackedTrader) -> bool:
         ok = (
@@ -409,12 +423,17 @@ class LeaderboardCopier:
         Called once after refresh_leaderboard() + _refresh_account_values().
         Emits entry signals for positions traders hold NOW that we don't already have.
 
-        _trader_positions is already seeded by _refresh_account_values(), so we
-        know what each trader holds. We just emit entry signals for those not yet
-        in our own account (risk manager handles the actual de-dup).
+        Waits for _refresh_done event (set by _refresh_account_values when ALL traders
+        have been fetched) before firing — eliminates the race where backfill ran before
+        the last trader's positions were seeded, causing signals to be silently dropped.
         """
         if not self._tracked:
             return
+        # Wait up to 60s for all account values to be fetched
+        try:
+            await asyncio.wait_for(self._refresh_done.wait(), timeout=60)
+        except asyncio.TimeoutError:
+            logger.warning("[Leaderboard] Backfill: refresh timed out after 60s — proceeding anyway")
         logger.info(f"[Leaderboard] Backfilling from {len(self._tracked)} traders...")
         total = 0
 

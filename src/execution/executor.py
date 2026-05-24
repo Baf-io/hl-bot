@@ -53,15 +53,24 @@ class Executor:
         # Sync open positions from HL so risk manager is accurate after restarts
         self._sync_positions_from_hl()
 
+    # Positions smaller than this are considered undersized from an old PORTFOLIO_USD
+    # setting and will be closed on startup so backfill can re-enter them correctly.
+    _MIN_SYNC_SIZE_USD = 30.0
+
     def _sync_positions_from_hl(self):
         """
         On startup: fetch real open positions from Hyperliquid and populate
         the risk manager. Prevents opening duplicate positions after bot restarts.
+
+        Dust positions (< $30 notional) are closed immediately — they are artefacts
+        of a previous low PORTFOLIO_USD setting and would block correctly-sized
+        backfill entries for the same coin.
         """
         try:
             state = self._info.user_state(settings.HL_WALLET_ADDRESS)
             positions = state.get("assetPositions", [])
             count = 0
+            dust_closed = []
             for p in positions:
                 pos = p.get("position", {})
                 szi = float(pos.get("szi", 0))
@@ -71,6 +80,21 @@ class Executor:
                 direction = "long" if szi > 0 else "short"
                 entry_px  = float(pos.get("entryPx") or 0)
                 size_usd  = abs(szi) * entry_px
+
+                # Close dust positions so backfill can re-enter at correct size
+                if size_usd < self._MIN_SYNC_SIZE_USD:
+                    logger.warning(
+                        f"[Executor] Dust position {direction} {coin} ${size_usd:.0f} "
+                        f"< ${self._MIN_SYNC_SIZE_USD} — closing for re-entry at correct size"
+                    )
+                    try:
+                        is_buy = direction == "short"   # close short = buy
+                        self._exchange.market_close(coin)
+                        dust_closed.append(coin)
+                        logger.info(f"[Executor] Dust closed: {coin}")
+                    except Exception as e:
+                        logger.warning(f"[Executor] Could not close dust {coin}: {e}")
+                    continue  # don't register in risk manager — backfill will re-enter
 
                 from data.store import TradeSignal
                 fake_signal = TradeSignal(
@@ -84,10 +108,13 @@ class Executor:
                 count += 1
                 logger.info(f"[Executor] Synced existing position: {direction} {coin} ${size_usd:,.0f}")
 
-            if count == 0:
+            if count == 0 and not dust_closed:
                 logger.info("[Executor] No existing HL positions — clean start")
             else:
-                logger.warning(f"[Executor] Synced {count} existing positions from HL — slots pre-filled")
+                logger.warning(
+                    f"[Executor] Synced {count} positions from HL — slots pre-filled"
+                    + (f" | Closed {len(dust_closed)} dust: {dust_closed}" if dust_closed else "")
+                )
         except Exception as e:
             logger.warning(f"[Executor] Position sync failed: {e} — starting fresh")
 
