@@ -494,7 +494,8 @@ class Executor:
             if r and r.get("status") == "ok":
                 st = r["response"]["data"]["statuses"][0]
                 if "error" not in st:
-                    logger.success(f"[Executor] 🛡️ native STOP {coin} @ ${sl_px} (-{sl:.0%} from ${entry_px})")
+                    dist = abs(sl_px - entry_px) / entry_px if entry_px else 0
+                    logger.success(f"[Executor] 🛡️ native STOP {coin} @ ${sl_px} (-{dist:.1%} from ${entry_px})")
                     return True
                 logger.error(f"[Executor] stop rejected {coin}: {st['error']}")
             else:
