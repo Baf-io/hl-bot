@@ -70,7 +70,7 @@ our_notional    = our_margin × their_lev
 ---
 
 ## Fix log (newest first, keep last 10)
-- `PENDING` Lev-tracker sleeve (`lev_tracker.py`): auto-mirrors `0x78aa…` direction on TRACKER_COINS (BTC) in isolated margin, fixed $100/coin stake, ≤40x, 60s poll. Follows open/close/flip not size. Wired into main.py gather under `TRACKER_ENABLED`. Dry-run tested (in-sync = no-op).
+- `8731016` Lev-tracker sleeve (`lev_tracker.py`): auto-mirrors `0x78aa…` direction on TRACKER_COINS (BTC) in isolated margin, fixed $100/coin stake, ≤40x, 60s poll. Follows open/close/flip not size. Wired into main.py gather under `TRACKER_ENABLED`. Dry-run tested (in-sync = no-op).
 - `25aa807` "78aa tactic" exits: `_ride_winners` replaces scale-out — tight stop (-25% margin, 0.6×ATR floor) + let winners run (1.5×ATR trail, no early bank). `TRACKER_COINS={BTC}` walls off the manual isolated lev-tracker from the copier (no sync/manage/desire). Executor coin-fallback now accepts `stop_loss`/`ride_trail`.
 - `637ed6e` reconcile prunes phantom positions vs OUR live HL state (`drop_phantoms`) — fixes ghosts left by manual close/liquidation/SL-TP. Raise `COPY_MIN_MARGIN_PCT` 0.01→0.03 (no $15 dust trades).
 - `8140e87` synced positions now carry real leverage (notional/marginUsed); was defaulting lev=1.0 → full notional counted as margin-delta → delta limit spuriously blocked entries after restarts.
