@@ -119,6 +119,12 @@ class LeaderboardCopier:
 
         # Add-mirroring: last poll's per-(addr,coin) notional, to detect when a trader ADDS.
         self._prev_trader_notionals: dict[tuple, float] = {}
+        # Add-detection state: per (addr,coin) size now + a RATCHETING baseline. Detects
+        # CUMULATIVE size growth (gradual scaling) not just a single 45s jump; baseline lowers
+        # on trims (so re-adds register) and resets after we act. Size (szi) not notional → no
+        # price contamination.
+        self._trader_position_sizes: dict[tuple, float] = {}
+        self._add_ref_size: dict[tuple, float] = {}
         # Daily-trend cache for the add-mirror trend filter: coin -> (dir ∈ {+1,-1,0}, ts).
         self._trend_cache: dict[str, tuple[int, float]] = {}
 
@@ -199,16 +205,18 @@ class LeaderboardCopier:
                             continue
                         fresh[coin] = "long" if szi > 0 else "short"
                         self._trader_position_notionals[(address, coin)] = notional
+                        self._trader_position_sizes[(address, coin)] = abs(szi)   # for add-detection (price-independent)
                         margin_used = float(pos.get("marginUsed") or 0)
                         if margin_used > 0:
                             lev = min(notional / margin_used, settings.COPY_MAX_COPY_LEVERAGE)
                             self._trader_position_leverages[(address, coin)] = round(lev, 1)
 
-                    # Drop cached notionals/leverages for coins this trader no longer holds
+                    # Drop cached notionals/leverages/sizes for coins this trader no longer holds
                     for (a, c) in list(self._trader_position_notionals.keys()):
                         if a == address and c not in fresh:
                             self._trader_position_notionals.pop((a, c), None)
                             self._trader_position_leverages.pop((a, c), None)
+                            self._trader_position_sizes.pop((a, c), None)
                     self._trader_positions[address] = fresh
 
                     logger.debug(
@@ -649,16 +657,21 @@ class LeaderboardCopier:
                 cap_margin = budget * settings.MAX_POSITION_SIZE_PCT
                 for coin, d in desired.items():
                     src = d["source"]
-                    cur_n  = self._trader_position_notionals.get((src, coin), 0.0)
-                    prev_n = self._prev_trader_notionals.get((src, coin), 0.0)
-                    if prev_n <= 0 or cur_n <= 0:
-                        continue                                   # no baseline (new trader/coin) → not an add
-                    if (cur_n - prev_n) / prev_n < settings.ADD_MIN_FRAC:
-                        continue                                   # not a meaningful add
-                    their_frac = (cur_n - prev_n) / prev_n
+                    cur_sz = self._trader_position_sizes.get((src, coin), 0.0)
+                    if cur_sz <= 0:
+                        continue
+                    ref = self._add_ref_size.get((src, coin))
+                    if ref is None or cur_sz < ref:
+                        # first sight, or a TRIM → (re)set the baseline to the current/lower size
+                        self._add_ref_size[(src, coin)] = cur_sz
+                        continue
+                    their_frac = (cur_sz - ref) / ref               # CUMULATIVE growth since baseline
+                    if their_frac < settings.ADD_MIN_FRAC:
+                        continue                                   # still accumulating — not yet a meaningful add
+                    self._add_ref_size[(src, coin)] = cur_sz        # CONSUME this add (fire once per +10% growth)
                     want = 1 if d["dir"] == "long" else -1
                     if self._trend_dir(coin) != want:
-                        logger.info(f"[Reconcile] {coin} add/buy skipped — trend not confirmed ({self._trend_dir(coin)} vs {want})")
+                        logger.info(f"[Reconcile] {coin} add +{their_frac:.0%} skipped — trend not confirmed ({self._trend_dir(coin)} vs {want})")
                         continue                                   # TREND GATE
                     p = held.get(coin)
                     if p is None:
@@ -680,8 +693,11 @@ class LeaderboardCopier:
                         await self._emit_add(coin, p.direction, add_usd, lev, src, their_frac)
                         adds += 1
 
-            # Snapshot trader notionals for next poll's add-detection (AFTER the add pass).
-            self._prev_trader_notionals = dict(self._trader_position_notionals)
+            # Prune add-baselines for coins no trader holds any more (avoid stale re-triggers).
+            live_keys = set(self._trader_position_sizes.keys())
+            for k in list(self._add_ref_size):
+                if k not in live_keys:
+                    self._add_ref_size.pop(k, None)
 
             if entries or exits or flips or resizes or trails or adds:
                 logger.info(

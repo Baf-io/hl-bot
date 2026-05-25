@@ -11,33 +11,32 @@ HL_WALLET_ADDRESS   = os.getenv("HL_WALLET_ADDRESS", "")
 HL_PRIVATE_KEY      = os.getenv("HL_PRIVATE_KEY", "")
 HL_TESTNET          = os.getenv("HL_TESTNET", "true").lower() == "true"
 
-# ── Risk limits ── FULL STACK MODE (~$1100 portfolio) ────────────────────────
-# Position sizing: 15% per trade = ~$165 on $1100
-# Max leaderboard slots: 6 × $165 = $990 deployed (90% stack)
-# Remaining 10% = buffer for fees, SL slippage, funding
-MAX_OPEN_POSITIONS      = 12            # global ceiling (leaderboard dominates now)
-MAX_POSITION_SIZE_PCT   = 0.15          # 15% per position (~$165 on $1100)
-DAILY_LOSS_HALT_PCT     = 0.10          # halt at -10% (~$110) — unchanged
-MAX_LEVERAGE            = 20
-PORTFOLIO_DELTA_MAX     = 0.95          # near-full directional exposure allowed
-MIN_POSITION_NOTIONAL   = 50            # reject signals below $50 notional — not worth a slot
+# ── Risk limits ── RISK-POLICY-CONTRACT CLAMP (2026-05-25) ───────────────────
+# Hard institutional limits. ≤3x, MAX 1 open position, kill-switch -3%/day & -5%/week,
+# no averaging, PROBE-only until a source is KEEP-validated (B). See ENTRY_EXIT_PLAN / contract.
+MAX_OPEN_POSITIONS      = 1             # CONTRACT: max 1 open position
+MAX_POSITION_SIZE_PCT   = 0.05          # tight per-pos margin cap (probe cap dominates anyway)
+DAILY_LOSS_HALT_PCT     = 0.03          # CONTRACT: halt new entries at -3%/day realized
+WEEKLY_LOSS_HALT_PCT    = 0.05          # CONTRACT: halt at -5%/week realized
+MAX_LEVERAGE            = 3             # CONTRACT: max 3x
+PORTFOLIO_DELTA_MAX     = 0.50          # tightened (1 small position anyway)
+MIN_POSITION_NOTIONAL   = 20            # lowered so a ≤$50 probe clears the floor
+PROBE_MAX_NOTIONAL      = 50            # CONTRACT: WATCH/unvalidated source → ≤$50 exposure (probe)
+PROBE_MAX_RISK_USD      = 5             # CONTRACT: ≤$5 risk on a probe
 
-# ── Per-strategy slot caps ────────────────────────────────────────────────────
-# leaderboard: 6 slots × $165 = $990 max (5 whitelisted traders, ~1-2 open each)
-# funding:     1 slot  × $165 = $165 (one carry — avoid fighting copy trades)
-# cascade:     2 slots × $165 = $330 (reduced — leaderboard is primary now)
+# ── Per-strategy slot caps (CONTRACT: only leaderboard, max 1) ────────────────
 STRATEGY_MAX_POSITIONS = {
-    "leaderboard": 10,   # 4 traders × max 3 each = 12 theoretical; 10 covers 95%
-    "funding":      1,
-    "cascade":      2,
-    "squeeze":      2,
-    "arb":          2,
+    "leaderboard": 1,
+    "funding":      0,
+    "cascade":      0,
+    "squeeze":      0,
+    "arb":          0,
 }
 
 # ── Strategy toggles ──────────────────────────────────────────────────────────
-STRATEGY_FUNDING_CARRY    = os.getenv("STRATEGY_FUNDING_CARRY", "true").lower() == "true"
+STRATEGY_FUNDING_CARRY    = os.getenv("STRATEGY_FUNDING_CARRY", "false").lower() == "true"   # CLAMP: off (contract = leaderboard-only)
 STRATEGY_LEADERBOARD_COPY = os.getenv("STRATEGY_LEADERBOARD_COPY", "true").lower() == "true"
-STRATEGY_CASCADE          = os.getenv("STRATEGY_CASCADE", "true").lower() == "true"
+STRATEGY_CASCADE          = os.getenv("STRATEGY_CASCADE", "false").lower() == "true"          # CLAMP: off
 # Phase 2-4 — disabled until calibrated; set to "true" in .env to enable
 STRATEGY_OI_SQUEEZE       = os.getenv("STRATEGY_OI_SQUEEZE", "false").lower() == "true"
 STRATEGY_STAT_ARB         = os.getenv("STRATEGY_STAT_ARB", "false").lower() == "true"
@@ -145,7 +144,7 @@ FRESH_ENTRY_EXPIRE_S = 600    # a fresh-open opportunity expires after this long
 # winners). So we mirror ADDS ONLY (scale in), never trims — exits stay ours (bank/ride/close).
 # Trend-gated because the add-edge is regime-dependent: only add when the coin's daily trend
 # aligns with the position (notify + enter). Bounded by the per-position margin cap.
-ADD_MIRROR_ENABLED = os.getenv("ADD_MIRROR_ENABLED", "true").lower() == "true"
+ADD_MIRROR_ENABLED = os.getenv("ADD_MIRROR_ENABLED", "false").lower() == "true"  # CLAMP: no averaging
 ADD_MIN_FRAC       = 0.10   # the trader's notional must grow >=10% poll-over-poll to trigger
 ADD_STEP_MAX       = 0.50   # our add = min(their %-increase, this) of our current size, per step
 TREND_SMA_DAYS     = 5      # daily-SMA window for the trend filter (close vs SMA = up/down)
@@ -157,13 +156,13 @@ TREND_SMA_DAYS     = 5      # daily-SMA window for the trend filter (close vs SM
 # trader's NEXT add (the "repeat"). Trend-gated entries/adds keep it on the right side.
 # Supersedes the +25% bank / ride-trail for copy positions (those constants now unused).
 COPY_TP_PCT        = 0.01   # sell at +1% favorable price move (≈ the 80%-probable roof)
-COPY_SL_PCT        = 0.015  # cut at -1.5% adverse (tight, paired with the +1% TP)
-COPY_REOPEN_ON_ADD = os.getenv("COPY_REOPEN_ON_ADD", "true").lower() == "true"  # buy-on-add when flat (repeat)
+COPY_SL_PCT        = 0.03   # cut at -3% adverse (3× the +1% TP — wide berth for the ~80% WR; 1:3 R:R, breakeven 75%)
+COPY_REOPEN_ON_ADD = os.getenv("COPY_REOPEN_ON_ADD", "false").lower() == "true"  # CLAMP: no re-add
 # Scalp leverage: FIXED leverage for copy entries (overrides the trader's lev + the old vol-cap),
 # so a +1% TP is meaningful $ on our small book. At 12x: +1%TP=+12% margin, -1.5%SL=-18% margin,
 # liq ≈ -7.9% price (the 1.5% soft-SL has buffer). Bounded by daily-loss-halt. NOTE: soft SL is
 # polled every 45s — going much above ~12x risks a fast move gapping past it (would need native stops).
-SCALP_LEVERAGE     = int(os.getenv("SCALP_LEVERAGE", "12"))
+SCALP_LEVERAGE     = int(os.getenv("SCALP_LEVERAGE", "3"))   # CLAMP: contract max 3x
 
 # ── Tracker coins: reserved for the manual "lev-guy" tracker, OFF-LIMITS to copy ─
 # The copy engine never syncs, manages, or desires these — they're a separate manual
@@ -186,7 +185,7 @@ COPIER_SKIP_COINS = TRACKER_COINS | MANUAL_COINS
 # Walled off from the copy engine. Holds a fixed TRACKER_MARGIN_USD of ISOLATED
 # margin per tracker coin in the SAME direction as the source trader; follows his
 # open/close/flip (not his size). Isolated → max loss per coin = the margin staked.
-TRACKER_ENABLED      = os.getenv("TRACKER_ENABLED", "true").lower() == "true"
+TRACKER_ENABLED      = os.getenv("TRACKER_ENABLED", "false").lower() == "true"  # CLAMP: 40x tracker violates 3x + 1-pos
 TRACKER_DRY_RUN      = os.getenv("TRACKER_DRY_RUN", "false").lower() == "true"  # log only
 TRACKER_SOURCE_ADDR  = os.getenv("TRACKER_SOURCE_ADDR",
                                  "0x78aa6328eae8028a089c35d2819f79c78de2a7e5")  # the 40x guy
@@ -202,7 +201,7 @@ COPY_MAX_POSITIONS_PER_TRADER = 5       # allow up to 5 (a9b95f has 3, fc667 has
 # max_notional = (portfolio × MAX_POSITION_SIZE_PCT) × their_leverage
 # e.g. $1120 × 15% × 10x = $1,680 notional — but only $168 of real margin committed.
 # Prevents blindly copying 50x gamblers; real traders use 5-10x.
-COPY_MAX_COPY_LEVERAGE    = 12          # cap (raised 10→12 for the scalp leverage; executor enforces it)
+COPY_MAX_COPY_LEVERAGE    = 3           # CLAMP: contract max 3x
 # Minimum margin (as % of portfolio) we must commit to open a copy position.
 # Prevents high-leverage traders from creating slots worth only a few dollars.
 # e.g. a9b95f 20x ETH: our_notional=$165 passes $50 notional floor but our_margin=$8 — skip.

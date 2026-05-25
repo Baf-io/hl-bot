@@ -48,8 +48,10 @@ class RiskManager:
         self._trading_halted     = False
         self._last_reset_date    = date.today()
         self._position_id_seq    = 0
+        self._weekly_pnl         = 0.0          # CONTRACT: -5%/week kill-switch
+        self._week_start         = date.today()
 
-    # ── Daily reset ────────────────────────────────────────────────────────────
+    # ── Daily / weekly reset ─────────────────────────────────────────────────────
 
     def _check_daily_reset(self):
         today = date.today()
@@ -58,6 +60,10 @@ class RiskManager:
             self._daily_pnl = 0.0
             self._trading_halted = False
             self._last_reset_date = today
+        if (today - self._week_start).days >= 7:
+            logger.info(f"Weekly reset | week PnL: ${self._weekly_pnl:+,.2f}")
+            self._weekly_pnl = 0.0
+            self._week_start = today
 
     # ── Main gate ──────────────────────────────────────────────────────────────
 
@@ -69,22 +75,17 @@ class RiskManager:
         self._check_daily_reset()
 
         if self._trading_halted:
-            return False, "HALTED: daily loss limit hit", 0
+            return False, "HALTED: loss limit hit", 0
+        # CONTRACT kill-switch: halt new entries at -5%/week realized (daily handled on close).
+        if self._weekly_pnl / self.portfolio_value <= -settings.WEEKLY_LOSS_HALT_PCT:
+            return False, f"HALTED: weekly loss {self._weekly_pnl/self.portfolio_value:.1%} ≤ -{settings.WEEKLY_LOSS_HALT_PCT:.0%}", 0
 
         if signal.meta.get("action") == "exit":
             return True, "exit approved", signal.size_usd
 
-        # ── ADD: grow an EXISTING position (add-mirroring). One-per-coin & max-positions
-        # don't apply (not a new position); the copier already caps the add to the margin
-        # cap. Still enforce the net-delta limit so adds can't blow past directional exposure.
+        # ── CONTRACT: NO averaging into losers — reject all 'add' signals.
         if signal.meta.get("action") == "add":
-            size = signal.size_usd
-            if size < settings.MIN_POSITION_NOTIONAL:
-                return False, f"add ${size:.0f} below min", 0
-            ok, msg = self._delta_check(signal, size)
-            if not ok:
-                return False, f"add blocked: {msg}", 0
-            return True, "add approved", size
+            return False, "REJECTED: no averaging (risk-policy contract)", 0
 
         # ── Rule 0: one position per coin ────────────────────────────────────
         existing = next((p for p in self.open_positions if p.coin == signal.coin), None)
@@ -113,6 +114,10 @@ class RiskManager:
         max_size     = max_margin * leverage
         raw_size = signal.size_usd if signal.size_usd > 0 else max_size * signal.confidence
         size = min(raw_size, max_size)
+        # ── CONTRACT: PROBE cap — no source is KEEP-validated yet, so every live entry is a
+        # probe: notional ≤ PROBE_MAX_NOTIONAL and risk ≤ PROBE_MAX_RISK_USD. (Lifted per-source
+        # in B once a source is KEEP-validated.)
+        size = min(size, float(settings.PROBE_MAX_NOTIONAL))
 
         # ── Rule 2b: minimum notional floor ──────────────────────────────────
         # Reject positions too small to be worth the gas/slippage.
@@ -168,6 +173,7 @@ class RiskManager:
             pnl = pos.size_usd * (exit_price - pos.entry_price) / pos.entry_price
 
         self._daily_pnl += pnl
+        self._weekly_pnl += pnl
         self.open_positions.remove(pos)
 
         pct = self._daily_pnl / self.portfolio_value
@@ -202,6 +208,7 @@ class RiskManager:
             pnl = closed_notional * (exit_price - pos.entry_price) / pos.entry_price
 
         self._daily_pnl += pnl
+        self._weekly_pnl += pnl
         pos.size_usd -= closed_notional
         pos.scaled_out = True
 
