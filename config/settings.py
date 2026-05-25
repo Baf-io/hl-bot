@@ -97,21 +97,32 @@ SCALEOUT_MIN_ATR_MULT   = 0.5    # ...noise floor lowered to 0.5 × daily ATR (w
 SCALEOUT_RUNNER_TRAIL_ATR = 1.0  # runner exits on a 1.0 × daily-ATR retrace from peak (was 1.5)
 ATR_PERIOD              = 14     # daily candles used for the ATR estimate
 
-# ── "78aa tactic": CUT LOSERS FAST, LET WINNERS RUN (applies to ALL copy pos) ───
-# Modelled on trader 0x78aa… — 39% win rate but 2.36 payoff: tiny stops, big runners.
-# When RIDE_WINNERS_ENABLED, this REPLACES scale-out (no early profit-banking — we do
-# NOT trim winners; we ride them on a wide ATR trail and only cut losers hard & early).
-#   • STOP  — full-exit a position the moment its loss hits STOP_LOSS_MARGIN_PCT of the
-#             margin committed (leverage-aware: price move = pct / leverage). This is the
-#             "cut losers fast" half — far tighter than the old -70% nuclear backstop.
-#   • RIDE  — once a winner has run ≥ RIDE_ACTIVATE_ATR × dailyATR%, trail it; exit only on
-#             a RIDE_GIVEBACK_ATR × dailyATR% retrace from peak. Wide trail = let it run.
+# ── EXIT ENGINE: HARD MARGIN STOP + BANK-AND-RIDE (see docs/ENTRY_EXIT_PLAN.md) ──
+# Overhauled 2026-05-25 after the live audit showed the old `max(margin, ATR)` stop was
+# really -47% to -62% of margin and fired 0 times; losses came from RESIZE churn instead.
+#   • STOP  — HARD: full-exit the instant loss hits STOP_LOSS_MARGIN_PCT of margin
+#             (price move = pct / leverage). NO ATR floor — the floor is gone; the dollar
+#             cap is enforced. Applies EVEN IF ATR is unavailable (atr only gates the trail).
+#   • BANK  — bank BANK_FRACTION of the position at +BANK_AT_MARGIN_RET margin return
+#             (= +2R when stop is -20%), then let the runner ride. ("take profits sooner")
+#   • RIDE  — runner trails: once it clears RIDE_ACTIVATE_ATR × dailyATR%, exit on a
+#             RIDE_GIVEBACK_ATR × dailyATR% retrace from peak.
 RIDE_WINNERS_ENABLED   = os.getenv("RIDE_WINNERS_ENABLED", "true").lower() == "true"
-STOP_LOSS_MARGIN_PCT   = 0.25   # cut a loser at -25% of its margin (was -70% nuclear only)
-STOP_MIN_ATR_MULT      = 0.6    # …but never tighter than 0.6× daily-ATR (avoid noise whipsaw
-                                #   on high-lev pos: -25%/10x = 2.5% price is < 1 ATR on alts)
+STOP_LOSS_MARGIN_PCT   = 0.20   # HARD: cut a loser at -20% of its margin (deterministic $ cap)
 RIDE_ACTIVATE_ATR      = 1.0    # winner must clear +1× daily-ATR before the trail engages
-RIDE_GIVEBACK_ATR      = 1.5    # then exit on a 1.5× daily-ATR retrace from peak (ride it)
+RIDE_GIVEBACK_ATR      = 1.0    # then exit on a 1.0× daily-ATR retrace from peak (bank closer)
+BANK_FRACTION          = 0.50   # bank 50% of the position at the +2R target…
+BANK_AT_MARGIN_RET     = 0.40   # …i.e. +40% return on margin (= 2× the -20% stop = +2R)
+
+# Vol-scaled leverage: tune each coin's copy leverage to its ATR so the -20% margin stop
+# always lands ≥ STOP_NOISE_ATR daily-ATRs away (a real move, not noise). Volatile coins get
+# smaller/safer positions; the dollar stop is identical everywhere. Textbook vol-targeting.
+VOL_SCALED_LEV         = os.getenv("VOL_SCALED_LEV", "true").lower() == "true"
+STOP_NOISE_ATR         = 0.5    # stop distance must be >= 0.5× daily-ATR → lev_cap = STOP/(0.5·atr)
+
+# Churn controls (the -$133 was mostly RESIZE close-and-reopen + fleeting alt copies):
+RESIZE_ENABLED            = os.getenv("RESIZE_ENABLED", "false").lower() == "true"  # phase-1: OFF (no close+reopen)
+COPY_ENTRY_DEBOUNCE_TICKS = int(os.getenv("COPY_ENTRY_DEBOUNCE_TICKS", "2"))        # trader must hold a NEW coin this many reconcile ticks before we copy
 
 # ── Tracker coins: reserved for the manual "lev-guy" tracker, OFF-LIMITS to copy ─
 # The copy engine never syncs, manages, or desires these — they're a separate manual
@@ -128,9 +139,9 @@ TRACKER_ENABLED      = os.getenv("TRACKER_ENABLED", "true").lower() == "true"
 TRACKER_DRY_RUN      = os.getenv("TRACKER_DRY_RUN", "false").lower() == "true"  # log only
 TRACKER_SOURCE_ADDR  = os.getenv("TRACKER_SOURCE_ADDR",
                                  "0x78aa6328eae8028a089c35d2819f79c78de2a7e5")  # the 40x guy
-TRACKER_MARGIN_USD   = float(os.getenv("TRACKER_MARGIN_USD", "100"))   # margin staked per coin
+TRACKER_MARGIN_USD   = float(os.getenv("TRACKER_MARGIN_USD", "200"))   # margin staked per coin (applies to 78aa's NEXT entry; current open BTC pos rides untouched)
 TRACKER_MAX_LEV      = int(os.getenv("TRACKER_MAX_LEV", "40"))          # cap (he runs ~40x)
-TRACKER_POLL_S       = int(os.getenv("TRACKER_POLL_S", "60"))           # direction poll cadence
+TRACKER_POLL_S       = int(os.getenv("TRACKER_POLL_S", "10"))           # direction poll cadence (10s: tight follow on his open/close/flip; 2 API calls/tick = trivial rate-limit load)
 ATR_REFRESH_S           = 3600   # re-fetch a coin's ATR at most this often (it moves slowly)
 COPY_MIN_THEIR_NOTIONAL   = 100         # position-aware tracking handles dedup; $100 = anti-dust
 COPY_MAX_POSITIONS_PER_TRADER = 5       # allow up to 5 (a9b95f has 3, fc667 has 6)
@@ -153,7 +164,7 @@ COPY_MIN_MARGIN_PCT       = 0.03        # (legacy proportional floor — unused 
 #      coin's direction, so tiny dabbles can't spuriously contest a coin.
 #   2. Equal-weight OUR capital to COPY_TARGET_DEPLOY across the chosen coins, capped at
 #      MAX_POSITION_SIZE_PCT each. Deploys fully regardless of the trader's account size.
-COPY_MIN_CONVICTION_PCT   = 0.03        # their position must be >=3% of their acct to copy/vote
+COPY_MIN_CONVICTION_PCT   = 0.05        # their position must be >=5% of their acct to copy/vote (raised 0.03→0.05: fewer, stronger copies, less churn)
 COPY_TARGET_DEPLOY        = 0.85        # deploy ~85% of our capital, equal-weight
 
 # Whitelist: if set, ONLY copy from these trader addresses (comma-separated).

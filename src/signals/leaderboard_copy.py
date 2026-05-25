@@ -104,6 +104,10 @@ class LeaderboardCopier:
         # coin -> the direction we were in when we trail-exited.
         self._trail_locked: dict[str, str] = {}
 
+        # Entry debounce: coin -> consecutive reconcile ticks it's been desired-but-not-held.
+        # We only open once the streak clears COPY_ENTRY_DEBOUNCE_TICKS (kills fleeting copies).
+        self._pending_entry: dict[str, int] = defaultdict(int)
+
         # Daily-ATR cache for scale-out levels: coin -> (atr_pct, monotonic_ts).
         # atr_pct is ATR(ATR_PERIOD) over daily candles divided by last close (a fraction).
         self._atr_cache: dict[str, tuple[float, float]] = {}
@@ -240,6 +244,24 @@ class LeaderboardCopier:
             return 0.0
         return (notional / self._lev_for(address, coin)) / acct
 
+    def _atr_cached(self, coin: str) -> Optional[float]:
+        """Synchronous read of the ATR cache (no fetch). Pre-warmed in reconcile via
+        _atr_pct before _build_desired so the vol-scaled-leverage step can stay sync."""
+        c = self._atr_cache.get(coin)
+        return c[0] if c else None
+
+    def _vol_capped_lev(self, coin: str, base_lev: float) -> float:
+        """Tune leverage to the coin's ATR so the hard -STOP_LOSS_MARGIN_PCT stop lands
+        >= STOP_NOISE_ATR daily-ATRs away (a real move, not noise). Caps below base_lev on
+        volatile coins; leaves low-vol coins at base. Falls back to base_lev if no ATR."""
+        if not settings.VOL_SCALED_LEV:
+            return base_lev
+        atr = self._atr_cached(coin)
+        if not atr or atr <= 0:
+            return base_lev
+        lev_cap = settings.STOP_LOSS_MARGIN_PCT / (settings.STOP_NOISE_ATR * atr)
+        return max(1.0, min(base_lev, lev_cap))
+
     # ── Daily-ATR for volatility-normalized scale-out ────────────────────────────
 
     async def _atr_pct(self, coin: str) -> Optional[float]:
@@ -344,7 +366,7 @@ class LeaderboardCopier:
                     continue
                 cand = hs
             addr, direction, _ = max(cand, key=lambda h: h[2])
-            chosen[coin] = (addr, direction, self._lev_for(addr, coin))
+            chosen[coin] = (addr, direction, self._vol_capped_lev(coin, self._lev_for(addr, coin)))
         self._prev_contested = contested_now
 
         # ── Stage 2: equal-weight sizing to target deployment ────────────────────
@@ -407,6 +429,13 @@ class LeaderboardCopier:
                 self._portfolio_usd = equity
                 self.risk.portfolio_value = equity
 
+            # Pre-warm the ATR cache for every coin a trader holds, so the sync vol-scaled-
+            # leverage step (_build_desired) and the stop/trail (_ride_winners) can read it
+            # without awaiting. _atr_pct caches for ATR_REFRESH_S, so this is ~1 call/coin/hr.
+            for c in {coin for pos in self._trader_positions.values() for coin in pos
+                      if coin not in settings.TRACKER_COINS}:
+                await self._atr_pct(c)
+
             desired = self._build_desired()
 
             # What we actually hold from this strategy (copy + startup-synced positions).
@@ -453,6 +482,17 @@ class LeaderboardCopier:
                     del self._trail_locked[coin]       # trader flipped — re-arm
                 cur = held.get(coin)
                 if cur is None:
+                    # Entry debounce: the trader must hold a NEW coin for COPY_ENTRY_DEBOUNCE_TICKS
+                    # consecutive reconciles before we copy it — kills fleeting/scalp positions
+                    # that would otherwise churn in and out at a fee loss.
+                    self._pending_entry[coin] += 1
+                    if self._pending_entry[coin] < settings.COPY_ENTRY_DEBOUNCE_TICKS:
+                        logger.debug(
+                            f"[Reconcile] {coin} debounce {self._pending_entry[coin]}/"
+                            f"{settings.COPY_ENTRY_DEBOUNCE_TICKS} — waiting"
+                        )
+                        continue
+                    self._pending_entry.pop(coin, None)
                     await self._emit_entry(coin, d)
                     entries += 1
                 elif cur.direction != d["dir"]:
@@ -460,14 +500,14 @@ class LeaderboardCopier:
                     await self._emit_exit(coin, cur.direction, "trader_flipped")
                     await self._emit_entry(coin, d)
                     flips += 1
-                elif not cur.scaled_out and not (
+                elif settings.RESIZE_ENABLED and not cur.scaled_out and not (
                         self._RESIZE_MIN_RATIO * self._capped_target(d)
                         <= cur.size_usd
                         <= self._RESIZE_MAX_RATIO * self._capped_target(d)):
-                    # Materially off target (under- OR over-sized) — close & re-enter at
-                    # the equal-weight target size.
-                    # (Skip scaled-out runners: their reduced size is intentional profit-
-                    #  taking, not a sizing artefact — re-buying would undo it and churn.)
+                    # Materially off target — close & re-enter at the equal-weight target size.
+                    # DISABLED by default (RESIZE_ENABLED=false): the close-and-reopen locked
+                    # running losses + paid double fees (−$79 of the first −$133). Positions now
+                    # ride at entry size until a real exit/flip/stop. (Skip scaled-out runners.)
                     tgt = self._capped_target(d)
                     logger.info(
                         f"[Reconcile] RESIZE {coin} ${cur.size_usd:,.0f} -> ~${tgt:,.0f} "
@@ -476,7 +516,7 @@ class LeaderboardCopier:
                     await self._emit_exit(coin, cur.direction, "resize")
                     await self._emit_entry(coin, d)
                     resizes += 1
-                # else: correct coin/direction/size → HOLD (this is the whole point)
+                # else: correct coin/direction → HOLD (this is the whole point)
 
             # Exits: we hold it but no trader wants it any more
             for coin, p in held.items():
@@ -488,6 +528,12 @@ class LeaderboardCopier:
             for coin in list(self._trail_locked):
                 if coin not in desired:
                     del self._trail_locked[coin]
+
+            # Reset entry-debounce streaks for coins we no longer desire OR already hold
+            # (so a coin must build a fresh streak each time it reappears as a new entry).
+            for coin in list(self._pending_entry):
+                if coin not in desired or coin in held:
+                    self._pending_entry.pop(coin, None)
 
             if entries or exits or flips or resizes or trails:
                 logger.info(
@@ -502,19 +548,18 @@ class LeaderboardCopier:
 
     async def _ride_winners(self, held: dict) -> int:
         """
-        "78aa tactic" — CUT LOSERS FAST, LET WINNERS RUN. Full-position exits only,
-        NO early profit-banking (we never trim a winner). Per held position:
+        HARD STOP + BANK-AND-RIDE exit engine (see docs/ENTRY_EXIT_PLAN.md). Per held pos:
 
-          STOP — exit the instant the loss reaches STOP_LOSS_MARGIN_PCT of margin
-                 (price move = pct / leverage), but never tighter than
-                 STOP_MIN_ATR_MULT × dailyATR% so high-lev positions aren't whipsawed
-                 out by intraday noise. This is the "cut losers fast" half.
-          RIDE — once the favorable excursion has cleared RIDE_ACTIVATE_ATR × dailyATR%,
-                 trail it; exit only on a RIDE_GIVEBACK_ATR × dailyATR% retrace from peak.
-                 Wide trail = let the winner run (mirrors his 2.36 payoff).
+          STOP — HARD full-exit the instant loss hits STOP_LOSS_MARGIN_PCT of margin
+                 (price move = pct / leverage). NO ATR floor. Applies even when ATR is
+                 unavailable — the dollar cap must always be enforced. ("cut losers fast")
+          BANK — once not yet scaled and the gain clears +BANK_AT_MARGIN_RET margin return
+                 (= +2R), bank BANK_FRACTION of the position and let the rest ride.
+          RIDE — the runner trails: after the peak clears RIDE_ACTIVATE_ATR × dailyATR%,
+                 exit on a RIDE_GIVEBACK_ATR × dailyATR% retrace from peak.
 
-        A coin we exit is trail-locked until the trader's net position resets, so
-        reconcile won't instantly re-buy. Skips any coin with no live mid / no ATR.
+        A full exit trail-locks the coin until the trader's net position resets, so
+        reconcile won't instantly re-buy. Skips a coin only if it has no live mid.
         """
         actions = 0
         for coin, p in list(held.items()):
@@ -526,18 +571,14 @@ class LeaderboardCopier:
             if exc > p.peak_price_pct:
                 p.peak_price_pct = exc
             lev = max(p.leverage, 1.0)
-            atr = await self._atr_pct(coin)
-            if not atr or atr <= 0:
-                continue   # no volatility estimate → don't act blind
+            atr = await self._atr_pct(coin)   # may be None — only the trail needs it
 
-            # ── CUT LOSERS FAST ───────────────────────────────────────────────
-            stop_px = max(settings.STOP_LOSS_MARGIN_PCT / lev,
-                          settings.STOP_MIN_ATR_MULT * atr)
+            # ── HARD STOP (deterministic, no ATR dependency) ──────────────────
+            stop_px = settings.STOP_LOSS_MARGIN_PCT / lev
             if exc <= -stop_px:
                 logger.info(
                     f"[Reconcile] 🛑 STOP {coin} {p.direction} | move {exc:+.1%} "
-                    f"≤ -{stop_px:.1%} (-{settings.STOP_LOSS_MARGIN_PCT:.0%} margin @ {lev:.0f}x, "
-                    f"ATR floor {settings.STOP_MIN_ATR_MULT}×{atr:.1%})"
+                    f"≤ -{stop_px:.1%} (hard -{settings.STOP_LOSS_MARGIN_PCT:.0%} margin @ {lev:.0f}x)"
                 )
                 await self._emit_exit(coin, p.direction, "stop_loss")
                 self._trail_locked[coin] = p.direction
@@ -545,8 +586,23 @@ class LeaderboardCopier:
                 actions += 1
                 continue
 
-            # ── LET WINNERS RUN (wide ATR trail, no early bank) ────────────────
-            if p.peak_price_pct >= settings.RIDE_ACTIVATE_ATR * atr:
+            # ── BANK at +2R (partial; no ATR needed) ──────────────────────────
+            if not p.scaled_out:
+                bank_px = settings.BANK_AT_MARGIN_RET / lev
+                if exc >= bank_px:
+                    logger.info(
+                        f"[Reconcile] 💰 BANK {settings.BANK_FRACTION:.0%} {coin} {p.direction} | "
+                        f"move +{exc:.1%} ≥ +{bank_px:.1%} (+{settings.BANK_AT_MARGIN_RET:.0%} margin "
+                        f"= +2R @ {lev:.0f}x) — ride the rest"
+                    )
+                    await self._emit_exit(coin, p.direction, "bank_2r",
+                                          settings.BANK_FRACTION)
+                    p.scaled_out = True
+                    actions += 1
+                    # fall through: the runner can still trail/stop on later ticks
+
+            # ── RIDE the runner (needs ATR) ───────────────────────────────────
+            if atr and atr > 0 and p.peak_price_pct >= settings.RIDE_ACTIVATE_ATR * atr:
                 giveback = settings.RIDE_GIVEBACK_ATR * atr
                 if exc <= p.peak_price_pct - giveback:
                     logger.info(
