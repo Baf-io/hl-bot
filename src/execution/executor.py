@@ -77,6 +77,12 @@ class Executor:
                 if szi == 0:
                     continue
                 coin      = pos.get("coin", "")
+                if coin in settings.TRACKER_COINS:
+                    logger.info(
+                        f"[Executor] Skip sync of tracker coin {coin} — manual lev-tracker "
+                        f"sleeve, not copy-managed (won't adopt or auto-close it)"
+                    )
+                    continue
                 direction = "long" if szi > 0 else "short"
                 entry_px  = float(pos.get("entryPx") or 0)
                 size_usd  = abs(szi) * entry_px
@@ -252,7 +258,7 @@ class Executor:
                     f"(strategy {pos.strategy!r})"
                 )
         # 3. Last resort: coin-only (handles guardian/zombie closes where direction may vary)
-        if pos is None and signal.meta.get("reason") in ("zombie", "nuclear"):
+        if pos is None and signal.meta.get("reason") in ("zombie", "nuclear", "stop_loss", "ride_trail"):
             pos = next(
                 (p for p in self.risk.open_positions if p.coin == signal.coin),
                 None,

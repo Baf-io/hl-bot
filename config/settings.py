@@ -96,6 +96,29 @@ SCALEOUT_TP1_MARGIN_RET = 0.10   # ...target +10% return on MARGIN (was 0.15)
 SCALEOUT_MIN_ATR_MULT   = 0.5    # ...noise floor lowered to 0.5 × daily ATR (was 0.8)
 SCALEOUT_RUNNER_TRAIL_ATR = 1.0  # runner exits on a 1.0 × daily-ATR retrace from peak (was 1.5)
 ATR_PERIOD              = 14     # daily candles used for the ATR estimate
+
+# ── "78aa tactic": CUT LOSERS FAST, LET WINNERS RUN (applies to ALL copy pos) ───
+# Modelled on trader 0x78aa… — 39% win rate but 2.36 payoff: tiny stops, big runners.
+# When RIDE_WINNERS_ENABLED, this REPLACES scale-out (no early profit-banking — we do
+# NOT trim winners; we ride them on a wide ATR trail and only cut losers hard & early).
+#   • STOP  — full-exit a position the moment its loss hits STOP_LOSS_MARGIN_PCT of the
+#             margin committed (leverage-aware: price move = pct / leverage). This is the
+#             "cut losers fast" half — far tighter than the old -70% nuclear backstop.
+#   • RIDE  — once a winner has run ≥ RIDE_ACTIVATE_ATR × dailyATR%, trail it; exit only on
+#             a RIDE_GIVEBACK_ATR × dailyATR% retrace from peak. Wide trail = let it run.
+RIDE_WINNERS_ENABLED   = os.getenv("RIDE_WINNERS_ENABLED", "true").lower() == "true"
+STOP_LOSS_MARGIN_PCT   = 0.25   # cut a loser at -25% of its margin (was -70% nuclear only)
+STOP_MIN_ATR_MULT      = 0.6    # …but never tighter than 0.6× daily-ATR (avoid noise whipsaw
+                                #   on high-lev pos: -25%/10x = 2.5% price is < 1 ATR on alts)
+RIDE_ACTIVATE_ATR      = 1.0    # winner must clear +1× daily-ATR before the trail engages
+RIDE_GIVEBACK_ATR      = 1.5    # then exit on a 1.5× daily-ATR retrace from peak (ride it)
+
+# ── Tracker coins: reserved for the manual "lev-guy" tracker, OFF-LIMITS to copy ─
+# The copy engine never syncs, manages, or desires these — they're a separate manual
+# (isolated-margin) sleeve mirroring trader 0x78aa… So a restart won't auto-close the
+# tracker, and the copier won't open an opposing position that nets against it on HL.
+TRACKER_COINS = {c.strip().upper() for c in
+                 os.getenv("TRACKER_COINS", "BTC").split(",") if c.strip()}
 ATR_REFRESH_S           = 3600   # re-fetch a coin's ATR at most this often (it moves slowly)
 COPY_MIN_THEIR_NOTIONAL   = 100         # position-aware tracking handles dedup; $100 = anti-dust
 COPY_MAX_POSITIONS_PER_TRADER = 5       # allow up to 5 (a9b95f has 3, fc667 has 6)

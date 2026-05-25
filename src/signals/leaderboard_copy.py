@@ -315,6 +315,8 @@ class LeaderboardCopier:
             if acct <= 0:
                 continue
             for coin, direction in positions.items():
+                if coin in settings.TRACKER_COINS:
+                    continue   # reserved for the manual lev-tracker sleeve — never copy it
                 notional = self._trader_position_notionals.get((address, coin), 0)
                 if notional <= 0:
                     continue
@@ -419,7 +421,9 @@ class LeaderboardCopier:
             # The traders only buy-and-hold; this banks gains they'd otherwise give back.
             # Preferred path: SCALE-OUT (2 tranches, ATR-normalized, leverage-aware) —
             # see _scale_out. Falls back to the flat TRAIL_* logic when scale-out is off.
-            if settings.SCALEOUT_ENABLED and self.store:
+            if settings.RIDE_WINNERS_ENABLED and self.store:
+                trails += await self._ride_winners(held)
+            elif settings.SCALEOUT_ENABLED and self.store:
                 trails += await self._scale_out(held)
             elif settings.TRAIL_ENABLED and self.store:
                 for coin, p in list(held.items()):
@@ -495,6 +499,66 @@ class LeaderboardCopier:
                 logger.debug(
                     f"[Reconcile] in sync — desired={len(desired)} held={len(held)}"
                 )
+
+    async def _ride_winners(self, held: dict) -> int:
+        """
+        "78aa tactic" — CUT LOSERS FAST, LET WINNERS RUN. Full-position exits only,
+        NO early profit-banking (we never trim a winner). Per held position:
+
+          STOP — exit the instant the loss reaches STOP_LOSS_MARGIN_PCT of margin
+                 (price move = pct / leverage), but never tighter than
+                 STOP_MIN_ATR_MULT × dailyATR% so high-lev positions aren't whipsawed
+                 out by intraday noise. This is the "cut losers fast" half.
+          RIDE — once the favorable excursion has cleared RIDE_ACTIVATE_ATR × dailyATR%,
+                 trail it; exit only on a RIDE_GIVEBACK_ATR × dailyATR% retrace from peak.
+                 Wide trail = let the winner run (mirrors his 2.36 payoff).
+
+        A coin we exit is trail-locked until the trader's net position resets, so
+        reconcile won't instantly re-buy. Skips any coin with no live mid / no ATR.
+        """
+        actions = 0
+        for coin, p in list(held.items()):
+            px = self.store.latest_mid(coin)
+            if not px or not p.entry_price:
+                continue
+            exc = ((px - p.entry_price) / p.entry_price) if p.direction == "long" \
+                  else ((p.entry_price - px) / p.entry_price)
+            if exc > p.peak_price_pct:
+                p.peak_price_pct = exc
+            lev = max(p.leverage, 1.0)
+            atr = await self._atr_pct(coin)
+            if not atr or atr <= 0:
+                continue   # no volatility estimate → don't act blind
+
+            # ── CUT LOSERS FAST ───────────────────────────────────────────────
+            stop_px = max(settings.STOP_LOSS_MARGIN_PCT / lev,
+                          settings.STOP_MIN_ATR_MULT * atr)
+            if exc <= -stop_px:
+                logger.info(
+                    f"[Reconcile] 🛑 STOP {coin} {p.direction} | move {exc:+.1%} "
+                    f"≤ -{stop_px:.1%} (-{settings.STOP_LOSS_MARGIN_PCT:.0%} margin @ {lev:.0f}x, "
+                    f"ATR floor {settings.STOP_MIN_ATR_MULT}×{atr:.1%})"
+                )
+                await self._emit_exit(coin, p.direction, "stop_loss")
+                self._trail_locked[coin] = p.direction
+                del held[coin]
+                actions += 1
+                continue
+
+            # ── LET WINNERS RUN (wide ATR trail, no early bank) ────────────────
+            if p.peak_price_pct >= settings.RIDE_ACTIVATE_ATR * atr:
+                giveback = settings.RIDE_GIVEBACK_ATR * atr
+                if exc <= p.peak_price_pct - giveback:
+                    logger.info(
+                        f"[Reconcile] 🏃 RIDE EXIT {coin} {p.direction} | peak "
+                        f"+{p.peak_price_pct:.1%} -> +{exc:.1%} (giveback {giveback:.1%} "
+                        f"= {settings.RIDE_GIVEBACK_ATR}×ATR {atr:.1%})"
+                    )
+                    await self._emit_exit(coin, p.direction, "ride_trail")
+                    self._trail_locked[coin] = p.direction
+                    del held[coin]
+                    actions += 1
+        return actions
 
     async def _scale_out(self, held: dict) -> int:
         """
