@@ -150,6 +150,16 @@ ADD_MIN_FRAC       = 0.10   # the trader's notional must grow >=10% poll-over-po
 ADD_STEP_MAX       = 0.50   # our add = min(their %-increase, this) of our current size, per step
 TREND_SMA_DAYS     = 5      # daily-SMA window for the trend filter (close vs SMA = up/down)
 
+# ── PROBABLE-TP SCALP exit ("buy when they add → sell at +1% → repeat") ──────────────
+# Backtest: their adds run +1.5% median in 6h; a +1% TP hits 80% of the time. We take that
+# as the profit roof — FULL exit at +COPY_TP_PCT, paired with a TIGHT SL (a +1% TP needs a
+# small SL or the wins can't cover the losses). NO trail-lock on TP/SL → we re-enter on the
+# trader's NEXT add (the "repeat"). Trend-gated entries/adds keep it on the right side.
+# Supersedes the +25% bank / ride-trail for copy positions (those constants now unused).
+COPY_TP_PCT        = 0.01   # sell at +1% favorable price move (≈ the 80%-probable roof)
+COPY_SL_PCT        = 0.015  # cut at -1.5% adverse (tight, paired with the +1% TP)
+COPY_REOPEN_ON_ADD = os.getenv("COPY_REOPEN_ON_ADD", "true").lower() == "true"  # buy-on-add when flat (repeat)
+
 # ── Tracker coins: reserved for the manual "lev-guy" tracker, OFF-LIMITS to copy ─
 # The copy engine never syncs, manages, or desires these — they're a separate manual
 # (isolated-margin) sleeve mirroring trader 0x78aa… So a restart won't auto-close the
@@ -162,7 +172,7 @@ TRACKER_COINS = {c.strip().upper() for c in
 # startup sync, and fresh-detection — same as tracker coins. Clear when the bot should
 # resume managing them. 2026-05-25: HYPE = user's manual discretionary short.
 MANUAL_COINS = {c.strip().upper() for c in
-                os.getenv("MANUAL_COINS", "HYPE").split(",") if c.strip()}
+                os.getenv("MANUAL_COINS", "").split(",") if c.strip()}   # HYPE unblocked 2026-05-25 (user closed manual short)
 # Coins the COPIER skips entirely (tracker sleeve + user-manual). The 78aa tracker still
 # uses TRACKER_COINS for what IT trades; this is only the copier's skip set.
 COPIER_SKIP_COINS = TRACKER_COINS | MANUAL_COINS
@@ -178,6 +188,8 @@ TRACKER_SOURCE_ADDR  = os.getenv("TRACKER_SOURCE_ADDR",
 TRACKER_MARGIN_USD   = float(os.getenv("TRACKER_MARGIN_USD", "200"))   # margin staked per coin (applies to 78aa's NEXT entry; current open BTC pos rides untouched)
 TRACKER_MAX_LEV      = int(os.getenv("TRACKER_MAX_LEV", "40"))          # cap (he runs ~40x)
 TRACKER_POLL_S       = int(os.getenv("TRACKER_POLL_S", "10"))           # direction poll cadence (10s: tight follow on his open/close/flip; 2 API calls/tick = trivial rate-limit load)
+TRACKER_TP_PCT       = 0.01    # sell the isolated BTC sleeve at +1% favorable, then re-sync re-buys (sell-on-1%-repeat)
+TRACKER_REOPEN_COOLDOWN_S = 300  # after a TP, wait this long before re-opening (bounds 40x churn)
 ATR_REFRESH_S           = 3600   # re-fetch a coin's ATR at most this often (it moves slowly)
 COPY_MIN_THEIR_NOTIONAL   = 100         # position-aware tracking handles dedup; $100 = anti-dust
 COPY_MAX_POSITIONS_PER_TRADER = 5       # allow up to 5 (a9b95f has 3, fc667 has 6)

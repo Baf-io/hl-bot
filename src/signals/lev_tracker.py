@@ -24,6 +24,7 @@ We follow his open/close/flip, NOT his size — a bounded, fixed-stake shadow.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import eth_account
 from hyperliquid.exchange import Exchange
@@ -42,6 +43,7 @@ class LevTracker:
         self._meta_sz: dict[str, int] = {}
         self.src = settings.TRACKER_SOURCE_ADDR
         self.coins = settings.TRACKER_COINS
+        self._cooldown: dict[str, float] = {}   # coin -> monotonic ts of last TP (re-open cooldown)
 
     def _connect(self):
         wallet = eth_account.Account.from_key(settings.HL_PRIVATE_KEY)
@@ -111,18 +113,47 @@ class LevTracker:
             except Exception:
                 pass
 
+    @staticmethod
+    def _our_pos(state: dict, coin: str):
+        """(direction, entryPx, szi) of our `coin` position, or None."""
+        for p in state.get("assetPositions", []):
+            pos = p["position"]
+            if pos.get("coin") != coin:
+                continue
+            szi = float(pos.get("szi", 0))
+            if szi == 0:
+                return None
+            return ("long" if szi > 0 else "short"), float(pos.get("entryPx", 0)), szi
+        return None
+
     async def tick(self):
         src = self._info.user_state(self.src)
         mine = self._info.user_state(settings.HL_WALLET_ADDRESS)
+        mids = self._info.all_mids()
+        now = time.monotonic()
         for coin in self.coins:
+            # ── PROBABLE-TP: bank the isolated sleeve at +TRACKER_TP_PCT favorable ──
+            ours = self._our_pos(mine, coin)
+            if ours:
+                d, entry, _ = ours
+                px = float(mids.get(coin, 0)) or entry
+                fav = (px - entry) / entry if d == "long" else (entry - px) / entry
+                if entry > 0 and fav >= settings.TRACKER_TP_PCT:
+                    logger.warning(f"[LevTracker] 🎯 TP {coin} {d} +{fav:.2%} — banking, cooldown {settings.TRACKER_REOPEN_COOLDOWN_S}s")
+                    self._notify(f"🎯 Lev-tracker TP {coin} +{fav:.2%} — banked")
+                    self._close(coin); self._cooldown[coin] = now
+                    continue                      # don't re-open same tick
+
             their_dir, their_lev = self._net(src, coin)
             our_dir, _ = self._net(mine, coin)
             if their_dir == our_dir:
                 continue  # in sync (incl. both flat)
-            logger.info(f"[LevTracker] {coin} drift: source={their_dir} ours={our_dir} → adjusting")
-            if our_dir is not None:          # close stale side first (handles flip + exit)
+            if our_dir is not None:               # close stale side first (handles flip + exit)
                 self._close(coin)
-            if their_dir is not None:        # open / re-open to match the source
+            if their_dir is not None:             # open / re-open to match the source
+                if now - self._cooldown.get(coin, 0) < settings.TRACKER_REOPEN_COOLDOWN_S:
+                    continue                      # post-TP cooldown — wait before re-buying
+                logger.info(f"[LevTracker] {coin} drift: source={their_dir} ours={our_dir} → opening")
                 self._open(coin, their_dir, their_lev)
 
     async def run(self):

@@ -639,38 +639,43 @@ class LeaderboardCopier:
                 if coin not in desired or coin in held:
                     self._pending_entry.pop(coin, None)
 
-            # ── ADD-MIRRORING: scale IN when the source trader ADDS, in a confirmed trend ──
+            # ── BUY-WHEN-THEY-ADD (trend-confirmed): scale IN if held, OPEN if flat (the "repeat") ──
             if settings.ADD_MIRROR_ENABLED:
                 budget = max(self._portfolio_usd - (settings.TRACKER_MARGIN_USD * len(settings.TRACKER_COINS)
                              if settings.TRACKER_ENABLED else 0.0), 0.0)
                 cap_margin = budget * settings.MAX_POSITION_SIZE_PCT
-                for coin, p in list(held.items()):
-                    d = desired.get(coin)
-                    if not d or d["dir"] != p.direction:
-                        continue                                   # trader gone or flipped → not an add
+                for coin, d in desired.items():
                     src = d["source"]
                     cur_n  = self._trader_position_notionals.get((src, coin), 0.0)
                     prev_n = self._prev_trader_notionals.get((src, coin), 0.0)
                     if prev_n <= 0 or cur_n <= 0:
                         continue                                   # no baseline (new trader/coin) → not an add
+                    if (cur_n - prev_n) / prev_n < settings.ADD_MIN_FRAC:
+                        continue                                   # not a meaningful add
                     their_frac = (cur_n - prev_n) / prev_n
-                    if their_frac < settings.ADD_MIN_FRAC:
-                        continue                                   # not a meaningful add (skip scalp noise)
-                    want = 1 if p.direction == "long" else -1
+                    want = 1 if d["dir"] == "long" else -1
                     if self._trend_dir(coin) != want:
-                        logger.info(f"[Reconcile] add {coin} skipped — trend not confirmed (dir {self._trend_dir(coin)} vs {want})")
-                        continue                                   # TREND GATE: only add into a confirmed trend
-                    lev = max(p.leverage, 1.0)
-                    cur_margin = p.size_usd / lev
-                    room = cap_margin - cur_margin
-                    if room <= settings.MIN_POSITION_NOTIONAL / lev:
-                        continue                                   # already at the per-position cap
-                    add_margin = min(cur_margin * min(their_frac, settings.ADD_STEP_MAX), room)
-                    add_usd = add_margin * lev
-                    if add_usd < settings.MIN_POSITION_NOTIONAL:
-                        continue
-                    await self._emit_add(coin, p.direction, add_usd, lev, src, their_frac)
-                    adds += 1
+                        logger.info(f"[Reconcile] {coin} add/buy skipped — trend not confirmed ({self._trend_dir(coin)} vs {want})")
+                        continue                                   # TREND GATE
+                    p = held.get(coin)
+                    if p is None:
+                        # FLAT + trader added + trend-confirmed → OPEN (re-entry / the repeat).
+                        if not settings.COPY_REOPEN_ON_ADD or p is not None or coin in self._trail_locked:
+                            continue
+                        logger.info(f"[Reconcile] 🔁 RE-OPEN {d['dir'].upper()} {coin} on trader add (+{their_frac:.0%}, trend-confirmed)")
+                        await self._emit_entry(coin, d)
+                        entries += 1
+                    elif p.direction == d["dir"]:
+                        # HELD same dir + trader added → SCALE IN, capped at the per-pos margin cap.
+                        lev = max(p.leverage, 1.0)
+                        room = cap_margin - p.size_usd / lev
+                        if room <= settings.MIN_POSITION_NOTIONAL / lev:
+                            continue                               # already at cap
+                        add_usd = min(p.size_usd * min(their_frac, settings.ADD_STEP_MAX), room * lev)
+                        if add_usd < settings.MIN_POSITION_NOTIONAL:
+                            continue
+                        await self._emit_add(coin, p.direction, add_usd, lev, src, their_frac)
+                        adds += 1
 
             # Snapshot trader notionals for next poll's add-detection (AFTER the add pass).
             self._prev_trader_notionals = dict(self._trader_position_notionals)
@@ -710,57 +715,23 @@ class LeaderboardCopier:
                   else ((p.entry_price - px) / p.entry_price)
             if exc > p.peak_price_pct:
                 p.peak_price_pct = exc
-            lev = max(p.leverage, 1.0)
-            atr = await self._atr_pct(coin)   # may be None — only the trail needs it
 
-            # ── STOP (ride-with-the-trader) ──────────────────────────────────────
-            # The roster is active SWING traders we follow in/out — so we RIDE through noise,
-            # not chop on it. Stop = WIDER of (-STOP_LOSS_MARGIN_PCT/lev, SPECIALIST_STOP_ATR×ATR)
-            # so a normal intraday wiggle doesn't knock us out of a hold the trader rides to
-            # profit. The real exits are: the trader closing (trader_closed), the +25% bank, and
-            # the ATR ride-trail. This wide stop is just the catastrophe backstop.
-            stop_px = settings.STOP_LOSS_MARGIN_PCT / lev
-            if atr and atr > 0:
-                stop_px = max(stop_px, settings.SPECIALIST_STOP_ATR * atr)
-            if exc <= -stop_px:
-                logger.info(
-                    f"[Reconcile] 🛑 STOP {coin} {p.direction} | move {exc:+.1%} ≤ -{stop_px:.1%} "
-                    f"(ride backstop max(-{settings.STOP_LOSS_MARGIN_PCT:.0%}/lev, {settings.SPECIALIST_STOP_ATR}×ATR) @ {lev:.0f}x)"
-                )
-                await self._emit_exit(coin, p.direction, "stop_loss")
-                self._trail_locked[coin] = p.direction
+            # ── PROBABLE-TP: full exit at +COPY_TP_PCT (the 80%-hit roof) ──────────
+            # NO trail-lock → we re-enter on the trader's next add (the "repeat").
+            if exc >= settings.COPY_TP_PCT:
+                logger.info(f"[Reconcile] 🎯 TP {coin} {p.direction} | +{exc:.2%} ≥ +{settings.COPY_TP_PCT:.0%} — bank & wait for next add")
+                await self._emit_exit(coin, p.direction, "tp_roof")
                 del held[coin]
                 actions += 1
                 continue
 
-            # ── BANK at +2R (partial; no ATR needed) ──────────────────────────
-            if not p.scaled_out:
-                bank_px = settings.BANK_AT_MARGIN_RET / lev
-                if exc >= bank_px:
-                    logger.info(
-                        f"[Reconcile] 💰 BANK {settings.BANK_FRACTION:.0%} {coin} {p.direction} | "
-                        f"move +{exc:.1%} ≥ +{bank_px:.1%} (+{settings.BANK_AT_MARGIN_RET:.0%} margin "
-                        f"= +2R @ {lev:.0f}x) — ride the rest"
-                    )
-                    await self._emit_exit(coin, p.direction, "bank_2r",
-                                          settings.BANK_FRACTION)
-                    p.scaled_out = True
-                    actions += 1
-                    # fall through: the runner can still trail/stop on later ticks
-
-            # ── RIDE the runner (needs ATR) ───────────────────────────────────
-            if atr and atr > 0 and p.peak_price_pct >= settings.RIDE_ACTIVATE_ATR * atr:
-                giveback = settings.RIDE_GIVEBACK_ATR * atr
-                if exc <= p.peak_price_pct - giveback:
-                    logger.info(
-                        f"[Reconcile] 🏃 RIDE EXIT {coin} {p.direction} | peak "
-                        f"+{p.peak_price_pct:.1%} -> +{exc:.1%} (giveback {giveback:.1%} "
-                        f"= {settings.RIDE_GIVEBACK_ATR}×ATR {atr:.1%})"
-                    )
-                    await self._emit_exit(coin, p.direction, "ride_trail")
-                    self._trail_locked[coin] = p.direction
-                    del held[coin]
-                    actions += 1
+            # ── TIGHT SL: full exit at -COPY_SL_PCT (paired with the +1% TP) ──────
+            if exc <= -settings.COPY_SL_PCT:
+                logger.info(f"[Reconcile] 🛑 SL {coin} {p.direction} | {exc:+.2%} ≤ -{settings.COPY_SL_PCT:.1%} — cut")
+                await self._emit_exit(coin, p.direction, "stop_loss")
+                del held[coin]
+                actions += 1
+                continue
         return actions
 
     async def _scale_out(self, held: dict) -> int:
