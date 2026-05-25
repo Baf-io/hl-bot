@@ -108,11 +108,11 @@ ATR_PERIOD              = 14     # daily candles used for the ATR estimate
 #   • RIDE  — runner trails: once it clears RIDE_ACTIVATE_ATR × dailyATR%, exit on a
 #             RIDE_GIVEBACK_ATR × dailyATR% retrace from peak.
 RIDE_WINNERS_ENABLED   = os.getenv("RIDE_WINNERS_ENABLED", "true").lower() == "true"
-STOP_LOSS_MARGIN_PCT   = 0.20   # HARD: cut a loser at -20% of its margin (deterministic $ cap)
+STOP_LOSS_MARGIN_PCT   = 0.09   # HARD: cut a loser at -9% of its margin (tightened from -20%)
 RIDE_ACTIVATE_ATR      = 1.0    # winner must clear +1× daily-ATR before the trail engages
 RIDE_GIVEBACK_ATR      = 1.0    # then exit on a 1.0× daily-ATR retrace from peak (bank closer)
-BANK_FRACTION          = 0.50   # bank 50% of the position at the +2R target…
-BANK_AT_MARGIN_RET     = 0.40   # …i.e. +40% return on margin (= 2× the -20% stop = +2R)
+BANK_FRACTION          = 0.50   # bank 50% of the position at the target…
+BANK_AT_MARGIN_RET     = 0.25   # …i.e. +25% return on margin (R = 25/9 ≈ 2.78)
 
 # Vol-scaled leverage: tune each coin's copy leverage to its ATR so the -20% margin stop
 # always lands ≥ STOP_NOISE_ATR daily-ATRs away (a real move, not noise). Volatile coins get
