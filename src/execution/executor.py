@@ -164,6 +164,8 @@ class Executor:
         action = signal.meta.get("action", "enter")
         if action == "exit":
             await self._close_position(signal)
+        elif action == "add":
+            await self._add_to_position(signal, size_usd)
         else:
             await self._open_position(signal, size_usd)
 
@@ -229,6 +231,36 @@ class Executor:
                 logger.debug(f"[Executor] Leaderboard copy — no native SL/TP, trusting trader exit")
         else:
             logger.warning(f"[Executor] Order not filled for {coin}: {err}")
+
+    async def _add_to_position(self, signal: TradeSignal, size_usd: float):
+        """Add-mirroring: grow an EXISTING same-direction position (the trader added in a
+        confirmed trend). Market_open more in the same direction at the existing leverage,
+        then update the tracked position's size + weighted-avg entry. Never flips/opens new."""
+        coin, direction = signal.coin, signal.direction
+        pos = next((p for p in self.risk.open_positions
+                    if p.coin == coin and p.direction == direction), None)
+        if not pos:
+            logger.warning(f"[Executor] ADD {coin} {direction} but no matching held position — skip")
+            return
+        mid = await self._get_mid_price(coin)
+        if mid is None:
+            logger.error(f"[Executor] No price for {coin} add — skip")
+            return
+        size_coin = round(size_usd / mid, self._get_sz_decimals(coin))
+        if size_coin <= 0:
+            logger.warning(f"[Executor] {coin} add rounds to 0 at ${size_usd} — skip")
+            return
+        result = await self._place_market(coin, direction == "long", size_coin)
+        filled, fill_px, err = self._parse_fill(result)
+        if not filled:
+            logger.warning(f"[Executor] ADD not filled for {coin}: {err}")
+            return
+        actual_px = fill_px or mid
+        self.risk.add_to_position(pos.id, size_usd, actual_px)
+        logger.success(
+            f"[Executor] ADDED {direction.upper()} +{size_coin} {coin} @ ${actual_px:,.4f} "
+            f"(+${size_usd:,.0f}) pos#{pos.id}"
+        )
 
     async def _close_position(self, signal: TradeSignal):
         # The signal.direction for exit signals = the direction WE ARE CLOSING.

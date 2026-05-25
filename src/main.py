@@ -146,6 +146,7 @@ async def main():
         copier = LeaderboardCopier(store, feed)
         copier.set_signal_queue(signal_queue)
         copier.risk = risk   # reconcile needs to see what we already hold
+        copier.alerter = alerter   # notify on trend-confirmed add-mirror entries
 
         # Load the trader list + specialist routing once at startup, refresh every 5 min.
         scheduler.add_job(copier.refresh_leaderboard, "interval", minutes=5, id="lb_refresh")

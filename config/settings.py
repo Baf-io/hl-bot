@@ -139,6 +139,17 @@ FRESH_ENTRY_ONLY     = os.getenv("FRESH_ENTRY_ONLY", "true").lower() == "true"
 FRESH_ENTRY_MAX_ATR  = 0.5    # max distance from the trader's observed open price to still enter
 FRESH_ENTRY_EXPIRE_S = 600    # a fresh-open opportunity expires after this long if unfilled
 
+# ── ADD-MIRRORING (scale IN when a trader adds to a held position, TREND-confirmed) ──────
+# Analysis of the roster's recent adds/trims: their ADDS have forward edge (esp. in trends —
+# f83858 BTC adds 90%/6h, 69b HYPE adds ~100%); their TRIMS are early/negative-edge (they cut
+# winners). So we mirror ADDS ONLY (scale in), never trims — exits stay ours (bank/ride/close).
+# Trend-gated because the add-edge is regime-dependent: only add when the coin's daily trend
+# aligns with the position (notify + enter). Bounded by the per-position margin cap.
+ADD_MIRROR_ENABLED = os.getenv("ADD_MIRROR_ENABLED", "true").lower() == "true"
+ADD_MIN_FRAC       = 0.10   # the trader's notional must grow >=10% poll-over-poll to trigger
+ADD_STEP_MAX       = 0.50   # our add = min(their %-increase, this) of our current size, per step
+TREND_SMA_DAYS     = 5      # daily-SMA window for the trend filter (close vs SMA = up/down)
+
 # ── Tracker coins: reserved for the manual "lev-guy" tracker, OFF-LIMITS to copy ─
 # The copy engine never syncs, manages, or desires these — they're a separate manual
 # (isolated-margin) sleeve mirroring trader 0x78aa… So a restart won't auto-close the

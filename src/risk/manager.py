@@ -74,6 +74,18 @@ class RiskManager:
         if signal.meta.get("action") == "exit":
             return True, "exit approved", signal.size_usd
 
+        # ── ADD: grow an EXISTING position (add-mirroring). One-per-coin & max-positions
+        # don't apply (not a new position); the copier already caps the add to the margin
+        # cap. Still enforce the net-delta limit so adds can't blow past directional exposure.
+        if signal.meta.get("action") == "add":
+            size = signal.size_usd
+            if size < settings.MIN_POSITION_NOTIONAL:
+                return False, f"add ${size:.0f} below min", 0
+            ok, msg = self._delta_check(signal, size)
+            if not ok:
+                return False, f"add blocked: {msg}", 0
+            return True, "add approved", size
+
         # ── Rule 0: one position per coin ────────────────────────────────────
         existing = next((p for p in self.open_positions if p.coin == signal.coin), None)
         if existing:
@@ -204,6 +216,22 @@ class RiskManager:
                 f"[Risk] ⛔ TRADING HALTED — daily loss {pct:.2%} "
                 f"exceeds -{settings.DAILY_LOSS_HALT_PCT:.0%} limit"
             )
+
+    def add_to_position(self, position_id: int, add_size_usd: float, fill_price: float):
+        """Grow a position (add-mirroring): increase size_usd and recompute the size-weighted
+        average entry (in coin terms) so the stop/bank/ride math stays correct. Same direction."""
+        pos = next((p for p in self.open_positions if p.id == position_id), None)
+        if not pos or add_size_usd <= 0 or fill_price <= 0 or pos.entry_price <= 0:
+            return
+        old_coins = pos.size_usd / pos.entry_price
+        add_coins = add_size_usd / fill_price
+        new_size  = pos.size_usd + add_size_usd
+        pos.entry_price = new_size / (old_coins + add_coins)   # avg px = total notional / total coins
+        pos.size_usd = new_size
+        logger.info(
+            f"[Risk] Added to #{position_id} {pos.coin} {pos.direction} | +${add_size_usd:,.0f} "
+            f"→ size ${pos.size_usd:,.0f} | new avg entry ${pos.entry_price:,.4f}"
+        )
 
     def update_unrealized(self, coin: str, current_price: float):
         for pos in self.open_positions:

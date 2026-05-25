@@ -117,6 +117,15 @@ class LeaderboardCopier:
         self._fresh_opens: dict[str, dict] = {}
         self._seeded: bool = False
 
+        # Add-mirroring: last poll's per-(addr,coin) notional, to detect when a trader ADDS.
+        self._prev_trader_notionals: dict[tuple, float] = {}
+        # Daily-trend cache for the add-mirror trend filter: coin -> (dir ∈ {+1,-1,0}, ts).
+        self._trend_cache: dict[str, tuple[int, float]] = {}
+
+        # High-signal alerter (Telegram + ntfy), injected by main.py. Used to notify on a
+        # trend-confirmed add-mirror entry (the user wants a heads-up when one fires).
+        self.alerter = None
+
         # Daily-ATR cache for scale-out levels: coin -> (atr_pct, monotonic_ts).
         # atr_pct is ATR(ATR_PERIOD) over daily candles divided by last close (a fraction).
         self._atr_cache: dict[str, tuple[float, float]] = {}
@@ -259,6 +268,12 @@ class LeaderboardCopier:
         c = self._atr_cache.get(coin)
         return c[0] if c else None
 
+    def _trend_dir(self, coin: str) -> int:
+        """Daily-trend direction for the add-mirror gate: +1 up, -1 down, 0 unknown/flat.
+        Sync read of the pre-warmed trend cache (close vs SMA(TREND_SMA_DAYS))."""
+        c = self._trend_cache.get(coin)
+        return c[0] if c else 0
+
     def _detect_fresh_opens(self):
         """
         Zero-copy-lag: diff each trader's current positions vs last poll. A coin that newly
@@ -366,6 +381,10 @@ class LeaderboardCopier:
                 return None
             atr_pct = atr / last_close
             self._atr_cache[coin] = (atr_pct, now)
+            # Trend (for add-mirror gate): last close vs SMA over TREND_SMA_DAYS daily closes.
+            sma_n = min(settings.TREND_SMA_DAYS, len(candles))
+            sma = sum(float(c["c"]) for c in candles[-sma_n:]) / sma_n
+            self._trend_cache[coin] = (1 if last_close > sma else (-1 if last_close < sma else 0), now)
             return atr_pct
         except Exception as e:
             logger.debug(f"[Reconcile] ATR fetch failed for {coin}: {e}")
@@ -519,7 +538,7 @@ class LeaderboardCopier:
                 if p.strategy in ("leaderboard", "synced")
             }
 
-            entries = exits = flips = resizes = trails = 0
+            entries = exits = flips = resizes = trails = adds = 0
 
             # ── Profit-taking on copied holds ─────────────────────────────────────
             # The traders only buy-and-hold; this banks gains they'd otherwise give back.
@@ -620,11 +639,47 @@ class LeaderboardCopier:
                 if coin not in desired or coin in held:
                     self._pending_entry.pop(coin, None)
 
-            if entries or exits or flips or resizes or trails:
+            # ── ADD-MIRRORING: scale IN when the source trader ADDS, in a confirmed trend ──
+            if settings.ADD_MIRROR_ENABLED:
+                budget = max(self._portfolio_usd - (settings.TRACKER_MARGIN_USD * len(settings.TRACKER_COINS)
+                             if settings.TRACKER_ENABLED else 0.0), 0.0)
+                cap_margin = budget * settings.MAX_POSITION_SIZE_PCT
+                for coin, p in list(held.items()):
+                    d = desired.get(coin)
+                    if not d or d["dir"] != p.direction:
+                        continue                                   # trader gone or flipped → not an add
+                    src = d["source"]
+                    cur_n  = self._trader_position_notionals.get((src, coin), 0.0)
+                    prev_n = self._prev_trader_notionals.get((src, coin), 0.0)
+                    if prev_n <= 0 or cur_n <= 0:
+                        continue                                   # no baseline (new trader/coin) → not an add
+                    their_frac = (cur_n - prev_n) / prev_n
+                    if their_frac < settings.ADD_MIN_FRAC:
+                        continue                                   # not a meaningful add (skip scalp noise)
+                    want = 1 if p.direction == "long" else -1
+                    if self._trend_dir(coin) != want:
+                        logger.info(f"[Reconcile] add {coin} skipped — trend not confirmed (dir {self._trend_dir(coin)} vs {want})")
+                        continue                                   # TREND GATE: only add into a confirmed trend
+                    lev = max(p.leverage, 1.0)
+                    cur_margin = p.size_usd / lev
+                    room = cap_margin - cur_margin
+                    if room <= settings.MIN_POSITION_NOTIONAL / lev:
+                        continue                                   # already at the per-position cap
+                    add_margin = min(cur_margin * min(their_frac, settings.ADD_STEP_MAX), room)
+                    add_usd = add_margin * lev
+                    if add_usd < settings.MIN_POSITION_NOTIONAL:
+                        continue
+                    await self._emit_add(coin, p.direction, add_usd, lev, src, their_frac)
+                    adds += 1
+
+            # Snapshot trader notionals for next poll's add-detection (AFTER the add pass).
+            self._prev_trader_notionals = dict(self._trader_position_notionals)
+
+            if entries or exits or flips or resizes or trails or adds:
                 logger.info(
                     f"[Reconcile] desired={len(desired)} held={len(held)} | "
                     f"+{entries} entries, {exits} exits, {flips} flips, "
-                    f"{resizes} resizes, {trails} trails"
+                    f"{resizes} resizes, {trails} trails, {adds} adds"
                 )
             else:
                 logger.debug(
@@ -786,6 +841,28 @@ class LeaderboardCopier:
                 "their_size_usd": d["their_notional"],
                 "action":         "enter",
             },
+        ))
+
+    async def _emit_add(self, coin: str, direction: str, add_usd: float, lev: float,
+                        source: str, their_frac: float):
+        """Emit an ADD signal (grow an existing same-direction position) + notify the user —
+        fired only on a trend-confirmed trader add (add-mirroring)."""
+        logger.info(
+            f"[Reconcile] ➕ ADD {direction.upper()} {coin} +${add_usd:,.0f} (trend-confirmed; "
+            f"trader +{their_frac:.0%}) lev={lev:.0f}x | src={source[:10]}..."
+        )
+        if self.alerter:
+            try:
+                await self.alerter.send(
+                    f"➕ *Add-mirror* {direction.upper()} {coin} +${add_usd:,.0f} — "
+                    f"{source[:6]} added +{their_frac:.0%} in a confirmed trend"
+                )
+            except Exception:
+                pass
+        await self._signal_queue.put(TradeSignal(
+            strategy="leaderboard", coin=coin, direction=direction, size_usd=add_usd,
+            confidence=1.0,
+            meta={"source": source, "leverage": lev, "action": "add", "reason": "add_mirror_trend"},
         ))
 
     async def _emit_exit(self, coin: str, held_direction: str, reason: str,
