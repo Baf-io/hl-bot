@@ -119,6 +119,18 @@ RIDE_GIVEBACK_ATR      = 1.5    # then exit on a 1.5× daily-ATR retrace from pe
 # tracker, and the copier won't open an opposing position that nets against it on HL.
 TRACKER_COINS = {c.strip().upper() for c in
                  os.getenv("TRACKER_COINS", "BTC").split(",") if c.strip()}
+
+# ── Lev-tracker sleeve: mirror ONE trader's DIRECTION on TRACKER_COINS, ISOLATED ─
+# Walled off from the copy engine. Holds a fixed TRACKER_MARGIN_USD of ISOLATED
+# margin per tracker coin in the SAME direction as the source trader; follows his
+# open/close/flip (not his size). Isolated → max loss per coin = the margin staked.
+TRACKER_ENABLED      = os.getenv("TRACKER_ENABLED", "true").lower() == "true"
+TRACKER_DRY_RUN      = os.getenv("TRACKER_DRY_RUN", "false").lower() == "true"  # log only
+TRACKER_SOURCE_ADDR  = os.getenv("TRACKER_SOURCE_ADDR",
+                                 "0x78aa6328eae8028a089c35d2819f79c78de2a7e5")  # the 40x guy
+TRACKER_MARGIN_USD   = float(os.getenv("TRACKER_MARGIN_USD", "100"))   # margin staked per coin
+TRACKER_MAX_LEV      = int(os.getenv("TRACKER_MAX_LEV", "40"))          # cap (he runs ~40x)
+TRACKER_POLL_S       = int(os.getenv("TRACKER_POLL_S", "60"))           # direction poll cadence
 ATR_REFRESH_S           = 3600   # re-fetch a coin's ATR at most this often (it moves slowly)
 COPY_MIN_THEIR_NOTIONAL   = 100         # position-aware tracking handles dedup; $100 = anti-dust
 COPY_MAX_POSITIONS_PER_TRADER = 5       # allow up to 5 (a9b95f has 3, fc667 has 6)

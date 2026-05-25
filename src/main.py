@@ -42,6 +42,8 @@ if settings.STRATEGY_STAT_ARB:
     from signals.stat_arb import StatArbScanner
 if settings.STRATEGY_MOMENTUM:
     from signals.momentum_ignition import MomentumIgnition
+if settings.TRACKER_ENABLED:
+    from signals.lev_tracker import LevTracker
 
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
@@ -305,13 +307,13 @@ async def main():
             sig = await signal_queue.get()
             await executor.enqueue(sig)
 
+    # Walled-off lev-tracker sleeve (mirrors one trader on TRACKER_COINS, isolated).
+    tasks = [feed.run(), executor.run(), position_guardian(), relay_signals()]
+    if settings.TRACKER_ENABLED:
+        tasks.append(LevTracker(alerter=alerter).run())
+
     await alerter.send("🤖 *HL-Bot started*")
-    await asyncio.gather(
-        feed.run(),
-        executor.run(),
-        position_guardian(),
-        relay_signals(),
-    )
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
