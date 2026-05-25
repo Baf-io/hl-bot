@@ -8,9 +8,9 @@
 ---
 
 ## What this bot does
-Hyperliquid perp trading bot. Copies 5 whitelisted leaderboard traders
-proportionally (margin-based sizing), plus cascade + funding carry strategies.
-Runs 24/7 on a Linux VPS as `hl-bot.service`.
+Hyperliquid perp trading bot. Copies 2 elite single-coin specialists (a9b95f→HYPE,
+feec88→SOL) equal-weight + fresh-entry-only, plus a walled-off isolated BTC tracker
+(78aa). Runs 24/7 on a Linux VPS as `hl-bot.service`.
 
 ---
 
@@ -22,7 +22,7 @@ Runs 24/7 on a Linux VPS as `hl-bot.service`.
 | `src/execution/executor.py` | Order placement, startup position sync |
 | `src/risk/manager.py` | Risk gating (one-per-coin, margin/notional caps) |
 | `config/settings.py` | All tunable constants |
-| `config/traders.json` | The 5 whitelisted trader addresses + labels |
+| `config/traders.json` | The whitelisted specialists + `specialty` pins (currently a9b95f→HYPE, feec88→SOL) |
 
 ---
 
