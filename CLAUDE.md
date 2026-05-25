@@ -80,10 +80,6 @@ our_notional    = our_margin × their_lev
 - `c99e55a` Guardian force-close was dead (offsetting dir + full-string reason never matched). Now held dir + bare reason. Close via reduce-only `market_close` + `_parse_fill`. Nuclear now margin-based (70%).
 - `ce54c96` Add margin floor `COPY_MIN_MARGIN_PCT` + fix orphaned dust if market_close fails
 - `2665b56` Skip dust coins entirely (return 0.0 from _compute_size) instead of flooring
-- `7c8a8f1` MIN_POSITION_NOTIONAL=50 backstop in risk manager + executor dust cleanup
-- `b5a08ef` asyncio.Event for backfill sync (killed sleep race); dust close on startup
-- `5ed2e66` 5-trader whitelist; traders.json path fix; full addresses (lookup script used)
-- `b7ae1db` Margin-based sizing (was notional-based — wrong at high leverage)
 
 ---
 
