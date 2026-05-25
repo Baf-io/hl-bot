@@ -336,9 +336,15 @@ class LeaderboardCopier:
             acct = self._trader_acct_values.get(address, 0)
             if acct <= 0:
                 continue
+            # Specialists are PINNED to their one coin: if a trader has a `specialty`, we only
+            # copy that coin from them (their other positions are deliberately ignored). This
+            # is how a9b95f→HYPE-only and feec88→SOL-only is enforced.
+            spec = self._tracked[address].specialty
             for coin, direction in positions.items():
                 if coin in settings.TRACKER_COINS:
                     continue   # reserved for the manual lev-tracker sleeve — never copy it
+                if spec and coin.upper() != spec.upper():
+                    continue   # specialist: only their designated coin counts
                 notional = self._trader_position_notionals.get((address, coin), 0)
                 if notional <= 0:
                     continue
@@ -573,12 +579,19 @@ class LeaderboardCopier:
             lev = max(p.leverage, 1.0)
             atr = await self._atr_pct(coin)   # may be None — only the trail needs it
 
-            # ── HARD STOP (deterministic, no ATR dependency) ──────────────────
+            # ── STOP ───────────────────────────────────────────────────────────
+            # Default: HARD -STOP_LOSS_MARGIN_PCT of margin (tight, deterministic).
+            # Specialist conviction coins (a trader's `specialty`) ride WITH the trader —
+            # widen to the larger of (-9% margin, SPECIALIST_STOP_ATR×ATR) so we don't get
+            # noise-chopped out of an elite hold (e.g. feec88 SOL). bank + follow-exit control it.
             stop_px = settings.STOP_LOSS_MARGIN_PCT / lev
+            is_spec = coin.upper() in self._specialist
+            if is_spec and atr and atr > 0:
+                stop_px = max(stop_px, settings.SPECIALIST_STOP_ATR * atr)
             if exc <= -stop_px:
                 logger.info(
                     f"[Reconcile] 🛑 STOP {coin} {p.direction} | move {exc:+.1%} "
-                    f"≤ -{stop_px:.1%} (hard -{settings.STOP_LOSS_MARGIN_PCT:.0%} margin @ {lev:.0f}x)"
+                    f"≤ -{stop_px:.1%} ({'SPECIALIST ' + str(settings.SPECIALIST_STOP_ATR) + '×ATR' if is_spec else 'hard -' + format(settings.STOP_LOSS_MARGIN_PCT, '.0%') + ' margin'} @ {lev:.0f}x)"
                 )
                 await self._emit_exit(coin, p.direction, "stop_loss")
                 self._trail_locked[coin] = p.direction

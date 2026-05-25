@@ -1,33 +1,9 @@
 [
   {
-    "address": "0xfc667adba8d4837586078f4fdcdc29804337ca06",
-    "label":        "fc667",
-    "note":         "macro bear, $21M account — HYPE LONG + BTC/ETH/SOL/XRP SHORTs + PAXG LONG",
-    "specialty":    null,
-    "alltime_pnl":  900000,
-    "win_rate":     0.62,
-    "max_drawdown": 0.16,
-    "avg_leverage": 6,
-    "trade_count":  2000,
-    "account_age_days": 100
-  },
-  {
-    "address": "0x4f7634c03ec4e87e14725c84913ade523c6fad5a",
-    "label":        "4f7634 (ZEC)",
-    "note":         "ZEC specialist — $40.8M all-time PnL on a $307K acct, conservative 10x, ZEC+TON shorts. Upgrade over 42b6d9.",
-    "specialty":    "ZEC",
-    "alltime_pnl":  40800000,
-    "win_rate":     0.65,
-    "max_drawdown": 0.15,
-    "avg_leverage": 10,
-    "trade_count":  500,
-    "account_age_days": 120
-  },
-  {
     "address": "0xa9b95f2a2e7ef219021efc5c04c32761b8553bbd",
-    "label":        "a9b95f",
-    "note":         "macro, $6M account — BTC/ETH SHORT + HYPE LONG (mostly deduped vs fc667)",
-    "specialty":    null,
+    "label":        "a9b95f (HYPE)",
+    "note":         "HYPE specialist — PINNED to HYPE only (his 59%-conviction core, +$11.5M from $39.63). ETH/BTC deliberately ignored. Kept 2026-05-25 as the HYPE engine.",
+    "specialty":    "HYPE",
     "alltime_pnl":  2000000,
     "win_rate":     0.65,
     "max_drawdown": 0.15,
@@ -38,7 +14,7 @@
   {
     "address": "0xfeec88b13fc0be31695069f02bac18538a154e9c",
     "label":        "feec88 (SOL)",
-    "note":         "SOL specialist — $10.5M all-time PnL on a $697K acct, conservative 10x cap, concentrated SOL short. Upgrade over 6bea81.",
+    "note":         "SOL specialist — 100%+ conviction SOL short, +$411k, actively ADDING. Elite, kept as a ride-with-the-trader specialist.",
     "specialty":    "SOL",
     "alltime_pnl":  10500000,
     "win_rate":     0.62,

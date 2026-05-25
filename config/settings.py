@@ -113,6 +113,11 @@ RIDE_ACTIVATE_ATR      = 1.0    # winner must clear +1× daily-ATR before the tr
 RIDE_GIVEBACK_ATR      = 1.0    # then exit on a 1.0× daily-ATR retrace from peak (bank closer)
 BANK_FRACTION          = 0.50   # bank 50% of the position at the target…
 BANK_AT_MARGIN_RET     = 0.25   # …i.e. +25% return on margin (R = 25/9 ≈ 2.78)
+# Specialist conviction coins (a trader's `specialty` coin) ride WITH the trader — give them
+# room instead of the tight -9% noise-chop. Their stop = WIDER of (-9% margin, this×ATR), so
+# we don't get whipsawed out of an elite trader's high-conviction multi-day hold (e.g. feec88
+# +$411k SOL). The bank (+25%) + following the trader's exit are the primary controls here.
+SPECIALIST_STOP_ATR    = 1.0    # specialist coins stop no tighter than 1.0× daily-ATR
 
 # Vol-scaled leverage: tune each coin's copy leverage to its ATR so the -20% margin stop
 # always lands ≥ STOP_NOISE_ATR daily-ATRs away (a real move, not noise). Volatile coins get
