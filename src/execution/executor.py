@@ -228,7 +228,8 @@ class Executor:
             # ── CONTRACT (B1): EVERY order MUST carry a native exchange stop. Place it
             # immediately after the fill; if it can't be confirmed, REJECT = close the
             # position right away (never hold an unstopped position).
-            stop_ok = await self._place_protective_stop(coin, is_buy, size_coin, actual_px)
+            stop_ok = await self._place_protective_stop(coin, is_buy, size_coin, actual_px,
+                                                        stop_px=signal.meta.get("stop_px"))
             if not stop_ok:
                 logger.error(
                     f"[Executor] ⛔ NO STOP confirmed for {coin} pos#{position_id} — "
@@ -303,7 +304,7 @@ class Executor:
                     f"(strategy {pos.strategy!r})"
                 )
         # 3. Last resort: coin-only (handles guardian/zombie closes where direction may vary)
-        if pos is None and signal.meta.get("reason") in ("zombie", "nuclear", "stop_loss", "ride_trail"):
+        if pos is None and signal.meta.get("reason") in ("zombie", "nuclear", "stop_loss", "ride_trail", "ttl"):
             pos = next(
                 (p for p in self.risk.open_positions if p.coin == signal.coin),
                 None,
@@ -466,17 +467,24 @@ class Executor:
         return round(px, d)
 
     async def _place_protective_stop(self, coin: str, entry_is_buy: bool, size: float,
-                                     entry_px: float) -> bool:
-        """CONTRACT (B1): place a native, reduce-only exchange STOP at COPY_SL_PCT from entry.
-        Returns True only if the exchange confirms it (verified inner status). Caller closes
-        the position if this returns False — no unstopped position is allowed to ride."""
+                                     entry_px: float, stop_px: float | None = None) -> bool:
+        """CONTRACT (B1): place a native, reduce-only exchange STOP. Uses the EXPLICIT stop
+        price when provided (brain signals carry their own stop), else COPY_SL_PCT from entry.
+        Returns True only if the exchange confirms it; caller closes the position on False —
+        no unstopped position is allowed to ride."""
         if not self._exchange:
             return False
-        sl = settings.COPY_SL_PCT
-        if entry_is_buy:                                   # long → stop SELL below entry
-            sl_px = self._round_px(entry_px * (1 - sl)); close_is_buy = False
-        else:                                              # short → stop BUY above entry
-            sl_px = self._round_px(entry_px * (1 + sl)); close_is_buy = True
+        close_is_buy = not entry_is_buy                    # long→SELL stop, short→BUY stop
+        if stop_px and float(stop_px) > 0:
+            sl_px = self._round_px(float(stop_px))         # brain's explicit stop
+            # sanity: must be on the protective side of entry
+            if entry_is_buy and not sl_px < entry_px:
+                logger.error(f"[Executor] stop {sl_px} not below long entry {entry_px} — reject"); return False
+            if not entry_is_buy and not sl_px > entry_px:
+                logger.error(f"[Executor] stop {sl_px} not above short entry {entry_px} — reject"); return False
+        else:
+            sl = settings.COPY_SL_PCT
+            sl_px = self._round_px(entry_px * (1 - sl)) if entry_is_buy else self._round_px(entry_px * (1 + sl))
         try:
             r = self._exchange.order(
                 coin, close_is_buy, size, sl_px,

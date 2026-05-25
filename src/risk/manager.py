@@ -38,6 +38,7 @@ class OpenPosition:
     unrealized_pnl: float = 0.0
     peak_price_pct: float = 0.0  # max favorable price excursion seen — for trailing-profit exit
     scaled_out: bool = False     # True once the first profit tranche has been banked (TP1)
+    hold_seconds: int = 0        # brain TTL: close this many seconds after open (0 = no TTL)
 
 
 class RiskManager:
@@ -157,6 +158,7 @@ class RiskManager:
             entry_price=price,
             strategy=signal.strategy,
             leverage=max(float(signal.meta.get("leverage", 1)), 1.0),
+            hold_seconds=int(signal.meta.get("hold_seconds", 0) or 0),
         )
         self.open_positions.append(pos)
         logger.info(f"[Risk] Position registered #{pos.id} {pos.coin} {pos.direction}")

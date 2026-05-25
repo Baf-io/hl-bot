@@ -268,7 +268,10 @@ async def main():
 
                 exit_kind = None
                 detail    = None
-                if age_h >= ZOMBIE_HOURS:
+                age_s = (now - pos.opened_at).total_seconds()
+                if pos.hold_seconds and age_s >= pos.hold_seconds:
+                    exit_kind, detail = "ttl", f"TTL {pos.hold_seconds}s elapsed (age {age_s/3600:.1f}h)"
+                elif age_h >= ZOMBIE_HOURS:
                     exit_kind, detail = "zombie", f"zombie {age_h:.1f}h — missed close signal?"
                 elif pnl_pct < -NUCLEAR_MARGIN_LOSS:
                     exit_kind, detail = "nuclear", f"nuclear loss {pnl_pct:.1%} of margin — SL failed"
