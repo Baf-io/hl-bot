@@ -28,7 +28,7 @@ Runs 24/7 on a Linux VPS as `hl-bot.service`.
 
 ## Current state (update after each deploy)
 - **Portfolio:** $1120 USDC (PORTFOLIO_USD=1120 in VPS .env)
-- **Active traders:** fc667, a9b95f (generalists); 42b6d9→ZEC, 6bea81→SOL, a4dedd→LIT (specialists via `specialty` in traders.json)
+- **Active traders:** fc667, a9b95f (generalists); 4f7634→ZEC, feec88→SOL (specialists via `specialty` in traders.json). a4dedd/LIT DROPPED 2026-05-25 (down ~20%/mo, 99% off-mandate in HYPE) — LIT no longer covered.
 - **COPY_TRADER_WHITELIST:** must be empty in .env — traders.json is the source
 - **Copy model:** STATE-BASED. `reconcile()` (every `COPY_RECONCILE_INTERVAL_S=45s`) rebuilds each trader's net `clearinghouseState`, prunes phantom held positions vs OUR live HL state (`drop_phantoms`), builds a desired portfolio (specialist routing, skip contested coins, highest-conviction holder), diffs vs held, mirrors net changes incl. RESIZE of under-sized holdings. NOT fill-driven.
 - **Sizing:** margin-based proportional; `COPY_MIN_MARGIN_PCT=0.03` (~$34 floor, no dust); `MIN_POSITION_NOTIONAL=50`; `COPY_MAX_COPY_LEVERAGE=10`

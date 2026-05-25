@@ -46,17 +46,5 @@
     "avg_leverage": 10,
     "trade_count":  1024,
     "account_age_days": 90
-  },
-  {
-    "address": "0xa4dedda59f2908b92ae192cfd494839373bcb3c4",
-    "label":        "a4dedd (LIT)",
-    "note":         "LIT specialist — 100% LIT concentration, LONG bias, $680K acct. Also holds HYPE (deduped vs fc667).",
-    "specialty":    "LIT",
-    "alltime_pnl":  190000,
-    "win_rate":     0.60,
-    "max_drawdown": 0.25,
-    "avg_leverage": 4,
-    "trade_count":  707,
-    "account_age_days": 30
   }
 ]
