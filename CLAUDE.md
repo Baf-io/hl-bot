@@ -70,7 +70,7 @@ our_notional    = our_margin × their_lev
 ---
 
 ## Fix log (newest first, keep last 10)
-- `PENDING2` Stage 2 zero-copy-lag (`FRESH_ENTRY_ONLY`): only open on a trader's fresh flat→pos/flip within 0.5×ATR of their open; never adopt stale holds (the copy-lag leak — BTC entered 3.5% late=+27%, HYPE 56% late=+17%, SOL 10% late=−3%). `_detect_fresh_opens`/`_is_fresh_entry`, baseline-seeds on boot. Dry-run: 5/5 logic tests pass; deployed, baseline seeded, book grandfathered.
+- `d1019ca` Stage 2 zero-copy-lag (`FRESH_ENTRY_ONLY`): only open on a trader's fresh flat→pos/flip within 0.5×ATR of their open; never adopt stale holds (the copy-lag leak — BTC entered 3.5% late=+27%, HYPE 56% late=+17%, SOL 10% late=−3%). `_detect_fresh_opens`/`_is_fresh_entry`, baseline-seeds on boot. Dry-run: 5/5 logic tests pass; deployed, baseline seeded, book grandfathered.
 - `7a52603` Roster cut to elite-only: a9b95f PINNED→HYPE + feec88 PINNED→SOL (single-coin specialists) + 78aa→BTC tracker; deleted fc667 (gated out) + 4f7634 (closed TON/ZEC). Specialist conviction coins ride wider stop max(−9%/lev, 1.0×ATR).
 - `3a69f36` Tighten risk: stop −9% margin, bank +25% (R≈2.78). First live stop fired clean (ETH −$15.61).
 - `0ccc6d5` Entry/exit overhaul (see `docs/ENTRY_EXIT_PLAN.md`): (1) HARD stop −20% margin, dropped the broken `max()` ATR floor (was −47/−62%, fired 0×); (2) BANK 50% at +2R then ride; (3) vol-scaled leverage so the stop lands ≥0.5 ATR (HYPE→5x etc.); (4) RESIZE close-and-reopen DISABLED (locked −$79 of churn); (5) entry debounce 2 ticks + conviction gate 0.03→0.05. Tracker → $200/coin, 10s poll. Deployed + read-only reconcile dry-run = in-sync, no errors.
