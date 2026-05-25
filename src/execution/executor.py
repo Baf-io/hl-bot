@@ -193,7 +193,7 @@ class Executor:
         # For copy trades: set leverage to match the trader's leverage (capped by COPY_MAX_COPY_LEVERAGE).
         # Signal meta["leverage"] is already capped at settings.COPY_MAX_COPY_LEVERAGE (10x).
         # Cross margin — shares collateral across all positions.
-        if is_copy:
+        if is_copy or signal.strategy == "brain":
             copy_lev = int(min(
                 max(float(signal.meta.get("leverage", 5)), 1),
                 settings.COPY_MAX_COPY_LEVERAGE,
@@ -241,8 +241,9 @@ class Executor:
                     try: await self.alerter.send(f"⛔ {coin} opened but stop FAILED → force-closed (contract: no unstopped position)")
                     except Exception: pass
                 return
-            if not is_copy:
-                await self._place_native_sltp(coin, is_buy, size_coin, actual_px)
+            # The B1 protective stop above is the ONLY stop. The legacy _place_native_sltp
+            # (6%/12% SL/TP) is superseded — it must NOT run (it added an unwanted TP to the
+            # brain probe; contract exit = stop OR TTL, no TP).
         else:
             logger.warning(f"[Executor] Order not filled for {coin}: {err}")
 
