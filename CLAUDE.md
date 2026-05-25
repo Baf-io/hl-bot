@@ -8,9 +8,10 @@
 ---
 
 ## What this bot does
-Hyperliquid perp trading bot. Copies 2 elite single-coin specialists (a9b95f→HYPE,
-feec88→SOL) equal-weight + fresh-entry-only, plus a walled-off isolated BTC tracker
-(78aa). Runs 24/7 on a Linux VPS as `hl-bot.service`.
+Hyperliquid perp trading bot. FULL ACTIVE-SWING profile: copies 3 weighted, two-sided
+GENERALIST swing traders (fresh-entry-only, ride-with-trader), plus a walled-off isolated
+BTC tracker (78aa). User can hand-manage coins via MANUAL_COINS. Runs 24/7 on a Linux VPS
+as `hl-bot.service`.
 
 ---
 
@@ -22,7 +23,7 @@ feec88→SOL) equal-weight + fresh-entry-only, plus a walled-off isolated BTC tr
 | `src/execution/executor.py` | Order placement, startup position sync |
 | `src/risk/manager.py` | Risk gating (one-per-coin, margin/notional caps) |
 | `config/settings.py` | All tunable constants |
-| `config/traders.json` | The whitelisted specialists + `specialty` pins (currently a9b95f→HYPE, feec88→SOL) |
+| `config/traders.json` | Whitelisted traders + per-trader `weight` (+ optional `specialty` pin). Re-read live every 5min |
 
 ---
 
@@ -51,22 +52,22 @@ feec88→SOL) equal-weight + fresh-entry-only, plus a walled-off isolated BTC tr
 
 ---
 
-## Sizing formula
+## Sizing formula (weighted fixed-per-position — see "Sizing" above)
 ```
-their_lev       = min(notional / marginUsed, COPY_MAX_COPY_LEVERAGE)  [cached per coin]
-their_margin    = their_notional / their_lev
-their_margin_pct = their_margin / their_acct_val
-our_margin      = PORTFOLIO_USD × their_margin_pct
-our_notional    = our_margin × their_lev
+budget    = equity − (TRACKER_MARGIN_USD × |TRACKER_COINS|)      # copy budget, tracker reserved
+per_margin = min(budget × COPY_POSITION_PCT × trader.weight, budget × MAX_POSITION_SIZE_PCT)
+our_lev   = min(their_lev, COPY_MAX_COPY_LEVERAGE, STOP_LOSS_MARGIN_PCT/(STOP_NOISE_ATR×ATR))
+our_notional = per_margin × our_lev
 → skip if our_notional < MIN_POSITION_NOTIONAL ($50)
-→ skip if our_margin   < PORTFOLIO_USD × COPY_MIN_MARGIN_PCT (~$34)
+→ book bounded by MAX_OPEN_POSITIONS + risk caps (graceful, no margin wall)
 ```
 
 ---
 
 ## Open issues
-- Conviction weighting is mostly flattened by the risk manager's 15% margin cap (big holds all clamp to ~$168 margin). Fine for risk; revisit if we want to over-weight top-conviction coins.
-- "Faster in-and-out" framework requested (2026-05-24): user wants higher-margin, more active trades. These 5 traders are slow macro holders, so faster trading needs a different alpha sleeve (momentum/cascade) — see `docs/FRAMEWORK_PLAN.md` (pending). NOT yet implemented; copy core is the proven base.
+- Active-swing pivot (2026-05-25) is freshly deployed — UNPROVEN live: the bank (+25%), the ride-trail, and fresh-entries on the new generalists haven't fired yet. Watch the first of each.
+- Generalist deep-vet caveats: 41829013 is a multi-wallet fund op (opaque, hence wt 0.6); 69b05701 is HYPE-beta concentrated (wt 0.4). Re-vet if performance diverges from the perp-durable thesis.
+- `docs/POSITION_THESIS.md` is now stale (pre-pivot roster) — re-pull before trusting per-position detail.
 
 ---
 
