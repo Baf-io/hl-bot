@@ -140,15 +140,31 @@ class IntakeServer:
     async def _execute(self, p: dict) -> str | None:
         """Enqueue an entry to the executor carrying the brain's stop + TTL. The executor
         (B1) places the entry + native stop; the TTL exit (hold_seconds) is owned here/guardian."""
+        entry = float(p["entry"]); stop = float(p["stop"])
+        size_usd = float(p["size_notional"])
+        # B2 — LIVE sizing is OURS, never the brain's number: derive notional so a stop-out
+        # loses exactly RISK_PER_TRADE_PCT of equity (never feel-sized). Probe keeps its
+        # ≤$50 cap untouched. Cap derived notional at the MAX_LEVERAGE implied-lev wall.
+        if p["mode"] == "live":
+            eq = self.risk.portfolio_value
+            stop_frac = abs(entry - stop) / entry
+            derived = (settings.RISK_PER_TRADE_PCT * eq) / stop_frac if stop_frac > 0 else 0.0
+            derived = min(derived, settings.MAX_LEVERAGE * eq)
+            logger.info(
+                f"[Intake] B2 live-size {p['coin']}: stop {stop_frac*100:.2f}% → "
+                f"${derived:.0f} notional (1%-risk=${settings.RISK_PER_TRADE_PCT*eq:.0f}); "
+                f"brain asked ${size_usd:.0f}"
+            )
+            size_usd = derived
         sig = TradeSignal(
             strategy="brain", coin=p["coin"], direction=p["direction"],
-            size_usd=float(p["size_notional"]), confidence=1.0,
+            size_usd=size_usd, confidence=1.0,
             meta={"action": "enter", "leverage": min(settings.MAX_LEVERAGE, 3),
                   "source": p["source"], "stop_px": float(p["stop"]),
                   "hold_seconds": int(p["hold_seconds"]), "signal_id": p["signal_id"]},
         )
         await self.executor.enqueue(sig)
-        logger.success(f"[Intake] ▶ ENQUEUED {p['direction']} {p['coin']} ${p['size_notional']:.0f} (src {p['source']})")
+        logger.success(f"[Intake] ▶ ENQUEUED {p['direction']} {p['coin']} ${size_usd:.0f} (src {p['source']}, {p['mode']})")
         return p["signal_id"]
 
     async def run(self):
