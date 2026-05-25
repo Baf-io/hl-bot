@@ -3,6 +3,7 @@ Execution layer — takes approved signals from RiskManager and places orders.
 Uses hyperliquid-python-sdk. Handles retries, maker/taker routing, position tracking.
 """
 import asyncio
+import time
 from loguru import logger
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
@@ -18,6 +19,8 @@ class Executor:
         self._info: Info | None = None
         self._signal_queue: asyncio.Queue = asyncio.Queue()
         self.squeeze_guard = None   # injected by main.py after init
+        self._last_stop = None      # {coin,oid,px} from the most recent confirmed stop
+        self._signal_status: dict = {}   # signal_id → fill+stop verification (brain polls GET /status)
 
     def init_client(self):
         """
@@ -230,6 +233,7 @@ class Executor:
             # position right away (never hold an unstopped position).
             stop_ok = await self._place_protective_stop(coin, is_buy, size_coin, actual_px,
                                                         stop_px=signal.meta.get("stop_px"))
+            sid = signal.meta.get("signal_id")
             if not stop_ok:
                 logger.error(
                     f"[Executor] ⛔ NO STOP confirmed for {coin} pos#{position_id} — "
@@ -237,10 +241,24 @@ class Executor:
                 )
                 await self._place_market_close(coin)
                 self.risk.close_position(position_id, actual_px)
+                if sid:
+                    self._signal_status[sid] = {
+                        "signal_id": sid, "coin": coin, "filled": True, "fill_px": actual_px,
+                        "size": size_coin, "stop_resting": False, "stop_oid": None, "stop_px": None,
+                        "outcome": "FAIL-SAFE CLOSED (stop unconfirmed)", "ts": time.time(),
+                    }
                 if getattr(self, "alerter", None):
                     try: await self.alerter.send(f"⛔ {coin} opened but stop FAILED → force-closed (contract: no unstopped position)")
                     except Exception: pass
                 return
+            if sid:
+                ls = self._last_stop or {}
+                self._signal_status[sid] = {
+                    "signal_id": sid, "coin": coin, "filled": True, "fill_px": actual_px,
+                    "size": size_coin, "stop_resting": True,
+                    "stop_oid": ls.get("oid"), "stop_px": ls.get("px"),
+                    "outcome": "OPEN (stop confirmed on book)", "ts": time.time(),
+                }
             # The B1 protective stop above is the ONLY stop. The legacy _place_native_sltp
             # (6%/12% SL/TP) is superseded — it must NOT run (it added an unwanted TP to the
             # brain probe; contract exit = stop OR TTL, no TP).
@@ -486,21 +504,43 @@ class Executor:
         else:
             sl = settings.COPY_SL_PCT
             sl_px = self._round_px(entry_px * (1 - sl)) if entry_is_buy else self._round_px(entry_px * (1 + sl))
+        self._last_stop = None
         try:
             r = self._exchange.order(
                 coin, close_is_buy, size, sl_px,
                 {"trigger": {"triggerPx": sl_px, "isMarket": True, "tpsl": "sl"}},
                 reduce_only=True,
             )
-            if r and r.get("status") == "ok":
-                st = r["response"]["data"]["statuses"][0]
-                if "error" not in st:
-                    dist = abs(sl_px - entry_px) / entry_px if entry_px else 0
-                    logger.success(f"[Executor] 🛡️ native STOP {coin} @ ${sl_px} (-{dist:.1%} from ${entry_px})")
-                    return True
-                logger.error(f"[Executor] stop rejected {coin}: {st['error']}")
-            else:
+            if not (r and r.get("status") == "ok"):
                 logger.error(f"[Executor] stop bad response {coin}: {r}")
+                return False
+            st = r["response"]["data"]["statuses"][0]
+            if "error" in st:
+                logger.error(f"[Executor] stop rejected {coin}: {st['error']}")
+                return False
+            # The ack is NOT trust. Pull the resting oid and CONFIRM it is actually on the
+            # book via a fresh openOrders read (eyes-on-book, defense in depth). A stop that
+            # acked but isn't resting is treated as a FAILURE → caller force-closes.
+            oid = (st.get("resting") or {}).get("oid")
+            if oid is None:
+                logger.error(f"[Executor] stop {coin}: no resting oid in ack ({st}) — treat as unstopped")
+                return False
+            resting = False
+            for attempt in range(3):
+                try:
+                    oo = self._info.open_orders(settings.HL_WALLET_ADDRESS)
+                    if any(o.get("oid") == oid for o in oo):
+                        resting = True; break
+                except Exception as e:
+                    logger.warning(f"[Executor] stop re-query {coin} attempt {attempt}: {e}")
+                await asyncio.sleep(0.4)
+            if not resting:
+                logger.error(f"[Executor] stop {coin} oid={oid} ACKed but NOT resting on HL — treat as unstopped")
+                return False
+            dist = abs(sl_px - entry_px) / entry_px if entry_px else 0
+            self._last_stop = {"coin": coin, "oid": oid, "px": sl_px}
+            logger.success(f"[Executor] 🛡️ native STOP {coin} @ ${sl_px} (-{dist:.1%} from ${entry_px}) oid={oid} CONFIRMED on book")
+            return True
         except Exception as e:
             logger.error(f"[Executor] stop placement EXC {coin}: {e}")
         return False

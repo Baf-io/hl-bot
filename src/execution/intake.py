@@ -167,9 +167,20 @@ class IntakeServer:
         logger.success(f"[Intake] ▶ ENQUEUED {p['direction']} {p['coin']} ${size_usd:.0f} (src {p['source']}, {p['mode']})")
         return p["signal_id"]
 
+    async def status(self, request: web.Request) -> web.Response:
+        """Brain polls this after sending: echoes the FILL + whether the protective stop is
+        actually resting on HL (verified, not 'accepted'). 404-ish {pending} until the
+        executor has processed the signal. This is the automatic stop-verification channel."""
+        sid = request.match_info.get("sid", "")
+        st = self.executor._signal_status.get(sid)
+        if st is None:
+            return web.json_response({"signal_id": sid, "status": "pending (not yet filled, rejected, or unknown id)"})
+        return web.json_response(st)
+
     async def run(self):
         app = web.Application()
         app.router.add_post("/intake", self.intake)
+        app.router.add_get("/status/{sid}", self.status)
         app.router.add_get("/health", lambda r: web.json_response({"ok": True, "ack_only": settings.INTAKE_ACK_ONLY}))
         runner = web.AppRunner(app)
         await runner.setup()
