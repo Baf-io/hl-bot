@@ -455,7 +455,10 @@ class LeaderboardCopier:
                     continue
                 cand = hs
             addr, direction, _ = max(cand, key=lambda h: h[2])
-            chosen[coin] = (addr, direction, self._vol_capped_lev(coin, self._lev_for(addr, coin)))
+            # Scalp leverage: FIXED (overrides trader lev + old vol-cap) so the +1% TP is
+            # meaningful $; capped at COPY_MAX_COPY_LEVERAGE (executor re-enforces it).
+            scalp_lev = float(min(settings.SCALP_LEVERAGE, settings.COPY_MAX_COPY_LEVERAGE))
+            chosen[coin] = (addr, direction, scalp_lev)
         self._prev_contested = contested_now
 
         # ── Stage 2: weighted fixed-per-position sizing off the copy budget ──────

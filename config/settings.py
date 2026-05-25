@@ -159,6 +159,11 @@ TREND_SMA_DAYS     = 5      # daily-SMA window for the trend filter (close vs SM
 COPY_TP_PCT        = 0.01   # sell at +1% favorable price move (≈ the 80%-probable roof)
 COPY_SL_PCT        = 0.015  # cut at -1.5% adverse (tight, paired with the +1% TP)
 COPY_REOPEN_ON_ADD = os.getenv("COPY_REOPEN_ON_ADD", "true").lower() == "true"  # buy-on-add when flat (repeat)
+# Scalp leverage: FIXED leverage for copy entries (overrides the trader's lev + the old vol-cap),
+# so a +1% TP is meaningful $ on our small book. At 12x: +1%TP=+12% margin, -1.5%SL=-18% margin,
+# liq ≈ -7.9% price (the 1.5% soft-SL has buffer). Bounded by daily-loss-halt. NOTE: soft SL is
+# polled every 45s — going much above ~12x risks a fast move gapping past it (would need native stops).
+SCALP_LEVERAGE     = int(os.getenv("SCALP_LEVERAGE", "12"))
 
 # ── Tracker coins: reserved for the manual "lev-guy" tracker, OFF-LIMITS to copy ─
 # The copy engine never syncs, manages, or desires these — they're a separate manual
@@ -197,7 +202,7 @@ COPY_MAX_POSITIONS_PER_TRADER = 5       # allow up to 5 (a9b95f has 3, fc667 has
 # max_notional = (portfolio × MAX_POSITION_SIZE_PCT) × their_leverage
 # e.g. $1120 × 15% × 10x = $1,680 notional — but only $168 of real margin committed.
 # Prevents blindly copying 50x gamblers; real traders use 5-10x.
-COPY_MAX_COPY_LEVERAGE    = 10          # don't mirror leverage above 10x
+COPY_MAX_COPY_LEVERAGE    = 12          # cap (raised 10→12 for the scalp leverage; executor enforces it)
 # Minimum margin (as % of portfolio) we must commit to open a copy position.
 # Prevents high-leverage traders from creating slots worth only a few dollars.
 # e.g. a9b95f 20x ETH: our_notional=$165 passes $50 notional floor but our_margin=$8 — skip.
