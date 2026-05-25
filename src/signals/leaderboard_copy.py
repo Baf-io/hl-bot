@@ -803,6 +803,14 @@ class LeaderboardCopier:
             f"their=${d['their_notional']:,.0f}/acct=${d['their_acct']:,.0f} | "
             f"src={d['source'][:10]}..."
         )
+        if self.alerter:   # notify on every copy OPEN (user wants a ping when we copy-trade)
+            try:
+                await self.alerter.send(
+                    f"🟢 *Copy OPEN* {d['dir'].upper()} {coin} ${d['size']:,.0f} "
+                    f"({d['lev']:.0f}x, margin≈${d['size'] / max(d['lev'], 1):,.0f}) — src {d['source'][:6]}"
+                )
+            except Exception:
+                pass
         await self._signal_queue.put(TradeSignal(
             strategy="leaderboard",
             coin=coin,
