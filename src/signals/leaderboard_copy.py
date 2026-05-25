@@ -108,6 +108,14 @@ class LeaderboardCopier:
         # We only open once the streak clears COPY_ENTRY_DEBOUNCE_TICKS (kills fleeting copies).
         self._pending_entry: dict[str, int] = defaultdict(int)
 
+        # Zero-copy-lag (Stage 2) fresh-entry state:
+        #   _prev_trader_positions = last poll's {addr -> {coin -> dir}}, to detect transitions
+        #   _fresh_opens           = coin -> {"px": observed open price, "ts": monotonic}
+        #   _seeded                = first poll establishes the baseline (adopts nothing stale)
+        self._prev_trader_positions: dict[str, dict[str, str]] = {}
+        self._fresh_opens: dict[str, dict] = {}
+        self._seeded: bool = False
+
         # Daily-ATR cache for scale-out levels: coin -> (atr_pct, monotonic_ts).
         # atr_pct is ATR(ATR_PERIOD) over daily candles divided by last close (a fraction).
         self._atr_cache: dict[str, tuple[float, float]] = {}
@@ -249,6 +257,54 @@ class LeaderboardCopier:
         _atr_pct before _build_desired so the vol-scaled-leverage step can stay sync."""
         c = self._atr_cache.get(coin)
         return c[0] if c else None
+
+    def _detect_fresh_opens(self):
+        """
+        Zero-copy-lag: diff each trader's current positions vs last poll. A coin that newly
+        appears (flat→position) or flips direction = a FRESH open — record the observed price
+        and timestamp so an entry can fire near the trader's own entry. The FIRST call only
+        seeds the baseline (so a restart never adopts positions the trader already held).
+        """
+        now = time.monotonic()
+        for c in list(self._fresh_opens):                       # expire stale opportunities
+            if now - self._fresh_opens[c]["ts"] > settings.FRESH_ENTRY_EXPIRE_S:
+                self._fresh_opens.pop(c, None)
+        if not self._seeded:
+            self._prev_trader_positions = {a: dict(p) for a, p in self._trader_positions.items()}
+            self._seeded = True
+            logger.info("[Reconcile] fresh-entry baseline seeded — existing trader holds are NOT adopted")
+            return
+        for addr, positions in self._trader_positions.items():
+            if addr not in self._tracked:
+                continue
+            spec = self._tracked[addr].specialty
+            prev = self._prev_trader_positions.get(addr, {})
+            for coin, direction in positions.items():
+                if coin in settings.TRACKER_COINS:
+                    continue
+                if spec and coin.upper() != spec.upper():
+                    continue
+                if prev.get(coin) != direction:                 # newly opened OR flipped
+                    px = self.store.latest_mid(coin) if self.store else None
+                    if px:
+                        self._fresh_opens[coin] = {"px": px, "ts": now}
+                        logger.info(
+                            f"[Reconcile] 🆕 FRESH open {addr[:6]} {direction} {coin} @ ${px} "
+                            f"— entry window open (±{settings.FRESH_ENTRY_MAX_ATR}×ATR)"
+                        )
+        self._prev_trader_positions = {a: dict(p) for a, p in self._trader_positions.items()}
+
+    def _is_fresh_entry(self, coin: str) -> bool:
+        """True only if `coin` was freshly opened by the trader AND current price is still within
+        FRESH_ENTRY_MAX_ATR of their observed open — i.e. we can enter near their price, no lag."""
+        fo = self._fresh_opens.get(coin)
+        if not fo:
+            return False
+        px = self.store.latest_mid(coin) if self.store else None
+        atr = self._atr_cached(coin)
+        if not px or not atr or atr <= 0:
+            return False
+        return abs(px - fo["px"]) <= settings.FRESH_ENTRY_MAX_ATR * atr * fo["px"]
 
     def _vol_capped_lev(self, coin: str, base_lev: float) -> float:
         """Tune leverage to the coin's ATR so the hard -STOP_LOSS_MARGIN_PCT stop lands
@@ -442,6 +498,9 @@ class LeaderboardCopier:
                       if coin not in settings.TRACKER_COINS}:
                 await self._atr_pct(c)
 
+            # Zero-copy-lag: detect fresh trader opens this poll (gates new entries below)
+            self._detect_fresh_opens()
+
             desired = self._build_desired()
 
             # What we actually hold from this strategy (copy + startup-synced positions).
@@ -488,19 +547,29 @@ class LeaderboardCopier:
                     del self._trail_locked[coin]       # trader flipped — re-arm
                 cur = held.get(coin)
                 if cur is None:
-                    # Entry debounce: the trader must hold a NEW coin for COPY_ENTRY_DEBOUNCE_TICKS
-                    # consecutive reconciles before we copy it — kills fleeting/scalp positions
-                    # that would otherwise churn in and out at a fee loss.
-                    self._pending_entry[coin] += 1
-                    if self._pending_entry[coin] < settings.COPY_ENTRY_DEBOUNCE_TICKS:
-                        logger.debug(
-                            f"[Reconcile] {coin} debounce {self._pending_entry[coin]}/"
-                            f"{settings.COPY_ENTRY_DEBOUNCE_TICKS} — waiting"
-                        )
-                        continue
-                    self._pending_entry.pop(coin, None)
-                    await self._emit_entry(coin, d)
-                    entries += 1
+                    if settings.FRESH_ENTRY_ONLY:
+                        # Zero-copy-lag: ONLY open on a fresh trader open near their price.
+                        # A position the trader already held (stale) is never adopted.
+                        if not self._is_fresh_entry(coin):
+                            logger.debug(f"[Reconcile] {coin} desired but not a fresh open near price — skip (no late adoption)")
+                            continue
+                        self._fresh_opens.pop(coin, None)   # consumed
+                        logger.info(f"[Reconcile] ✅ fresh entry {coin} near trader's open — copy-lag avoided")
+                        await self._emit_entry(coin, d)
+                        entries += 1
+                    else:
+                        # Legacy debounce path: trader must hold a NEW coin COPY_ENTRY_DEBOUNCE_TICKS
+                        # reconciles before we copy it (kills fleeting/scalp positions).
+                        self._pending_entry[coin] += 1
+                        if self._pending_entry[coin] < settings.COPY_ENTRY_DEBOUNCE_TICKS:
+                            logger.debug(
+                                f"[Reconcile] {coin} debounce {self._pending_entry[coin]}/"
+                                f"{settings.COPY_ENTRY_DEBOUNCE_TICKS} — waiting"
+                            )
+                            continue
+                        self._pending_entry.pop(coin, None)
+                        await self._emit_entry(coin, d)
+                        entries += 1
                 elif cur.direction != d["dir"]:
                     # Trader flipped: close our side, then open the new side.
                     await self._emit_exit(coin, cur.direction, "trader_flipped")

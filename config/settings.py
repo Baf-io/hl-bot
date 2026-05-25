@@ -127,7 +127,17 @@ STOP_NOISE_ATR         = 0.5    # stop distance must be >= 0.5× daily-ATR → l
 
 # Churn controls (the -$133 was mostly RESIZE close-and-reopen + fleeting alt copies):
 RESIZE_ENABLED            = os.getenv("RESIZE_ENABLED", "false").lower() == "true"  # phase-1: OFF (no close+reopen)
-COPY_ENTRY_DEBOUNCE_TICKS = int(os.getenv("COPY_ENTRY_DEBOUNCE_TICKS", "2"))        # trader must hold a NEW coin this many reconcile ticks before we copy
+COPY_ENTRY_DEBOUNCE_TICKS = int(os.getenv("COPY_ENTRY_DEBOUNCE_TICKS", "2"))        # (legacy path) trader must hold a NEW coin this many ticks before we copy
+
+# ── Zero-copy-lag: FRESH-ENTRY-ONLY (Stage 2) ───────────────────────────────────
+# Only OPEN a coin when we OBSERVE the trader open it (flat→position, or a flip) AND price is
+# still within FRESH_ENTRY_MAX_ATR daily-ATRs of where they opened. NEVER adopt a position they
+# already hold — that stale adoption at a worse price is the copy-lag leak (cost us ETH −$15.61
+# while the source sat +$560k; SOL −3% vs his +74%). First poll after restart = baseline only
+# (don't adopt anything stale on boot). Grandfathered held positions are unaffected (they ride).
+FRESH_ENTRY_ONLY     = os.getenv("FRESH_ENTRY_ONLY", "true").lower() == "true"
+FRESH_ENTRY_MAX_ATR  = 0.5    # max distance from the trader's observed open price to still enter
+FRESH_ENTRY_EXPIRE_S = 600    # a fresh-open opportunity expires after this long if unfilled
 
 # ── Tracker coins: reserved for the manual "lev-guy" tracker, OFF-LIMITS to copy ─
 # The copy engine never syncs, manages, or desires these — they're a separate manual
