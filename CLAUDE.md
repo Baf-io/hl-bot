@@ -57,7 +57,7 @@ as `hl-bot.service`.
 ```
 budget    = equity − (TRACKER_MARGIN_USD × |TRACKER_COINS|)      # copy budget, tracker reserved
 per_margin = min(budget × COPY_POSITION_PCT × trader.weight, budget × MAX_POSITION_SIZE_PCT)
-our_lev   = min(their_lev, COPY_MAX_COPY_LEVERAGE, STOP_LOSS_MARGIN_PCT/(STOP_NOISE_ATR×ATR))
+our_lev   = min(SCALP_LEVERAGE, COPY_MAX_COPY_LEVERAGE)          # fixed scalp lev (12x)
 our_notional = per_margin × our_lev
 → skip if our_notional < MIN_POSITION_NOTIONAL ($50)
 → book bounded by MAX_OPEN_POSITIONS + risk caps (graceful, no margin wall)
