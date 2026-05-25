@@ -61,6 +61,7 @@ class TrackedTrader:
     trade_count: int
     account_age_days: int
     specialty: Optional[str] = None   # coin this trader is the designated specialist for
+    weight: float = 1.0               # exposure multiplier (1.0 = full; <1 = trimmed exposure)
     score: float = 0.0
 
 
@@ -277,10 +278,15 @@ class LeaderboardCopier:
         for addr, positions in self._trader_positions.items():
             if addr not in self._tracked:
                 continue
+            if addr not in self._prev_trader_positions:
+                # Newly-ADDED trader (roster change/reload): seed their existing holds as
+                # baseline this poll — do NOT treat them as fresh opens (that stale-adoption
+                # bug opened an unwanted ETH short on a mid-run traders.json reload).
+                continue
             spec = self._tracked[addr].specialty
-            prev = self._prev_trader_positions.get(addr, {})
+            prev = self._prev_trader_positions[addr]
             for coin, direction in positions.items():
-                if coin in settings.TRACKER_COINS:
+                if coin in settings.COPIER_SKIP_COINS:
                     continue
                 if spec and coin.upper() != spec.upper():
                     continue
@@ -380,9 +386,11 @@ class LeaderboardCopier:
            • highest-conviction eligible holder wins the coin.
 
         2. SIZING (how big — DECOUPLED from the trader's account size):
-           • equal-weight OUR capital to COPY_TARGET_DEPLOY across the chosen coins,
-             capped at MAX_POSITION_SIZE_PCT each; notional = margin × their leverage.
-           This is what lets us copy big funds whose bets are a small % of their account.
+           • each position = COPY_POSITION_PCT of the COPY BUDGET × the source trader's
+             WEIGHT, capped at MAX_POSITION_SIZE_PCT; notional = margin × leverage.
+           • copy budget = equity − tracker reserve (so the isolated BTC sleeve and the copy
+             book never compete for margin). Fixed-per-position (not ÷n) so many-coin
+             generalists don't shrink to dust; MAX_OPEN_POSITIONS + risk caps bound the book.
         """
         # ── Stage 1: conviction-gated holders per coin ───────────────────────────
         holders: dict[str, list] = defaultdict(list)   # coin -> [(addr, dir, conviction)]
@@ -397,8 +405,8 @@ class LeaderboardCopier:
             # is how a9b95f→HYPE-only and feec88→SOL-only is enforced.
             spec = self._tracked[address].specialty
             for coin, direction in positions.items():
-                if coin in settings.TRACKER_COINS:
-                    continue   # reserved for the manual lev-tracker sleeve — never copy it
+                if coin in settings.COPIER_SKIP_COINS:
+                    continue   # tracker sleeve coin OR user-manual coin — never copy it
                 if spec and coin.upper() != spec.upper():
                     continue   # specialist: only their designated coin counts
                 notional = self._trader_position_notionals.get((address, coin), 0)
@@ -431,24 +439,26 @@ class LeaderboardCopier:
             chosen[coin] = (addr, direction, self._vol_capped_lev(coin, self._lev_for(addr, coin)))
         self._prev_contested = contested_now
 
-        # ── Stage 2: equal-weight sizing to target deployment ────────────────────
-        n = len(chosen)
-        if n == 0:
+        # ── Stage 2: weighted fixed-per-position sizing off the copy budget ──────
+        if not chosen:
             return {}
-        per_margin = min(
-            self._portfolio_usd * settings.COPY_TARGET_DEPLOY / n,
-            self._portfolio_usd * settings.MAX_POSITION_SIZE_PCT,
-        )
+        # Copy budget = equity − tracker reserve (isolated sleeve gets its margin first).
+        reserve = (settings.TRACKER_MARGIN_USD * len(settings.TRACKER_COINS)
+                   if settings.TRACKER_ENABLED else 0.0)
+        budget = max(self._portfolio_usd - reserve, 0.0)
         desired: dict[str, dict] = {}
         for coin, (addr, direction, lev) in chosen.items():
+            weight = self._tracked[addr].weight if addr in self._tracked else 1.0
+            per_margin = min(budget * settings.COPY_POSITION_PCT * weight,
+                             budget * settings.MAX_POSITION_SIZE_PCT)
             our_notional = per_margin * lev
             if our_notional < settings.MIN_POSITION_NOTIONAL:
-                continue   # sanity floor (shouldn't trigger at target deployment)
+                continue   # too small to be worth a slot (e.g. tiny weight × low budget)
             desired[coin] = {
                 "dir": direction, "source": addr,
                 "their_notional": self._trader_position_notionals.get((addr, coin), 0),
                 "their_acct": self._trader_acct_values.get(addr, 0),
-                "lev": lev, "size": our_notional,
+                "lev": lev, "size": our_notional, "weight": weight,
             }
         return desired
 
@@ -495,7 +505,7 @@ class LeaderboardCopier:
             # leverage step (_build_desired) and the stop/trail (_ride_winners) can read it
             # without awaiting. _atr_pct caches for ATR_REFRESH_S, so this is ~1 call/coin/hr.
             for c in {coin for pos in self._trader_positions.values() for coin in pos
-                      if coin not in settings.TRACKER_COINS}:
+                      if coin not in settings.COPIER_SKIP_COINS}:
                 await self._atr_pct(c)
 
             # Zero-copy-lag: detect fresh trader opens this poll (gates new entries below)
@@ -648,19 +658,19 @@ class LeaderboardCopier:
             lev = max(p.leverage, 1.0)
             atr = await self._atr_pct(coin)   # may be None — only the trail needs it
 
-            # ── STOP ───────────────────────────────────────────────────────────
-            # Default: HARD -STOP_LOSS_MARGIN_PCT of margin (tight, deterministic).
-            # Specialist conviction coins (a trader's `specialty`) ride WITH the trader —
-            # widen to the larger of (-9% margin, SPECIALIST_STOP_ATR×ATR) so we don't get
-            # noise-chopped out of an elite hold (e.g. feec88 SOL). bank + follow-exit control it.
+            # ── STOP (ride-with-the-trader) ──────────────────────────────────────
+            # The roster is active SWING traders we follow in/out — so we RIDE through noise,
+            # not chop on it. Stop = WIDER of (-STOP_LOSS_MARGIN_PCT/lev, SPECIALIST_STOP_ATR×ATR)
+            # so a normal intraday wiggle doesn't knock us out of a hold the trader rides to
+            # profit. The real exits are: the trader closing (trader_closed), the +25% bank, and
+            # the ATR ride-trail. This wide stop is just the catastrophe backstop.
             stop_px = settings.STOP_LOSS_MARGIN_PCT / lev
-            is_spec = coin.upper() in self._specialist
-            if is_spec and atr and atr > 0:
+            if atr and atr > 0:
                 stop_px = max(stop_px, settings.SPECIALIST_STOP_ATR * atr)
             if exc <= -stop_px:
                 logger.info(
-                    f"[Reconcile] 🛑 STOP {coin} {p.direction} | move {exc:+.1%} "
-                    f"≤ -{stop_px:.1%} ({'SPECIALIST ' + str(settings.SPECIALIST_STOP_ATR) + '×ATR' if is_spec else 'hard -' + format(settings.STOP_LOSS_MARGIN_PCT, '.0%') + ' margin'} @ {lev:.0f}x)"
+                    f"[Reconcile] 🛑 STOP {coin} {p.direction} | move {exc:+.1%} ≤ -{stop_px:.1%} "
+                    f"(ride backstop max(-{settings.STOP_LOSS_MARGIN_PCT:.0%}/lev, {settings.SPECIALIST_STOP_ATR}×ATR) @ {lev:.0f}x)"
                 )
                 await self._emit_exit(coin, p.direction, "stop_loss")
                 self._trail_locked[coin] = p.direction
@@ -847,6 +857,7 @@ class LeaderboardCopier:
                     trade_count=int(entry.get("trade_count", 500)),
                     account_age_days=int(entry.get("account_age_days", 60)),
                     specialty=entry.get("specialty") or None,
+                    weight=float(entry.get("weight", 1.0)),
                 ))
             logger.info(f"[Leaderboard] Loaded {len(traders)} traders from {traders_file}")
             return traders

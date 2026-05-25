@@ -77,10 +77,10 @@ class Executor:
                 if szi == 0:
                     continue
                 coin      = pos.get("coin", "")
-                if coin in settings.TRACKER_COINS:
+                if coin in settings.COPIER_SKIP_COINS:
                     logger.info(
-                        f"[Executor] Skip sync of tracker coin {coin} — manual lev-tracker "
-                        f"sleeve, not copy-managed (won't adopt or auto-close it)"
+                        f"[Executor] Skip sync of {coin} — tracker sleeve or user-manual coin, "
+                        f"not copy-managed (won't adopt or auto-close it)"
                     )
                     continue
                 direction = "long" if szi > 0 else "short"

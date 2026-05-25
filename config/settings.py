@@ -146,6 +146,16 @@ FRESH_ENTRY_EXPIRE_S = 600    # a fresh-open opportunity expires after this long
 TRACKER_COINS = {c.strip().upper() for c in
                  os.getenv("TRACKER_COINS", "BTC").split(",") if c.strip()}
 
+# ── MANUAL coins: the USER trades these by hand — the copier must NEVER touch them ──
+# (e.g. a discretionary HYPE short the user opened). Excluded from sizing, desired,
+# startup sync, and fresh-detection — same as tracker coins. Clear when the bot should
+# resume managing them. 2026-05-25: HYPE = user's manual discretionary short.
+MANUAL_COINS = {c.strip().upper() for c in
+                os.getenv("MANUAL_COINS", "HYPE").split(",") if c.strip()}
+# Coins the COPIER skips entirely (tracker sleeve + user-manual). The 78aa tracker still
+# uses TRACKER_COINS for what IT trades; this is only the copier's skip set.
+COPIER_SKIP_COINS = TRACKER_COINS | MANUAL_COINS
+
 # ── Lev-tracker sleeve: mirror ONE trader's DIRECTION on TRACKER_COINS, ISOLATED ─
 # Walled off from the copy engine. Holds a fixed TRACKER_MARGIN_USD of ISOLATED
 # margin per tracker coin in the SAME direction as the source trader; follows his
@@ -180,7 +190,14 @@ COPY_MIN_MARGIN_PCT       = 0.03        # (legacy proportional floor — unused 
 #   2. Equal-weight OUR capital to COPY_TARGET_DEPLOY across the chosen coins, capped at
 #      MAX_POSITION_SIZE_PCT each. Deploys fully regardless of the trader's account size.
 COPY_MIN_CONVICTION_PCT   = 0.05        # their position must be >=5% of their acct to copy/vote (raised 0.03→0.05: fewer, stronger copies, less churn)
-COPY_TARGET_DEPLOY        = 0.85        # deploy ~85% of our capital, equal-weight
+COPY_TARGET_DEPLOY        = 0.85        # (legacy equal-weight÷n model — superseded by COPY_POSITION_PCT)
+# ── Active-generalist sizing (multi-coin swing traders + per-trader weight) ─────────
+# Each copy position = FIXED fraction of the copy budget × the source trader's weight, NOT
+# equal-weight÷n (which collapsed to dust with many-coin generalists and risked hitting a
+# margin wall). Copy budget = equity MINUS the tracker reserve (so the isolated BTC sleeve
+# and the copy book never fight for margin). Book is bounded by MAX_OPEN_POSITIONS + the risk
+# manager's margin/delta caps, which gracefully stop new entries when full (no crash).
+COPY_POSITION_PCT         = 0.12        # margin per FULL-weight position = 12% of copy budget (cap MAX_POSITION_SIZE_PCT)
 
 # Whitelist: if set, ONLY copy from these trader addresses (comma-separated).
 # Leave empty to copy from all qualified traders.

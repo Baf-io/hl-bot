@@ -1,26 +1,41 @@
 [
   {
-    "address": "0xa9b95f2a2e7ef219021efc5c04c32761b8553bbd",
-    "label":        "a9b95f (HYPE)",
-    "note":         "HYPE specialist — PINNED to HYPE only (his 59%-conviction core, +$11.5M from $39.63). ETH/BTC deliberately ignored. Kept 2026-05-25 as the HYPE engine.",
-    "specialty":    "HYPE",
-    "alltime_pnl":  2000000,
-    "win_rate":     0.65,
-    "max_drawdown": 0.15,
-    "avg_leverage": 8,
-    "trade_count":  500,
-    "account_age_days": 120
+    "address": "0xf83858e57d9f804f5ca1603bce82558119aeac7b",
+    "label":        "f83858 (generalist)",
+    "note":         "Active two-sided swing, 19 coins, perp +$26k/107d, 2.4yr ORGANIC power-user (spot-genesis/vaults/staking, sister wallet 0xdb36). Diversified elite — full weight.",
+    "specialty":    null,
+    "weight":       1.0,
+    "alltime_pnl":  70000,
+    "win_rate":     0.57,
+    "max_drawdown": 0.20,
+    "avg_leverage": 3,
+    "trade_count":  2000,
+    "account_age_days": 863
   },
   {
-    "address": "0xfeec88b13fc0be31695069f02bac18538a154e9c",
-    "label":        "feec88 (SOL)",
-    "note":         "SOL specialist — 100%+ conviction SOL short, +$411k, actively ADDING. Elite, kept as a ride-with-the-trader specialist.",
-    "specialty":    "SOL",
-    "alltime_pnl":  10500000,
-    "win_rate":     0.62,
+    "address": "0x41829013ce94b21131b68d5a7b0247bd4eefce96",
+    "label":        "41829013 (generalist)",
+    "note":         "Active two-sided swing, 8 coins, perp +$49k/110d, organic edge but MULTI-WALLET FUND op ($1-2M shuffled w/ counterparties) — trimmed exposure for opacity.",
+    "specialty":    null,
+    "weight":       0.6,
+    "alltime_pnl":  76000,
+    "win_rate":     0.70,
     "max_drawdown": 0.20,
-    "avg_leverage": 10,
-    "trade_count":  1024,
-    "account_age_days": 90
+    "avg_leverage": 4,
+    "trade_count":  2000,
+    "account_age_days": 239
+  },
+  {
+    "address": "0x69b05701f8175c276ecd0138387a197948e240bb",
+    "label":        "69b05701 (HYPE-acc)",
+    "note":         "Clean organic capital ($432k in/$260k out), cleanest curve, but HYPE-beta concentrated (structural bull-token) — least exposure. BTC churn auto-skipped by state-based/fresh-entry.",
+    "specialty":    null,
+    "weight":       0.4,
+    "alltime_pnl":  450000,
+    "win_rate":     0.48,
+    "max_drawdown": 0.10,
+    "avg_leverage": 6,
+    "trade_count":  2000,
+    "account_age_days": 354
   }
 ]
