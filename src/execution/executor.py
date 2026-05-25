@@ -225,10 +225,23 @@ class Executor:
             # SL/TP: copy trades trust the trader's exit signal + guardian.
             # Native SL/TP killed positions that ran +50-80% for weeks.
             # Own-signal strategies (cascade, funding) still get SL/TP protection.
+            # ── CONTRACT (B1): EVERY order MUST carry a native exchange stop. Place it
+            # immediately after the fill; if it can't be confirmed, REJECT = close the
+            # position right away (never hold an unstopped position).
+            stop_ok = await self._place_protective_stop(coin, is_buy, size_coin, actual_px)
+            if not stop_ok:
+                logger.error(
+                    f"[Executor] ⛔ NO STOP confirmed for {coin} pos#{position_id} — "
+                    f"CLOSING per risk contract (reject if absent)"
+                )
+                await self._place_market_close(coin)
+                self.risk.close_position(position_id, actual_px)
+                if getattr(self, "alerter", None):
+                    try: await self.alerter.send(f"⛔ {coin} opened but stop FAILED → force-closed (contract: no unstopped position)")
+                    except Exception: pass
+                return
             if not is_copy:
                 await self._place_native_sltp(coin, is_buy, size_coin, actual_px)
-            else:
-                logger.debug(f"[Executor] Leaderboard copy — no native SL/TP, trusting trader exit")
         else:
             logger.warning(f"[Executor] Order not filled for {coin}: {err}")
 
@@ -442,6 +455,45 @@ class Executor:
         except (KeyError, IndexError, TypeError) as e:
             return False, None, f"parse error: {e}"
         return False, None, f"unknown status: {result}"
+
+    @staticmethod
+    def _round_px(px: float) -> float:
+        """Round to 5 significant figures (HL price precision rule)."""
+        if px <= 0:
+            return px
+        from math import floor, log10
+        d = max(0, min(6, 5 - int(floor(log10(abs(px)))) - 1))
+        return round(px, d)
+
+    async def _place_protective_stop(self, coin: str, entry_is_buy: bool, size: float,
+                                     entry_px: float) -> bool:
+        """CONTRACT (B1): place a native, reduce-only exchange STOP at COPY_SL_PCT from entry.
+        Returns True only if the exchange confirms it (verified inner status). Caller closes
+        the position if this returns False — no unstopped position is allowed to ride."""
+        if not self._exchange:
+            return False
+        sl = settings.COPY_SL_PCT
+        if entry_is_buy:                                   # long → stop SELL below entry
+            sl_px = self._round_px(entry_px * (1 - sl)); close_is_buy = False
+        else:                                              # short → stop BUY above entry
+            sl_px = self._round_px(entry_px * (1 + sl)); close_is_buy = True
+        try:
+            r = self._exchange.order(
+                coin, close_is_buy, size, sl_px,
+                {"trigger": {"triggerPx": sl_px, "isMarket": True, "tpsl": "sl"}},
+                reduce_only=True,
+            )
+            if r and r.get("status") == "ok":
+                st = r["response"]["data"]["statuses"][0]
+                if "error" not in st:
+                    logger.success(f"[Executor] 🛡️ native STOP {coin} @ ${sl_px} (-{sl:.0%} from ${entry_px})")
+                    return True
+                logger.error(f"[Executor] stop rejected {coin}: {st['error']}")
+            else:
+                logger.error(f"[Executor] stop bad response {coin}: {r}")
+        except Exception as e:
+            logger.error(f"[Executor] stop placement EXC {coin}: {e}")
+        return False
 
     async def _place_native_sltp(self, coin: str, is_buy: bool, size: float, entry_px: float):
         """

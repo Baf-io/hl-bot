@@ -80,6 +80,7 @@ async def main():
                                ntfy_topic=settings.NTFY_TOPIC, ntfy_server=settings.NTFY_SERVER)
     squeeze  = SqueezeGuard(store, alerter)
     executor.squeeze_guard = squeeze   # give executor access to fire lifecycle events
+    executor.alerter = alerter         # B1: alert on no-stop force-close
     feed     = HyperliquidFeed()
 
     signal_queue: asyncio.Queue[TradeSignal] = asyncio.Queue()
