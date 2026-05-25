@@ -73,6 +73,12 @@ COPY_MAX_LAG_MS           = 3000        # (legacy, fill-stream only) unused by s
 # kills the fee-bleeding fill-stream churn (was reacting to every TWAP/trim fill).
 COPY_RECONCILE_INTERVAL_S = 45
 
+# SHADOW mode: run the full leaderboard copy DECISION logic but PAPER-trade it — entries/exits
+# at live mid, paper P&L + win-rate logged, ZERO real orders, fully isolated from the brain's
+# live book (doesn't touch risk/executor). Lets us evaluate hopping back to the copy strategy
+# with new inputs while the brain runs live. (2026-05-25: leaderboard live OFF, shadow ON.)
+COPY_SHADOW = os.getenv("COPY_SHADOW", "true").lower() == "true"
+
 # Auto-compound: size off LIVE account equity instead of a frozen PORTFOLIO_USD, so gains
 # roll into bigger positions and drawdowns shrink them. Per-position (15%) + delta caps
 # still bound risk. PORTFOLIO_USD becomes the initial seed only.

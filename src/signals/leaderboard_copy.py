@@ -35,6 +35,7 @@ import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Optional
 import aiohttp
 from loguru import logger
@@ -131,6 +132,13 @@ class LeaderboardCopier:
         # High-signal alerter (Telegram + ntfy), injected by main.py. Used to notify on a
         # trend-confirmed add-mirror entry (the user wants a heads-up when one fires).
         self.alerter = None
+
+        # SHADOW (paper) mode: parallel paper book + P&L, never touches risk/executor.
+        self._shadow = settings.COPY_SHADOW
+        self._shadow_book: dict[str, object] = {}    # coin -> SimpleNamespace paper position
+        self._shadow_pnl = 0.0
+        self._shadow_n = 0
+        self._shadow_wins = 0
 
         # Daily-ATR cache for scale-out levels: coin -> (atr_pct, monotonic_ts).
         # atr_pct is ATR(ATR_PERIOD) over daily candles divided by last close (a fraction).
@@ -522,14 +530,15 @@ class LeaderboardCopier:
             await self._refresh_account_values()
 
             # Sync our in-memory book with reality FIRST: drop any position closed
-            # outside the bot (manual close, liquidation, native SL/TP). Also auto-compound
-            # sizing off live equity. Both come from one fetch of our wallet state.
-            actual, equity = await self._fetch_our_state()
-            if actual is not None:
-                self.risk.drop_phantoms(actual)
-            if equity and settings.PORTFOLIO_COMPOUND:
-                self._portfolio_usd = equity
-                self.risk.portfolio_value = equity
+            # outside the bot. SHADOW mode is paper-only — it must NEVER touch the real risk
+            # book (the brain owns that) or prune the brain's live positions.
+            if not self._shadow:
+                actual, equity = await self._fetch_our_state()
+                if actual is not None:
+                    self.risk.drop_phantoms(actual)
+                if equity and settings.PORTFOLIO_COMPOUND:
+                    self._portfolio_usd = equity
+                    self.risk.portfolio_value = equity
 
             # Pre-warm the ATR cache for every coin a trader holds, so the sync vol-scaled-
             # leverage step (_build_desired) and the stop/trail (_ride_winners) can read it
@@ -543,11 +552,14 @@ class LeaderboardCopier:
 
             desired = self._build_desired()
 
-            # What we actually hold from this strategy (copy + startup-synced positions).
-            held = {
-                p.coin: p for p in self.risk.open_positions
-                if p.strategy in ("leaderboard", "synced")
-            }
+            # What we "hold": the PAPER book in shadow, else the real leaderboard/synced book.
+            if self._shadow:
+                held = dict(self._shadow_book)
+            else:
+                held = {
+                    p.coin: p for p in self.risk.open_positions
+                    if p.strategy in ("leaderboard", "synced")
+                }
 
             entries = exits = flips = resizes = trails = adds = 0
 
@@ -813,6 +825,16 @@ class LeaderboardCopier:
         return actions
 
     async def _emit_entry(self, coin: str, d: dict):
+        if self._shadow:
+            px = self.store.latest_mid(coin) if self.store else None
+            if not px:
+                return
+            self._shadow_book[coin] = SimpleNamespace(
+                coin=coin, direction=d["dir"], entry_price=px, size_usd=d["size"],
+                leverage=max(d["lev"], 1.0), peak_price_pct=0.0, scaled_out=False)
+            logger.info(f"[Reconcile] 🔮 SHADOW ENTER {d['dir'].upper()} {coin} ${d['size']:,.0f} @ ${px} "
+                        f"lev={d['lev']:.0f}x src={d['source'][:6]} | open={len(self._shadow_book)}")
+            return
         logger.info(
             f"[Reconcile] ENTER {d['dir'].upper()} {coin} ${d['size']:,.0f} "
             f"(margin≈${d['size'] / max(d['lev'], 1):,.0f}) lev={d['lev']:.0f}x | "
@@ -845,6 +867,12 @@ class LeaderboardCopier:
                         source: str, their_frac: float):
         """Emit an ADD signal (grow an existing same-direction position) + notify the user —
         fired only on a trend-confirmed trader add (add-mirroring)."""
+        if self._shadow:
+            pos = self._shadow_book.get(coin)
+            if pos:
+                pos.size_usd += add_usd
+                logger.info(f"[Reconcile] 🔮 SHADOW ADD {direction.upper()} {coin} +${add_usd:,.0f} → ${pos.size_usd:,.0f}")
+            return
         logger.info(
             f"[Reconcile] ➕ ADD {direction.upper()} {coin} +${add_usd:,.0f} (trend-confirmed; "
             f"trader +{their_frac:.0%}) lev={lev:.0f}x | src={source[:10]}..."
@@ -865,6 +893,26 @@ class LeaderboardCopier:
 
     async def _emit_exit(self, coin: str, held_direction: str, reason: str,
                          fraction: float = 1.0):
+        if self._shadow:
+            pos = self._shadow_book.get(coin)
+            if not pos:
+                return
+            px = self.store.latest_mid(coin) if self.store else pos.entry_price
+            frac = fraction if 0 < fraction < 1.0 else 1.0
+            closed = pos.size_usd * frac
+            pnl = (closed * (px - pos.entry_price) / pos.entry_price) if held_direction == "long" \
+                  else (closed * (pos.entry_price - px) / pos.entry_price)
+            if frac >= 1.0:
+                self._shadow_book.pop(coin, None)
+                self._shadow_n += 1
+                if pnl > 0: self._shadow_wins += 1
+            else:
+                pos.size_usd -= closed; pos.scaled_out = True
+            self._shadow_pnl += pnl
+            wr = (self._shadow_wins / self._shadow_n * 100) if self._shadow_n else 0
+            logger.info(f"[Reconcile] 🔮 SHADOW EXIT {coin} {held_direction} ({reason}) @ ${px} | "
+                        f"pnl ${pnl:+,.2f} | cum ${self._shadow_pnl:+,.2f} over {self._shadow_n} ({wr:.0f}% win) | open={len(self._shadow_book)}")
+            return
         # Exit signal direction = the side WE HOLD (the one being closed) — see
         # executor._close_position matching convention. fraction<1 = partial scale-out
         # (trim that share, keep a runner); fraction>=1 = full close.
