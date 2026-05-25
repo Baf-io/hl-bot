@@ -313,6 +313,10 @@ async def main():
     tasks = [feed.run(), executor.run(), position_guardian(), relay_signals()]
     if settings.TRACKER_ENABLED:
         tasks.append(LevTracker(alerter=alerter).run())
+    # Brain intake (B4): HMAC-signed signal receiver (LXC brain → this executor).
+    if settings.INTAKE_ENABLED:
+        from execution.intake import IntakeServer
+        tasks.append(IntakeServer(executor, risk, alerter=alerter).run())
 
     await alerter.send("🤖 *HL-Bot started*")
     await asyncio.gather(*tasks)

@@ -23,6 +23,18 @@ PORTFOLIO_DELTA_MAX     = 0.50          # tightened (1 small position anyway)
 MIN_POSITION_NOTIONAL   = 20            # lowered so a ≤$50 probe clears the floor
 PROBE_MAX_NOTIONAL      = 50            # CONTRACT: WATCH/unvalidated source → ≤$50 exposure (probe)
 PROBE_MAX_RISK_USD      = 5             # CONTRACT: ≤$5 risk on a probe
+RISK_PER_TRADE_PCT      = 0.01          # CONTRACT (B2): size so a stop-out loses ~1% equity
+TOTAL_OPEN_RISK_PCT     = 0.02          # CONTRACT: total open risk across positions ≤2%
+
+# ── Brain intake (B4): HMAC-signed signal receiver — LXC brain → hl-bot executor ──
+# The brain is strategy-authoritative; WE independently re-enforce every cardinal & execute.
+INTAKE_ENABLED      = os.getenv("INTAKE_ENABLED", "true").lower() == "true"
+INTAKE_HOST         = os.getenv("INTAKE_HOST", "127.0.0.1")    # localhost ONLY until network confirmed (NOT Tailscale yet)
+INTAKE_PORT         = int(os.getenv("INTAKE_PORT", "8787"))
+INTAKE_ACK_ONLY     = os.getenv("INTAKE_ACK_ONLY", "true").lower() == "true"  # handshake: verify+log, DON'T place orders
+HLBOT_SHARED_SECRET = os.getenv("HLBOT_SHARED_SECRET", "")     # set in .env on BOTH boxes; never in code/chat
+STALE_SIGNAL_S      = int(os.getenv("STALE_SIGNAL_S", "60"))   # reject signals older than this
+KEEP_SOURCES        = {s.strip() for s in os.getenv("KEEP_SOURCES", "").split(",") if s.strip()}  # empty = none KEEP → live rejected
 
 # ── Per-strategy slot caps (CONTRACT: only leaderboard, max 1) ────────────────
 STRATEGY_MAX_POSITIONS = {
