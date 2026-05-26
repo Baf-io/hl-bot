@@ -23,6 +23,7 @@ import pathlib as _pl
 sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 sys.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent))
 import aiohttp
+from scan_common import hold_stats, legacy_avg_hold, fmt_hold, fmt_hold_short
 
 STATS_URL   = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 HL_REST     = "https://api.hyperliquid.xyz/info"
@@ -82,24 +83,9 @@ def calc_streak(closes: list[dict]) -> int:
     return streak
 
 
-def calc_hold_times(fills: list[dict], max_h: float = 168) -> list[float]:
-    """Match Open→Close pairs by coin and return hold durations in hours."""
-    hold_times = []
-    opens: dict[str, float] = {}
-    for fill in fills:
-        coin      = fill.get("coin", "")
-        direction = str(fill.get("dir", ""))
-        ts        = float(fill.get("time", 0))
-        cpnl      = float(fill.get("closedPnl", 0))
-        is_open   = "Open"  in direction or (cpnl == 0 and "Close" not in direction)
-        is_close  = "Close" in direction or cpnl != 0
-        if is_open and not is_close:
-            opens[coin] = ts
-        elif is_close and coin in opens:
-            h = (ts - opens.pop(coin)) / 3_600_000
-            if 0 < h < max_h:
-                hold_times.append(h)
-    return hold_times
+# Hold time now comes from scan_common.hold_stats (episode reconstruction over full
+# history; counts still-open positions). The old 30-day Open→Close pairing produced
+# "?" for exactly the longest-hold traders — see scan_common.py for the full writeup.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -148,8 +134,8 @@ async def profile_trader(session, address: str) -> tuple[dict | None, list]:
         win_rate_recent = wr(all_closes[-50:])   # last 50 across full history
 
         streak    = calc_streak(all_closes)
-        hold_list = calc_hold_times(recent30)
-        avg_hold  = sum(hold_list) / len(hold_list) if hold_list else 99.0
+        hs        = hold_stats(fills, now_ms)   # full history, episode-based, incl. open
+        avg_hold  = legacy_avg_hold(hs)
 
         notionals    = [float(f.get("sz", 0)) * float(f.get("px", 0)) for f in recent30 if float(f.get("sz", 0)) > 0]
         avg_notional = sum(notionals) / len(notionals) if notionals else 0
@@ -159,6 +145,13 @@ async def profile_trader(session, address: str) -> tuple[dict | None, list]:
         return {
             "trades_per_day":  trades_per_day,
             "avg_hold_h":      avg_hold,
+            "med_hold_h":      hs["med_closed_h"],
+            "med_open_h":      hs["med_open_h"],
+            "n_open_pos":      hs["n_open"],
+            "pct_intraday":    hs["pct_intraday"],
+            "pct_multiday":    hs["pct_multiday"],
+            "hold_str":        fmt_hold_short(hs),
+            "hold_full":       fmt_hold(hs),
             "win_rate_all":    win_rate_all,
             "win_rate_recent": win_rate_recent,
             "current_streak":  streak,
@@ -326,7 +319,7 @@ def print_summary_table(traders: list[dict], title: str):
     for i, t in enumerate(traders, 1):
         ss   = f"+{t['current_streak']}" if t['current_streak'] > 0 else str(t['current_streak'])
         lh   = f"{t['last_trade_h']:.0f}h ago"
-        hold = f"{t['avg_hold_h']:.1f}h" if t['avg_hold_h'] < 99 else "  ?"
+        hold = t.get('hold_str', '?')
         print(
             f"  {i:<3} {t['address'][:12]+'…':<14} "
             f"${t['alltime_pnl']:>9,.0f} "
@@ -349,7 +342,13 @@ def print_deep_card(i: int, t: dict):
     print(f"\n  ┌─ #{i} {t['address']} ({'score: ' + str(round(t['score'], 4))})")
     print(f"  │  PnL=${t['alltime_pnl']:,.0f}  "
           f"WR-recent={t['win_rate_recent']:.1%}  WR-all={t['win_rate_all']:.1%}  "
-          f"streak={ss}  T/day={t['trades_per_day']:.1f}  hold={t['avg_hold_h']:.1f}h")
+          f"streak={ss}  T/day={t['trades_per_day']:.1f}  hold={t.get('hold_full', '?')}")
+    pi, pm = t.get('pct_intraday'), t.get('pct_multiday')
+    if pi is not None:
+        verdict = ("SCALPER (not copy-able)" if pi >= 0.6
+                   else "SWING (copy-able)" if pm and pm >= 0.5 else "mixed cadence")
+        print(f"  │  cadence: intraday<1h={pi:.0%}  multiday>=24h={pm:.0%}  "
+              f"open_pos={t.get('n_open_pos', 0)}  → {verdict}")
 
     # Weekly consistency
     wc  = dd.get("week_consistency", 0)
@@ -465,7 +464,7 @@ async def main():
                     f"  {flag} {trader['address'][:14]}… "
                     f"WR={profile['win_rate_recent']:.0%} "
                     f"T/d={profile['trades_per_day']:.1f} "
-                    f"hold={profile['avg_hold_h']:.1f}h "
+                    f"hold={profile['hold_str']} "
                     f"streak={ss} "
                     f"score={merged['score']:.4f}"
                 )
@@ -511,6 +510,11 @@ async def main():
             "win_rate_all":       round(t["win_rate_all"], 4),
             "trades_per_day":     round(t["trades_per_day"], 2),
             "avg_hold_h":         round(t["avg_hold_h"], 2),
+            "med_hold_h":         round(t["med_hold_h"], 2) if t.get("med_hold_h") is not None else None,
+            "med_open_h":         round(t["med_open_h"], 2) if t.get("med_open_h") is not None else None,
+            "n_open_pos":         t.get("n_open_pos", 0),
+            "pct_intraday":       round(t["pct_intraday"], 3) if t.get("pct_intraday") is not None else None,
+            "pct_multiday":       round(t["pct_multiday"], 3) if t.get("pct_multiday") is not None else None,
             "current_streak":     t["current_streak"],
             "trades_7d":          t["trades_7d"],
             "last_trade_h":       round(t["last_trade_h"], 1),

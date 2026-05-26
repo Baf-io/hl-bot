@@ -11,23 +11,24 @@ HL_WALLET_ADDRESS   = os.getenv("HL_WALLET_ADDRESS", "")
 HL_PRIVATE_KEY      = os.getenv("HL_PRIVATE_KEY", "")
 HL_TESTNET          = os.getenv("HL_TESTNET", "true").lower() == "true"
 
-# ── Risk limits ── FULL STACK MODE (~$1100 portfolio) ────────────────────────
-# Position sizing: 15% per trade = ~$165 on $1100
-# Max leaderboard slots: 6 × $165 = $990 deployed (90% stack)
-# Remaining 10% = buffer for fees, SL slippage, funding
-MAX_OPEN_POSITIONS      = 12            # global ceiling (leaderboard dominates now)
-MAX_POSITION_SIZE_PCT   = 0.15          # 15% per position (~$165 on $1100)
-DAILY_LOSS_HALT_PCT     = 0.10          # halt at -10% (~$110) — unchanged
+# ── Risk limits ── FULL STACK MODE (~$1120 portfolio) ────────────────────────
+# Per-position cap is on MARGIN: MAX_POSITION_SIZE_PCT × portfolio = max margin/position
+# (e.g. 15% × $1120 = ~$168 margin; at the trader's leverage that's a larger notional).
+MAX_OPEN_POSITIONS      = 12            # global position-count ceiling (copy dominates)
+MAX_POSITION_SIZE_PCT   = 0.15          # 15% of portfolio per position, as MARGIN
+DAILY_LOSS_HALT_PCT     = 0.10          # halt the bot at -10% live-equity drawdown on the day
 MAX_LEVERAGE            = 20
-PORTFOLIO_DELTA_MAX     = 0.95          # near-full directional exposure allowed
+# Net margin-delta cap as a fraction of portfolio. NOTE: 0.95 is intentionally wide —
+# it allows a near-fully directional book (these copied traders are often all-short
+# majors at once). This is a deliberate risk choice, NOT a neutral hedge. Tighten toward
+# ~0.5-0.6 if you want the bot to refuse to stack one-way exposure.
+PORTFOLIO_DELTA_MAX     = 0.95
 MIN_POSITION_NOTIONAL   = 50            # reject signals below $50 notional — not worth a slot
 
-# ── Per-strategy slot caps ────────────────────────────────────────────────────
-# leaderboard: 6 slots × $165 = $990 max (5 whitelisted traders, ~1-2 open each)
-# funding:     1 slot  × $165 = $165 (one carry — avoid fighting copy trades)
-# cascade:     2 slots × $165 = $330 (reduced — leaderboard is primary now)
+# ── Per-strategy slot caps (position COUNT, not dollars) ──────────────────────
+# leaderboard dominates; the rest are kept small so they don't fight the copy book.
 STRATEGY_MAX_POSITIONS = {
-    "leaderboard": 10,   # 4 traders × max 3 each = 12 theoretical; 10 covers 95%
+    "leaderboard": 10,
     "funding":      1,
     "cascade":      2,
     "squeeze":      2,
@@ -49,14 +50,6 @@ FUNDING_EXIT_THRESHOLD    = 0.0001
 FUNDING_MAX_POSITIONS     = 1           # only 1 carry at a time (capital is small)
 
 # ── Leaderboard copy params ──────────────────────────────────────────────────
-COPY_MIN_ACCOUNT_AGE_DAYS = 20
-COPY_MIN_REALIZED_PNL_USD = 50_000
-COPY_MIN_WIN_RATE         = 0.52
-COPY_MAX_DRAWDOWN         = 0.35
-COPY_MAX_AVG_LEVERAGE     = 20
-COPY_MIN_TRADE_COUNT      = 200
-COPY_SIZE_SCALE           = 0.005       # 0.5% of their notional (scales to $100 portfolio)
-COPY_MAX_LAG_MS           = 3000        # (legacy, fill-stream only) unused by state-based reconcile
 # State-based reconcile: poll each trader's NET position this often and mirror only real
 # position changes. Traders hold for days, so 45s latency is irrelevant — and this is what
 # kills the fee-bleeding fill-stream churn (was reacting to every TWAP/trim fill).
@@ -64,18 +57,10 @@ COPY_RECONCILE_INTERVAL_S = 45
 
 # Auto-compound: size off LIVE account equity instead of a frozen PORTFOLIO_USD, so gains
 # roll into bigger positions and drawdowns shrink them. Per-position (15%) + delta caps
-# still bound risk. PORTFOLIO_USD becomes the initial seed only.
+# still bound risk. PORTFOLIO_USD becomes the initial seed only. Independent of the
+# daily-loss halt, which always tracks live equity regardless of this flag.
 PORTFOLIO_COMPOUND = os.getenv("PORTFOLIO_COMPOUND", "true").lower() == "true"
 
-# Trailing-profit exit on copied positions (the traders only buy-and-hold, so this banks
-# gains they'd give back). Arm once a position is +TRAIL_ARM_PCT in price, then exit if it
-# retraces TRAIL_GIVEBACK of its peak run. A trail-exited coin is LOCKED from re-entry until
-# the trader's net position resets (close/flip) — otherwise reconcile would instantly re-buy.
-TRAIL_ENABLED  = os.getenv("TRAIL_ENABLED", "true").lower() == "true"
-TRAIL_ARM_PCT  = 0.08    # only start protecting once +8% in price (a real move)
-TRAIL_GIVEBACK = 0.30    # exit on a 30% retrace from the peak favorable excursion
-COPY_MIN_THEIR_NOTIONAL   = 100         # position-aware tracking handles dedup; $100 = anti-dust
-COPY_MAX_POSITIONS_PER_TRADER = 5       # allow up to 5 (a9b95f has 3, fc667 has 6)
 # Margin-based sizing cap: cap is on MARGIN (not notional).
 # max_notional = (portfolio × MAX_POSITION_SIZE_PCT) × their_leverage
 # e.g. $1120 × 15% × 10x = $1,680 notional — but only $168 of real margin committed.

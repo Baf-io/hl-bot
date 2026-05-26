@@ -5,6 +5,7 @@ Run: python scan_focused.py
 """
 import urllib.request, json, time, sys
 from collections import defaultdict
+from scan_common import hold_stats, fmt_hold_short
 
 HL    = "https://api.hyperliquid.xyz/info"
 STATS = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
@@ -167,20 +168,9 @@ for i, c in enumerate(focused[:30]):
         coin_vol[f.get("coin", "?")] += abs(float(f.get("sz", 0)) * float(f.get("px", 0)))
     top_coins = sorted(coin_vol.items(), key=lambda x: -x[1])[:4]
 
-    opens_m = {}
-    holds   = []
-    for f in r30:
-        coin = f.get("coin", "")
-        d    = str(f.get("dir", ""))
-        ts   = float(f.get("time", 0))
-        cp   = float(f.get("closedPnl", 0))
-        if "Open" in d:
-            opens_m[coin] = ts
-        elif ("Close" in d or cp != 0) and coin in opens_m:
-            h = (ts - opens_m.pop(coin)) / 3_600_000
-            if 0 < h < 720:
-                holds.append(h)
-    avg_hold = sum(holds) / len(holds) if holds else 0
+    hs = hold_stats(fills, now_ms)   # full history, episode-based (incl. open)
+    avg_hold = (hs["mean_closed_h"] if hs["mean_closed_h"] is not None
+                else (hs["med_open_h"] or 0))
 
     streak = 0
     for f in reversed(closes[-50:]):
@@ -205,6 +195,11 @@ for i, c in enumerate(focused[:30]):
         "wr30d":        wr(r30c),
         "streak":       streak,
         "avg_hold":     avg_hold,
+        "hold_str":     fmt_hold_short(hs),
+        "med_hold_h":   hs["med_closed_h"],
+        "med_open_h":   hs["med_open_h"],
+        "pct_intraday": hs["pct_intraday"],
+        "pct_multiday": hs["pct_multiday"],
         "tpd":          round(len(r30) / 30, 1),
         "tpd7":         round(len(r7) / 7, 1),
         "fills_1d":     len(r1),
@@ -233,7 +228,7 @@ for t in results[:18]:
         f"ord={t['n_ord']}  "
         f"uPnL={t['upnl_pct']:+.1f}%  "
         f"WR={t['wr50']:.0%}  "
-        f"hold={t['avg_hold']:.1f}h  "
+        f"hold={t['hold_str']}  "
         f"str={ss}  "
         f"T/d={t['tpd']:.1f}  "
         f"last={t['last_h']:.0f}h"

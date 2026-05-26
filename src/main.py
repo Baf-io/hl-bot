@@ -213,14 +213,21 @@ async def main():
     # ── Position guardian ─────────────────────────────────────────────────────
     # Philosophy: trust the traders we whitelisted.
     #
-    # Primary exits (handled elsewhere):
-    #   • Trader closes their position → leaderboard copier sends exit signal
-    #   • Native SL at -3% on HL exchange → fires even if bot is offline
-    #   • Native TP at +8% on HL exchange → locks in profit automatically
+    # Exit paths, by strategy:
+    #   • COPY trades (leaderboard/synced): NO native exchange-side SL/TP. Native stops
+    #     killed positions that ran +50-80% for weeks, so copies rely entirely on
+    #     (a) the trader's own close/flip → copier emits an exit, and
+    #     (b) this guardian's NUCLEAR backstop below.
+    #   • OWN-SIGNAL trades (cascade/funding): DO get native SL/TP on HL (see
+    #     executor._place_native_sltp — currently -6% SL / +12% TP), which fire even
+    #     if the bot is offline.
     #
-    # Guardian only handles edge cases the above can't catch:
-    #   ZOMBIE  (>12h open) → WebSocket probably missed the trader's close signal
-    #   NUCLEAR (>-10% loss) → SL failed somehow (extreme gap / liquidation cascade)
+    # Account-level protection (all strategies): the risk manager's daily-loss halt
+    # trips on LIVE-equity drawdown (incl. unrealized) vs the day-start baseline.
+    #
+    # Guardian per-position backstops (edge cases the above can't catch):
+    #   ZOMBIE  (>72h open)        → WebSocket probably missed the trader's close signal
+    #   NUCLEAR (>70% margin loss) → a copy SL we never placed; extreme gap / liq cascade
     #
     # We do NOT close on small losses — these traders hold through dips.
     # Cutting them at -1% and watching them recover to +5% is the old mistake.
@@ -239,10 +246,17 @@ async def main():
             await asyncio.sleep(60)   # check every minute — less noise
             now = datetime.now(timezone.utc).replace(tzinfo=None)
 
+            # Trip the daily-loss halt on live-equity drawdown (incl. unrealized), using
+            # the equity fed in by the reconcile loop. Catches buy-and-hold copies bleeding
+            # unrealized losses that never hit the realized-PnL halt in close_position.
+            risk.check_drawdown_halt()
+
             # Phone alert exactly once when the bot transitions into a trading halt
             # (daily loss limit hit → "we're really down and the bot stopped trading").
             if risk._trading_halted and not was_halted:
-                await alerter.halt_alert(risk._daily_pnl / risk.portfolio_value)
+                base = risk._day_start_equity or risk.portfolio_value
+                dd = (risk._live_equity - base) / base if base else 0.0
+                await alerter.halt_alert(dd)
             was_halted = risk._trading_halted
             for pos in list(risk.open_positions):
                 current_price = store.latest_mid(pos.coin)

@@ -19,6 +19,7 @@ Usage:
 """
 import sys, time, json, math, urllib.request, urllib.error
 from collections import defaultdict
+from scan_common import hold_stats, fmt_hold, fmt_hold_short
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -317,21 +318,15 @@ def profile_coin(fills_all, coin, now_ms):
     real_30d = sum(float(f.get("closedPnl", 0)) for f in r30c)
     real_7d  = sum(float(f.get("closedPnl", 0)) for f in r7c)
 
-    # Hold time from paired open/close
-    opens = {}
-    holds = []
-    for f in cf:
-        d  = str(f.get("dir", ""))
-        ts = float(f.get("time", 0))
-        cp = float(f.get("closedPnl", 0))
-        if "Open" in d:
-            opens[coin] = ts
-        elif ("Close" in d or cp != 0) and coin in opens:
-            h = (ts - opens.pop(coin)) / MS_HOUR
-            if MIN_HOLD_MINUTES / 60 < h < 720:
-                holds.append(h)
-    avg_hold = sum(holds) / len(holds) if holds else 0
-    if avg_hold < MIN_HOLD_MINUTES / 60 and len(holds) > 3:
+    # Hold time via episode reconstruction over full history (incl. currently-open
+    # position). med closed-hold and med open-age are reported separately so a
+    # patient holder isn't mistaken for "no data" — see scan_common.py.
+    hs = hold_stats(cf, now_ms, coin)
+    avg_hold = (hs["mean_closed_h"] if hs["mean_closed_h"] is not None
+                else (hs["med_open_h"] or 0))
+    if (hs["mean_closed_h"] is not None
+            and hs["mean_closed_h"] < MIN_HOLD_MINUTES / 60
+            and hs["n_closed"] > 3):
         return None  # pure HFT
 
     # Direction bias (long/short ratio)
@@ -403,6 +398,13 @@ def profile_coin(fills_all, coin, now_ms):
         "real_30d":    real_30d,
         "real_7d":     real_7d,
         "avg_hold_h":  round(avg_hold, 2),
+        "med_hold_h":  round(hs["med_closed_h"], 2) if hs["med_closed_h"] is not None else None,
+        "med_open_h":  round(hs["med_open_h"], 2) if hs["med_open_h"] is not None else None,
+        "n_open":      hs["n_open"],
+        "pct_intraday": round(hs["pct_intraday"], 3) if hs["pct_intraday"] is not None else None,
+        "pct_multiday": round(hs["pct_multiday"], 3) if hs["pct_multiday"] is not None else None,
+        "hold_str":    fmt_hold_short(hs),
+        "hold_full":   fmt_hold(hs),
         "bias":        bias,
         "streak":      streak,
         "mls":         mls,
@@ -540,9 +542,15 @@ for coin in coins_with_results:
               f"acct={fmt_money(r['acct_val'])}{conf}")
         print(f"    WR: 50tr={r['p_wr50']:.0%}  30d={r['p_wr_30d']:.0%}  all={r['p_wr_at']:.0%}"
               f"   R:R={r['p_rr']:.2f}x"
-              f"   hold={r['p_avg_hold_h']:.1f}h"
+              f"   hold={r['p_hold_full']}"
               f"   bias={r['p_bias']}"
               f"   streak={ss}")
+        pi, pm = r.get('p_pct_intraday'), r.get('p_pct_multiday')
+        if pi is not None:
+            verdict = ("SCALPER — not copy-able at 45s reconcile" if pi >= 0.6
+                       else "SWING — copy-able" if pm and pm >= 0.5 else "mixed cadence")
+            print(f"    cadence: intraday<1h={pi:.0%}  multiday>=24h={pm:.0%}  "
+                  f"open_pos={r.get('p_n_open', 0)}  → {verdict}")
         print(f"    PnL: 7d={fmt_money(r['p_real_7d'])}  30d={fmt_money(r['p_real_30d'])}  "
               f"AT={fmt_money(r['p_real_at'])}"
               f"   worst={fmt_money(r['p_worst_trade'])}")
@@ -570,7 +578,7 @@ for r in results[:25]:
     flag = "*" if r["conflict"] else " "
     print(f"  {r['addr'][:16]}{flag} {r['coin']:<6}  {r['score']:>7.4f}  "
           f"{r['p_wr50']:>5.0%}  {r['p_wr_30d']:>5.0%}  {r['p_rr']:>5.2f}  "
-          f"{r['p_avg_hold_h']:>5.1f}h  {r['concentration']:>5.0%}  "
+          f"{r['p_hold_str']:>6}  {r['concentration']:>5.0%}  "
           f"{fmt_money(r['p_real_7d']):>8}  {ss:>7}  {wk:>6}  "
           f"{r['n_pos']:>4}  {r['last_h']:>4.0f}h  {r['p_bias']}")
 print()
@@ -586,7 +594,7 @@ for r in clean[:8]:
     lev = r["open_coins"].get(r["coin"], {}).get("lev", "?")
     print(f"  ADD: {r['addr']}")
     print(f"       Coin: {r['coin']}  Bias: {r['p_bias']}  "
-          f"WR={r['p_wr50']:.0%}  hold={r['p_avg_hold_h']:.1f}h  "
+          f"WR={r['p_wr50']:.0%}  hold={r['p_hold_full']}  "
           f"lev={lev}x  score={r['score']:.4f}")
     print(f"       7d PnL: {fmt_money(r['p_real_7d'])}  "
           f"30d PnL: {fmt_money(r['p_real_30d'])}")
