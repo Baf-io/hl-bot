@@ -2,13 +2,17 @@
 Risk Manager — the only thing standing between you and a blown account.
 NEVER bypass this layer. Every signal passes through here before execution.
 
-Rules enforced:
-  1. Max 5 open positions
-  2. Max 8% portfolio per position
-  3. Portfolio delta-neutral check (max 15% net delta)
-  4. Daily loss halt at -3%
-  5. No 3+ correlated positions simultaneously
-  6. Max leverage cap
+Rules enforced (values live in config/settings.py — do not duplicate them here as
+numbers that rot; these are the knobs):
+  1. Global + per-strategy position-count caps   (MAX_OPEN_POSITIONS / STRATEGY_MAX_POSITIONS)
+  2. Per-position MARGIN cap                       (MAX_POSITION_SIZE_PCT of portfolio)
+  3. Minimum notional floor                        (MIN_POSITION_NOTIONAL)
+  4. Net margin-delta cap                          (PORTFOLIO_DELTA_MAX)
+  5. No 3+ correlated positions simultaneously     (CORRELATION_GROUPS)
+  6. Leverage cap                                  (MAX_LEVERAGE)
+  7. Daily-loss halt                               (DAILY_LOSS_HALT_PCT) — measured on LIVE
+     equity vs the day-start baseline, so it catches UNREALIZED drawdown (these copied
+     buy-and-hold traders rarely realize), not just closed-trade PnL.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, date
@@ -36,7 +40,6 @@ class OpenPosition:
     leverage: float = 1.0       # leverage used — needed for margin-equivalent delta tracking
     opened_at: datetime = field(default_factory=datetime.utcnow)
     unrealized_pnl: float = 0.0
-    peak_price_pct: float = 0.0  # max favorable price excursion seen — for trailing-profit exit
 
 
 class RiskManager:
@@ -47,6 +50,11 @@ class RiskManager:
         self._trading_halted     = False
         self._last_reset_date    = date.today()
         self._position_id_seq    = 0
+        # Live account equity (incl. unrealized), refreshed from HL each reconcile via
+        # update_equity(). The daily-loss halt measures this against the day-start
+        # baseline so it sees unrealized drawdown, not just realized closes.
+        self._live_equity        = portfolio_value_usd
+        self._day_start_equity   = portfolio_value_usd
 
     # ── Daily reset ────────────────────────────────────────────────────────────
 
@@ -57,6 +65,34 @@ class RiskManager:
             self._daily_pnl = 0.0
             self._trading_halted = False
             self._last_reset_date = today
+            # Roll the drawdown baseline to today's opening equity.
+            self._day_start_equity = self._live_equity
+
+    # ── Equity / drawdown halt ───────────────────────────────────────────────────
+
+    def update_equity(self, equity: float):
+        """Feed the latest live account equity (incl. unrealized PnL) from HL."""
+        if equity > 0:
+            self._live_equity = equity
+
+    def check_drawdown_halt(self) -> bool:
+        """
+        Halt trading if live equity has fallen DAILY_LOSS_HALT_PCT below the day-start
+        baseline. Unlike a realized-PnL check, this catches the unrealized drawdown of
+        buy-and-hold copies that may not close for days. Idempotent; safe to call often.
+        """
+        self._check_daily_reset()
+        if self._trading_halted or self._day_start_equity <= 0:
+            return self._trading_halted
+        dd = (self._live_equity - self._day_start_equity) / self._day_start_equity
+        if dd <= -settings.DAILY_LOSS_HALT_PCT:
+            self._trading_halted = True
+            logger.warning(
+                f"[Risk] ⛔ TRADING HALTED — live equity drawdown {dd:.2%} "
+                f"exceeds -{settings.DAILY_LOSS_HALT_PCT:.0%} day limit "
+                f"(equity ${self._live_equity:,.0f} vs start ${self._day_start_equity:,.0f})"
+            )
+        return self._trading_halted
 
     # ── Main gate ──────────────────────────────────────────────────────────────
 
@@ -157,7 +193,10 @@ class RiskManager:
         self._daily_pnl += pnl
         self.open_positions.remove(pos)
 
-        pct = self._daily_pnl / self.portfolio_value
+        # Measure realized day PnL against the day-start baseline (not live equity, which
+        # auto-compound keeps moving — that would make the halt threshold drift).
+        base = self._day_start_equity if self._day_start_equity > 0 else self.portfolio_value
+        pct = self._daily_pnl / base
         logger.info(
             f"[Risk] Closed #{position_id} {pos.coin} | trade PnL=${pnl:+,.2f} "
             f"| day PnL={pct:+.2%}"
@@ -166,7 +205,7 @@ class RiskManager:
         if pct <= -settings.DAILY_LOSS_HALT_PCT:
             self._trading_halted = True
             logger.warning(
-                f"[Risk] ⛔ TRADING HALTED — daily loss {pct:.2%} "
+                f"[Risk] ⛔ TRADING HALTED — realized daily loss {pct:.2%} "
                 f"exceeds -{settings.DAILY_LOSS_HALT_PCT:.0%} limit"
             )
 

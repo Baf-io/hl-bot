@@ -60,7 +60,6 @@ class TrackedTrader:
     trade_count: int
     account_age_days: int
     specialty: Optional[str] = None   # coin this trader is the designated specialist for
-    score: float = 0.0
 
 
 class LeaderboardCopier:
@@ -99,10 +98,6 @@ class LeaderboardCopier:
         # Coins we've already logged as contested — so we log only on change, not every poll.
         self._prev_contested: set[str] = set()
 
-        # Coins we trail-exited → locked from re-entry until the trader's position resets.
-        # coin -> the direction we were in when we trail-exited.
-        self._trail_locked: dict[str, str] = {}
-
     # ── Leaderboard / trader-list loading ───────────────────────────────────────
 
     async def refresh_leaderboard(self):
@@ -121,9 +116,6 @@ class LeaderboardCopier:
                 f"[Leaderboard] Whitelist — {len(raw)} traders: "
                 + ", ".join(a[:10] + "..." for a in settings.COPY_TRADER_WHITELIST)
             )
-
-        for t in raw:
-            t.score = self._score(t)
 
         self._tracked = {t.address: t for t in raw}
 
@@ -195,31 +187,7 @@ class LeaderboardCopier:
 
         self._refresh_done.set()
 
-    # ── Filtering / scoring (unchanged) ─────────────────────────────────────────
-
-    def _passes_filter(self, t: TrackedTrader) -> bool:
-        ok = (
-            t.account_age_days  >= settings.COPY_MIN_ACCOUNT_AGE_DAYS
-            and t.realized_pnl  >= settings.COPY_MIN_REALIZED_PNL_USD
-            and t.win_rate      >= settings.COPY_MIN_WIN_RATE
-            and t.max_drawdown  <= settings.COPY_MAX_DRAWDOWN
-            and t.avg_leverage  <= settings.COPY_MAX_AVG_LEVERAGE
-            and t.trade_count   >= settings.COPY_MIN_TRADE_COUNT
-        )
-        if ok:
-            t.score = self._score(t)
-        return ok
-
-    @staticmethod
-    def _score(t: TrackedTrader) -> float:
-        return (
-            min(t.realized_pnl / 500_000, 1.0) * 0.3
-            + t.win_rate * 0.3
-            + (1 - t.max_drawdown) * 0.2
-            + min(1 / max(t.avg_leverage, 1), 1.0) * 0.2
-        )
-
-    # ── Sizing helper (unchanged margin-based logic) ─────────────────────────────
+    # ── Sizing helper (margin-based) ─────────────────────────────────────────────
 
     def _compute_size(
         self,
@@ -357,14 +325,21 @@ class LeaderboardCopier:
             await self._refresh_account_values()
 
             # Sync our in-memory book with reality FIRST: drop any position closed
-            # outside the bot (manual close, liquidation, native SL/TP). Also auto-compound
-            # sizing off live equity. Both come from one fetch of our wallet state.
+            # outside the bot (manual close, liquidation, native SL/TP). One fetch of our
+            # wallet state gives both the open coins and live account equity.
             actual, equity = await self._fetch_our_state()
             if actual is not None:
                 self.risk.drop_phantoms(actual)
-            if equity and settings.PORTFOLIO_COMPOUND:
-                self._portfolio_usd = equity
-                self.risk.portfolio_value = equity
+            if equity:
+                # Always feed live equity to the risk manager so the daily-loss halt is
+                # drawdown-aware (it measures live equity vs the day-start baseline, which
+                # captures UNREALIZED losses these buy-and-hold traders rarely realize).
+                self.risk.update_equity(equity)
+                # Auto-compound is a separate decision: only resize off live equity when
+                # enabled. PORTFOLIO_USD stays the seed otherwise.
+                if settings.PORTFOLIO_COMPOUND:
+                    self._portfolio_usd = equity
+                    self.risk.portfolio_value = equity
 
             desired = self._build_desired()
 
@@ -374,39 +349,14 @@ class LeaderboardCopier:
                 if p.strategy in ("leaderboard", "synced")
             }
 
-            entries = exits = flips = resizes = trails = 0
+            entries = exits = flips = resizes = 0
 
-            # ── Trailing-profit exits ─────────────────────────────────────────────
-            # The traders only buy-and-hold; this banks gains they'd otherwise give
-            # back. Arm once +TRAIL_ARM_PCT in price, exit on TRAIL_GIVEBACK retrace
-            # from the peak. A trail-exited coin is LOCKED from re-entry until the
-            # trader's position resets — otherwise we'd instantly re-buy and churn.
-            if settings.TRAIL_ENABLED and self.store:
-                for coin, p in list(held.items()):
-                    px = self.store.latest_mid(coin)
-                    if not px or not p.entry_price:
-                        continue
-                    exc = ((px - p.entry_price) / p.entry_price) if p.direction == "long" \
-                          else ((p.entry_price - px) / p.entry_price)
-                    if exc > p.peak_price_pct:
-                        p.peak_price_pct = exc
-                    if (p.peak_price_pct >= settings.TRAIL_ARM_PCT
-                            and exc <= p.peak_price_pct * (1 - settings.TRAIL_GIVEBACK)):
-                        logger.info(
-                            f"[Reconcile] TRAIL EXIT {coin} {p.direction} | "
-                            f"peak +{p.peak_price_pct:.1%} -> now +{exc:.1%}"
-                        )
-                        await self._emit_exit(coin, p.direction, "trail")
-                        self._trail_locked[coin] = p.direction   # lock until trader resets
-                        del held[coin]
-                        trails += 1
-
-            # ── Entries / flips / resizes (respecting trail-lock suppression) ─────
+            # ── Entries / flips / resizes ─────────────────────────────────────────
+            # We mirror the trader and HOLD as long as they hold — no profit-taking
+            # overlay. These are slow macro holders; their edge is the multi-week move,
+            # so banking a small gain and re-entering only churns fees and forfeits the
+            # run. Exits come from the trader closing/flipping or the guardian backstop.
             for coin, d in desired.items():
-                if coin in self._trail_locked:
-                    if self._trail_locked[coin] == d["dir"]:
-                        continue                       # still locked — trader hasn't reset
-                    del self._trail_locked[coin]       # trader flipped — re-arm
                 cur = held.get(coin)
                 if cur is None:
                     await self._emit_entry(coin, d)
@@ -433,16 +383,11 @@ class LeaderboardCopier:
                     await self._emit_exit(coin, p.direction, "trader_closed")
                     exits += 1
 
-            # Re-arm trail-locks once the trader no longer holds the coin
-            for coin in list(self._trail_locked):
-                if coin not in desired:
-                    del self._trail_locked[coin]
-
-            if entries or exits or flips or resizes or trails:
+            if entries or exits or flips or resizes:
                 logger.info(
                     f"[Reconcile] desired={len(desired)} held={len(held)} | "
                     f"+{entries} entries, {exits} exits, {flips} flips, "
-                    f"{resizes} resizes, {trails} trails"
+                    f"{resizes} resizes"
                 )
             else:
                 logger.debug(
@@ -552,38 +497,4 @@ class LeaderboardCopier:
                 address=addr, realized_pnl=pnl, win_rate=wr, max_drawdown=dd,
                 avg_leverage=lev, trade_count=tc, account_age_days=age, specialty=spec,
             ))
-        return traders
-
-    @staticmethod
-    def _parse_leaderboard(data) -> list[TrackedTrader]:
-        traders = []
-        rows = data if isinstance(data, list) else data.get("leaderboardRows", [])
-        for entry in rows:
-            try:
-                perfs = entry.get("windowPerformances", [])
-                stats = {}
-                for window, s in perfs:
-                    if window == "allTime":
-                        stats = s
-                        break
-                if not stats and perfs:
-                    stats = perfs[0][1] if isinstance(perfs[0], list) else {}
-
-                pnl      = float(stats.get("pnl", entry.get("pnl", 0)))
-                win_rate = float(stats.get("winRate", 0.5))
-                drawdown = float(stats.get("maxDrawdown", entry.get("maxDrawdown", 0.5)))
-                leverage = float(stats.get("avgLeverage", entry.get("avgLeverage", 5)))
-                trades   = int(stats.get("tradeCount", entry.get("tradeCount", 0)))
-                age      = int(entry.get("accountAgeDays", 30))
-                address  = entry.get("ethAddress", entry.get("user", ""))
-                if not address:
-                    continue
-                traders.append(TrackedTrader(
-                    address=address, realized_pnl=pnl, win_rate=win_rate,
-                    max_drawdown=abs(drawdown), avg_leverage=leverage,
-                    trade_count=trades, account_age_days=age,
-                ))
-            except Exception as e:
-                logger.debug(f"[Leaderboard] Parse skip: {e}")
-                continue
         return traders

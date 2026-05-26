@@ -62,9 +62,9 @@ class Executor:
         On startup: fetch real open positions from Hyperliquid and populate
         the risk manager. Prevents opening duplicate positions after bot restarts.
 
-        Dust positions (< $30 notional) are closed immediately — they are artefacts
-        of a previous low PORTFOLIO_USD setting and would block correctly-sized
-        backfill entries for the same coin.
+        Dust positions (< _MIN_SYNC_SIZE_USD notional, currently $50) are closed
+        immediately — they are artefacts of a previous low PORTFOLIO_USD setting and
+        would block correctly-sized backfill entries for the same coin.
         """
         try:
             state = self._info.user_state(settings.HL_WALLET_ADDRESS)

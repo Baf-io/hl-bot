@@ -31,7 +31,11 @@ Runs 24/7 on a Linux VPS as `hl-bot.service`.
 - **Active traders:** fc667, a9b95f (generalists); 42b6d9→ZEC, 6bea81→SOL, a4dedd→LIT (specialists via `specialty` in traders.json)
 - **COPY_TRADER_WHITELIST:** must be empty in .env — traders.json is the source
 - **Copy model:** STATE-BASED. `reconcile()` (every `COPY_RECONCILE_INTERVAL_S=45s`) rebuilds each trader's net `clearinghouseState`, prunes phantom held positions vs OUR live HL state (`drop_phantoms`), builds a desired portfolio (specialist routing, skip contested coins, highest-conviction holder), diffs vs held, mirrors net changes incl. RESIZE of under-sized holdings. NOT fill-driven.
-- **Sizing:** margin-based proportional; `COPY_MIN_MARGIN_PCT=0.03` (~$34 floor, no dust); `MIN_POSITION_NOTIONAL=50`; `COPY_MAX_COPY_LEVERAGE=10`
+- **Sizing:** margin-based proportional; `COPY_MIN_MARGIN_PCT=0.03` (~$34 floor, no dust); `MIN_POSITION_NOTIONAL=50`; `COPY_MAX_COPY_LEVERAGE=10`. Auto-compound (`PORTFOLIO_COMPOUND=true`) sizes off live equity.
+- **No profit-taking overlay:** copies HOLD as long as the trader holds. NO trailing-profit exit (removed — banked +5.6% and locked us out of multi-week runs, the exact mistake this bot exists to avoid). Exits come only from trader close/flip or the guardian.
+- **Stops:** copy trades have NO native exchange-side SL/TP (native stops killed runners). Backstops = guardian NUCLEAR (>70% margin loss) + account-level daily-loss halt. Only own-signal strategies (cascade/funding) get native -6%/+12% SL/TP.
+- **Daily-loss halt:** trips on LIVE-equity drawdown (incl. unrealized) vs the day-start baseline; `DAILY_LOSS_HALT_PCT=0.10`. Reconcile feeds equity via `risk.update_equity`; guardian calls `risk.check_drawdown_halt()` each minute.
+- **Net-delta cap:** `PORTFOLIO_DELTA_MAX=0.95` — intentionally wide (book can go near-fully one-way). Deliberate, not a hedge; tighten to ~0.5-0.6 to forbid stacking one-way exposure.
 - **Alerts:** Telegram + ntfy phone push (`NTFY_TOPIC` in .env) — high-signal ONLY (halt / guardian force-close / daily summary), never per-trade.
 
 ---
@@ -45,6 +49,7 @@ Runs 24/7 on a Linux VPS as `hl-bot.service`.
 6. Leverage read from `signal.meta["leverage"]`, never hardcoded. `_sync_positions_from_hl` runs at startup before first reconcile.
 7. Exit signal `direction` = the side WE HOLD (the one being closed), NOT the offsetting side. Guardian/flip/close all follow this; `_close_position` matches on it.
 8. Closes go through `_place_market_close` (reduce-only `market_close`) + `_parse_fill` — never `market_open`, never trust bare `status=="ok"`. A failed close leaves the position in the tracker.
+9. NO profit-taking / trailing-exit overlay on copies. We HOLD what the trader holds; a trailing exit banks small gains and forfeits the multi-week move (and any re-entry lock strands us out). Exits come only from trader close/flip or the guardian. Don't reintroduce it.
 
 ---
 
@@ -68,6 +73,7 @@ our_notional    = our_margin × their_lev
 ---
 
 ## Fix log (newest first, keep last 10)
+- `local` Conflict cleanup: REMOVED trailing-profit exit + trail-lock (was cutting winners at +5.6% and locking us out of multi-week runs — undid the copy thesis). Daily-loss halt now tracks LIVE-equity drawdown incl. unrealized (`update_equity`/`check_drawdown_halt`) instead of realized-only. Fixed false "-3%/+8% native stop" guardian comment (copies have no native stop). Corrected stale risk-manager docstring + settings comments. Removed dead config (TRAIL_*, COPY_SIZE_SCALE, COPY_MAX_LAG_MS, filter consts) + dead `_passes_filter`/`_score`/`_parse_leaderboard`.
 - `637ed6e` reconcile prunes phantom positions vs OUR live HL state (`drop_phantoms`) — fixes ghosts left by manual close/liquidation/SL-TP. Raise `COPY_MIN_MARGIN_PCT` 0.01→0.03 (no $15 dust trades).
 - `8140e87` synced positions now carry real leverage (notional/marginUsed); was defaulting lev=1.0 → full notional counted as margin-delta → delta limit spuriously blocked entries after restarts.
 - `a2b3804` ntfy phone alerts, high-signal only (halt / force-close / daily summary).
@@ -77,9 +83,6 @@ our_notional    = our_margin × their_lev
 - `ce54c96` Add margin floor `COPY_MIN_MARGIN_PCT` + fix orphaned dust if market_close fails
 - `2665b56` Skip dust coins entirely (return 0.0 from _compute_size) instead of flooring
 - `7c8a8f1` MIN_POSITION_NOTIONAL=50 backstop in risk manager + executor dust cleanup
-- `b5a08ef` asyncio.Event for backfill sync (killed sleep race); dust close on startup
-- `5ed2e66` 5-trader whitelist; traders.json path fix; full addresses (lookup script used)
-- `b7ae1db` Margin-based sizing (was notional-based — wrong at high leverage)
 
 ---
 
