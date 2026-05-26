@@ -3,6 +3,7 @@ scan_elite.py — one-shot elite trader scanner
 Run: python scan_elite.py
 """
 import urllib.request, urllib.error, json, time, sys
+from scan_common import hold_stats, fmt_hold_short
 
 HL    = "https://api.hyperliquid.xyz/info"
 STATS = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
@@ -85,20 +86,8 @@ def profile(addr):
         else:
             break
 
-    # hold times
-    opens = {}
-    holds = []
-    for f in r30:
-        coin = f.get("coin", "")
-        d    = str(f.get("dir", ""))
-        ts   = float(f.get("time", 0))
-        cp   = float(f.get("closedPnl", 0))
-        if "Open" in d or (cp == 0 and "Close" not in d):
-            opens[coin] = ts
-        elif ("Close" in d or cp != 0) and coin in opens:
-            h = (ts - opens.pop(coin)) / 3_600_000
-            if 0 < h < 168:
-                holds.append(h)
+    # hold times — episode reconstruction over full history (incl. open positions)
+    hs = hold_stats(fills, now_ms)
 
     # max concurrent
     oc = {}
@@ -158,7 +147,12 @@ def profile(addr):
         "tpd":    round(len(r30) / 30, 1),
         "tpd_7d": round(len(r7) / 7, 1),
         "tpd_1d": len(r1),
-        "hold":   round(sum(holds) / len(holds), 1) if holds else 99,
+        "hold":   round(hs["mean_closed_h"], 1) if hs["mean_closed_h"] is not None else (round(hs["med_open_h"], 1) if hs["med_open_h"] is not None else 99),
+        "hold_str": fmt_hold_short(hs),
+        "med_hold_h": hs["med_closed_h"],
+        "med_open_h": hs["med_open_h"],
+        "pct_intraday": hs["pct_intraday"],
+        "pct_multiday": hs["pct_multiday"],
         "max_c":  max(snaps) if snaps else 0,
         "avg_c":  round(sum(snaps) / len(snaps), 1) if snaps else 0,
         "pw":     pw,
@@ -190,7 +184,7 @@ def print_row(i_tag, t):
         f"  {i_tag:<6} {t['addr'][:12]}..  ${t['pnl']/1e6:5.1f}M"
         f"  WR={t['wr50']:.0%}/{t['wr_all']:.0%}"
         f"  T/d={t['tpd']:4.1f}({t['tpd_7d']:3.1f})"
-        f"  hold={t['hold']:4.1f}h"
+        f"  hold={t['hold_str']:>5}"
         f"  str={ss:>4}"
         f"  conc={t['avg_c']:.0f}/{t['max_c']}"
         f"  {wc}"
