@@ -547,8 +547,8 @@ for coin in coins_with_results:
               f"   streak={ss}")
         pi, pm = r.get('p_pct_intraday'), r.get('p_pct_multiday')
         if pi is not None:
-            verdict = ("SCALPER — not copy-able at 45s reconcile" if pi >= 0.6
-                       else "SWING — copy-able" if pm and pm >= 0.5 else "mixed cadence")
+            verdict = ("SCALPER" if pi >= 0.6
+                       else "SWING" if pm and pm >= 0.5 else "MIXED")
             print(f"    cadence: intraday<1h={pi:.0%}  multiday>=24h={pm:.0%}  "
                   f"open_pos={r.get('p_n_open', 0)}  → {verdict}")
         print(f"    PnL: 7d={fmt_money(r['p_real_7d'])}  30d={fmt_money(r['p_real_30d'])}  "

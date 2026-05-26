@@ -345,8 +345,8 @@ def print_deep_card(i: int, t: dict):
           f"streak={ss}  T/day={t['trades_per_day']:.1f}  hold={t.get('hold_full', '?')}")
     pi, pm = t.get('pct_intraday'), t.get('pct_multiday')
     if pi is not None:
-        verdict = ("SCALPER (not copy-able)" if pi >= 0.6
-                   else "SWING (copy-able)" if pm and pm >= 0.5 else "mixed cadence")
+        verdict = ("SCALPER" if pi >= 0.6
+                   else "SWING" if pm and pm >= 0.5 else "MIXED")
         print(f"  │  cadence: intraday<1h={pi:.0%}  multiday>=24h={pm:.0%}  "
               f"open_pos={t.get('n_open_pos', 0)}  → {verdict}")
 
