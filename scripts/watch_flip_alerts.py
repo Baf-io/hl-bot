@@ -44,9 +44,12 @@ def push(title, msg, tags="bell", prio="high"):
     if not TOPIC:
         print(f"  [no NTFY] {title}: {msg}", flush=True); return
     try:
+        # HTTP headers are latin-1 only — strip emojis from title (the Tags header
+        # renders them on-phone via ntfy's tag→emoji map). Body is UTF-8 safe.
+        ascii_title = title.encode("ascii", "ignore").decode("ascii").strip() or "Alert"
         requests.post(f"https://ntfy.sh/{TOPIC}", data=msg.encode(),
-                      headers={"Title": title, "Priority": prio, "Tags": tags}, timeout=10)
-        print(f"  PUSHED: {title}", flush=True)
+                      headers={"Title": ascii_title, "Priority": prio, "Tags": tags}, timeout=10)
+        print(f"  PUSHED: {ascii_title}", flush=True)
     except Exception as e:
         print(f"  push fail: {e}", flush=True)
 
