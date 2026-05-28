@@ -589,6 +589,15 @@ class Executor:
             logger.warning(f"[Executor] SL/TP placement failed for {coin}: {e} — guardian will cover")
 
     async def _get_mid_price(self, coin: str) -> float | None:
+        # ms-tier: prefer the WS-streamed cached mid (updated every allMids tick) over a
+        # synchronous all_mids() HTTP fetch (~80-150ms HL round-trip). Falls back to the
+        # API only if WS hasn't seen a tick for this coin yet (rare; happens within
+        # seconds of startup or for very illiquid coins).
+        store = getattr(getattr(self, "risk", None), "store", None)
+        if store is not None:
+            cached = store.latest_mid(coin)
+            if cached is not None and cached > 0:
+                return float(cached)
         if not self._info:
             return None
         try:
