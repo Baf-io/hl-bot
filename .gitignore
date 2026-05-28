@@ -1,6 +1,8 @@
 # Secrets — NEVER commit
 .env
 *.env
+.env.bak.*
+config/*.bak.*
 config/secrets.py
 private_key.txt
 wallet.json

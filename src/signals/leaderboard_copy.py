@@ -480,10 +480,8 @@ class LeaderboardCopier:
         # ── Stage 2: weighted fixed-per-position sizing off the copy budget ──────
         if not chosen:
             return {}
-        # Copy budget = equity − tracker reserve (isolated sleeve gets its margin first).
-        reserve = (settings.TRACKER_MARGIN_USD * len(settings.TRACKER_COINS)
-                   if settings.TRACKER_ENABLED else 0.0)
-        budget = max(self._portfolio_usd - reserve, 0.0)
+        # Copy budget = equity (tracker reserve removed 2026-05-28 with lev-tracker).
+        budget = max(self._portfolio_usd, 0.0)
         desired: dict[str, dict] = {}
         for coin, (addr, direction, lev) in chosen.items():
             weight = self._tracked[addr].weight if addr in self._tracked else 1.0
@@ -664,8 +662,7 @@ class LeaderboardCopier:
 
             # ── BUY-WHEN-THEY-ADD (trend-confirmed): scale IN if held, OPEN if flat (the "repeat") ──
             if settings.ADD_MIRROR_ENABLED:
-                budget = max(self._portfolio_usd - (settings.TRACKER_MARGIN_USD * len(settings.TRACKER_COINS)
-                             if settings.TRACKER_ENABLED else 0.0), 0.0)
+                budget = max(self._portfolio_usd, 0.0)
                 cap_margin = budget * settings.MAX_POSITION_SIZE_PCT
                 for coin, d in desired.items():
                     src = d["source"]

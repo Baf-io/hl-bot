@@ -1,115 +1,91 @@
 # HL-Bot Agent Briefing
 
-> **Agent self-maintenance rule:** After every fix, update this file:
-> - Move resolved bugs from "Open issues" to "Fix log" (one line each, keep last 10)
-> - Update "Current state" section to reflect what's actually deployed
-> - Delete stale context — this file must stay under ~120 lines
+> **Self-maintenance rule:** after every fix, move resolved bugs from "Open issues" → "Fix log" (keep last 10), update "Current state" to reflect what's actually deployed, delete stale context. This file must stay under ~120 lines.
 
 ---
 
 ## What this bot does
-Hyperliquid perp trading bot. FULL ACTIVE-SWING profile: copies 3 weighted, two-sided
-GENERALIST swing traders (fresh-entry-only, ride-with-trader), plus a walled-off isolated
-BTC tracker (78aa). User can hand-manage coins via MANUAL_COINS. Runs 24/7 on a Linux VPS
-as `hl-bot.service`.
+Hyperliquid perp trading **infrastructure**. The model is **sleeve-copy on subaccounts** (each smart-money source mirrored on its own isolated sub) + **discretionary trading on MAIN** (user-owned, hands-off from any bot signal) + **alerts/watchdogs** + a **paper-validated leaderboard shadow**. All processes are independent systemd services so a single failure only takes down its own sleeve. Runs 24/7 on a Linux VPS.
 
 ---
 
-## Architecture (one line per file)
-| File | Role |
+## Architecture (one file per role)
+| Path | Role |
 |---|---|
-| `src/main.py` | Wiring, scheduler, guardian loop |
-| `src/signals/leaderboard_copy.py` | Copy engine: STATE-BASED reconcile (polls trader net positions), specialist routing, sizing |
-| `src/execution/executor.py` | Order placement, startup position sync |
-| `src/risk/manager.py` | Risk gating (one-per-coin, margin/notional caps) |
-| `config/settings.py` | All tunable constants |
-| `config/traders.json` | Whitelisted traders + per-trader `weight` (+ optional `specialty` pin). Re-read live every 5min |
+| `scripts/watch_swing_sleeve.py` | Sleeve engine: env-parametrized, mirrors ONE trader's direction on a sub (`vault_address` routing), fresh-entry-only, dead-man stop, daily kill-switch. One systemd service per source. |
+| `scripts/watch_flip_alerts.py` | Cohort-flip detector: ntfy when ≥N high-trust sources rotate same direction on same coin in a window. |
+| `scripts/watch_pos_alert.py` | Single-trade watchdog: ntfy on limit-fill + escalating adverse-move ladder; auto-disarm. |
+| `scripts/watch_btc_alert.py` | BTC range ntfy. |
+| `scripts/tracker_scan.py` | Change-triggered findings log (HL+Pyth free layer). |
+| `scripts/shadow_*.py` | Paper-validate candidate sources without capital. |
+| `scripts/trust_forensic.py` | Consistency-first forensic vetting (script is the spec — read before adding sources). |
+| `scripts/{candidate,contestant,deep,drift,hft,intraday,jupperp,regime,solana}_scan.py` + `forensic_worker.py` | Research/scan toolkit feeding `data/research2/COPYABLE_DB.md`. |
+| `src/main.py` | `hl-bot.service`: leaderboard-copy in SHADOW + brain intake server (B4) + position guardian. NO live MAIN trading signals here. |
+| `src/signals/leaderboard_copy.py` | State-based reconcile of the multi-source roster (SHADOW only). |
+| `src/execution/{executor,intake}.py` | Order placement + HMAC brain-signal receiver. |
+| `src/risk/manager.py` | Risk gating for intake-driven orders (probe-only until KEEP). |
+| `src/tracker/prices.py` | Pyth price layer (used by scanners). |
+| `config/traders.json` | Roster of 12 weighted traders (read live every 5min by leaderboard). |
+| `config/settings.py` | All tunables. |
+| `data/research2/COPYABLE_DB.md` | Canonical vet-passed source list. |
+| `research/` | Cross-agent handoffs (scanner agent → me). |
 
 ---
 
 ## Current state (update after each deploy)
-- **★ LATEST (2026-05-28 PM) — DOWNSIDE RETIRED, ALL CAPITAL → LEAD 0x77998579 SLEEVE @ 4x/40% ($484):** User consolidated after a forensic re-run showed `0x77998579` is the **highest-trust source ever vetted** (score **66.2**, beats Downside 52.2): 100% WR on 24 closed round-trips, WR-by-third 88→100→100 (improving), maxDD $0, 12% martingale, 88% taker, Sharpe 0.51. All 4 whale alternatives ($2.68M `0x99967871`, $265k `0x739c52c1`, roster vets `0x99df385a`/`0x807ddb66`/`0x3093189b`/`0xeb47e64c`) FAILED gates (one-trade-dep / 40x lev / 63% martingale / -$250k blowup day / sporadic 138d gaps) — see [[whales-fail-trust-gate]]. User moved Downside sub's $232 → Sub Baf, total Sub Baf $483.72. **`hl-downside-sleeve` STOPPED + DISABLED** (Downside sub $0.01). **ONLY LIVE SLEEVE: `hl-77998579-sleeve`** on Sub Baf `0xdac952c2ff2dfd0275baf6c972a7cb6b50142246`, bar-for-bar mirror BTC+ETH only (his entire 90d universe), `MAX_CONCURRENT=3` (practically 2; he never runs 3), **4x iso**, **`MARGIN_PCT=0.40`** (bumped from 0.30 to deploy full $485) → **$773/leg notional, $193 margin, $93 stop-loss**; `STOP_PCT=0.12` dead-man (backtest: never hit — exits via his flips); `HALT_USD=$50/d`; fresh-entry-only, baseline-seeded BTC -13.1 + ETH -74.1 (NOT adopted, rule #9). **30d backtest at $250 sim: 18 round-trips, 72% WR, +19.7%** (his ETH-flipper cadence ~1/2d + patient BTC swing). Realistic post-slippage: +12-18%/mo, ~2× the $ figures at the new $773/leg. **Shadows still live:** `hl-shadow-downside`, `hl-shadow-2385`, `hl-shadow-scan` (paper only, no capital). **`hl-btc-alert`** = ntfy on BTC <$74k/>$78k. **`hl-flip-alerts` 🆕** = ntfy push when ≥2 of 11 high-trust sources rotate same direction on same coin (BTC/ETH/SOL/HYPE) within 6h window — cohort-flip detector for regime turns. Sub-routing FIXED (`vault_address`, rule #10). 78aa tracker disabled. Manage: `systemctl {status,stop} hl-77998579-sleeve|hl-flip-alerts`. See [[lead-77998579-sleeve]], [[whales-fail-trust-gate]], [[flip-alerts-service]].
-- **⚠️ RISK-POLICY-CONTRACT CLAMP ACTIVE (2026-05-25, commit `93207a8`):** hard limits override everything below — **≤3x, MAX 1 open position, kill-switch −3%/day & −5%/week, NO averaging (adds rejected), PROBE-only (≤$50 notional/≤$5 risk) until a source is KEEP-validated, 40x tracker OFF, funding/cascade OFF.** Book FLATTENED to comply. The aggressive active-swing/scalp/add-mirror/tracker machinery below is SUSPENDED by the clamp (constants still present, gated off). **B progress — ALL LIVE:** ✅B1 native per-order stops, EYES-ON-BOOK verified (`_place_protective_stop` places at the brain's explicit `stop_px` else `COPY_SL_PCT`, then RE-QUERIES `open_orders` for the acked oid — an order that ACKs but isn't resting = FAILURE → force-close; brain entries get ONLY this stop + TTL, NO legacy SL/TP). ✅B2 stop-derived sizing — LIVE entries sized by US: `notional = RISK_PER_TRADE_PCT(1%)×equity / stop_dist`, cap 3x (brain's `size_notional` IGNORED for live; probe keeps ≤$50). ✅B3 KEEP/WATCH/PROBE tiering — `KEEP_SOURCES` (.env) unlocks `mode=live`; non-KEEP → probe-only. **The BRAIN owns the graduation gate: it only emits `mode=probe` for WATCH sources (EmberCN, OnchainLens) — `mode=live` is reserved for sources IT promotes to KEEP. So KEEP_SOURCES stays EMPTY on my side until the brain graduates one (don't pre-graduate — it desyncs the gate).** ✅B4 two-box transport: **LXC-Claude X-scraper brain (node `bafscrape-1`/100.93.122.60) → HMAC-SHA256-signed POST → `src/execution/intake.py` on me (100.115.113.91:8787) → I re-verify sig + idempotency + EVERY cardinal independently.** `INTAKE_ACK_ONLY=false`=live. Lifecycle (entry+stop+TTL) owned by executor/guardian. **Stop-verification echo:** executor records per-`signal_id` fill+stop status; brain polls `GET /status/{sid}` for `stop_resting:true`+oid/px (don't trust bare "accepted"). **Leaderboard copy → SHADOW (paper, `COPY_SHADOW=true`).**
-- **Portfolio:** $1120 USDC (PORTFOLIO_USD=1120 in VPS .env)
-- **Main wallet (hands-off from bot, 2026-05-28 18:30 snapshot):** equity **$705.80, FLAT** (no positions, no orders). User has been actively intraday-scalping BTC through the $72-74k range over the last 48h — best trade +$122 (BTC short 0.31385 @ $73,210 → closed $72,820 on 05-28 13:37); worst recent −$52 on BTC shorts squeezed during the 16:35-18:08 bounce. The "manual clamp-override BTC long @ $77,277" from 2026-05-25 was closed/flipped on 05-26 16:14. Bot does NOT touch main; treat main as user-discretion intraday book.
-- **78aa BTC tracker — DISABLED (CLAUDE.md history retained for context):** the autonomous proportional-mirror service `hl-78aa-tracker.service` was disabled along with the manual clamp-override BTC long (closed 05-26 16:14). 78aa is still being WATCHED as a signal source via `hl-tracker-scan` (findings logged when his BTC size changes) and via `hl-flip-alerts` (cohort-flip detector). Latest tracker reading **2026-05-28 18:24 UTC: 78aa BTC 1.0 → 1.5** — he added MORE long at $73.5k (intraday pattern: 0→1→3→1→1.5, accumulating into the dip). If we want to re-mirror him on a sub, the `watch_scale_mirror.py` script is still in tree but `hl-78aa-tracker.service` is stopped.
-- **Active traders (2026-05-25 → FULL ACTIVE-SWING pivot):** 3 weighted GENERALISTS (multi-coin, two-sided, perp-durable, deep-vetted ORGANIC): `0xf83858`(wt 1.0, 19-coin diversified), `0x41829013`(wt 0.6, multi-wallet fund — trimmed), `0x69b05701`(wt 0.4, HYPE-beta — least). Plus 78aa→BTC tracker. DROPPED the conviction-HODLERS feec88(SOL)/a9b95f(HYPE) — they never trim, incompatible w/ fresh-entry. (Earlier drops: fc667, 4f7634, a4dedd.)
-- **MANUAL_COINS (now `{}` — HYPE unblocked 2026-05-25 when user closed his manual short):** coins the USER trades by hand — copier skips them (`COPIER_SKIP_COINS = TRACKER_COINS|MANUAL_COINS`, currently just `{BTC}`). Set `MANUAL_COINS=HYPE,...` to hand-manage a coin again.
-- **⚠️ TWO SWING COPY SLEEVES — LIVE on sub-accounts (2026-05-26, walled off):** durable multi-day SWING traders mirrored DIRECTION-only on isolated subs (copy-lag-tolerant; the corrected thesis — copy SWING, not fast round-trippers). Both run `scripts/watch_swing_sleeve.py` (env-parametrized), fresh-entry-only (baseline-seed his current pos = no stale adopt; enter on his next add/flip, exit on his flat/flip), dead-man 8% reduce-only stop + daily realized kill-switch, walled off from `hl-bot.service`. (1) **`hl-807-sleeve`** = static seat (wt 0.75): mirror `0x807ddb66` BTC+HYPE on **Sub Baf** `0xdac9…2246` ($300, MARGIN_PCT 0.35, 3x, halt $45/d). (2) **`hl-95bfa-sleeve`** = dynamic seat (wt 0.25): mirror `0x95bfa1c0` BTC on new sub **"SwingDyn"** `0x57e8b2f2…a673` ($100, MARGIN_PCT 0.45, 3x, halt $20/d). Both armed/baseline-seeded (sources net-SHORT → not adopted; awaiting next fresh move). Weight = capital split. 26fe test (`hl-26fe-sleeve`) stopped+disabled, Sub Baf repurposed. See [[two-swing-sleeves-plan]]. Manage: `systemctl {status,stop} hl-807-sleeve|hl-95bfa-sleeve`.
-- **⚠️ VAULT COPY SLEEVE — Akka Hyper AI, LIVE on sub (2026-05-27, walled off):** `scripts/vault_scan.py` screens the full HL vault leaderboard (~9.5k vaults) CONSISTENCY-FIRST (cheap `pnls.allTime`-curve pre-screen → 67, then full `trust_forensic` deep-screen on top 35). **Only 2 passed all gates** (martingale/DD>40%/concentration>30%/sporadic/stale): **Akka Hyper AI** (`0x0e008684…`, score 40.4 — disciplined, WR improving, simple BTC/ETH/BNB book) → **SLEEVED**; **[A] Downside** (`0x4af52283…`, score 52.2 — but WR degrading + 6-leg 5-10x alt basket) → **SHADOWED only**. `hl-akka-sleeve` (`watch_swing_sleeve.py`, env `SLEEVE_NAME=akka`) mirrors Akka's DIRECTION on sub **AkkaVault** `0xb3df35c5…a9` ($150, MARGIN_PCT 0.30, 3x isolated, halt $25/d, coins BTC,ETH,BNB), fresh-entry-only (baseline-seeded, his BTC long NOT adopted — awaiting next fresh move). `hl-shadow-downside` (`scripts/shadow_sleeve.py`, paper, ALL coins) still validates Downside's full alt book. **Downside LIVE test (2026-05-27, user): `hl-downside-sleeve` — ONE-SLOT fresh-entry on his LIQUID MAJORS only** (BTC/ETH/SOL/HYPE/NEAR/DOGE), DownsideTest sub `0x6991c560…` ($100, MARGIN_PCT 0.80 → ~$240 notional concentrated on ONE position, 3x isolated, halt $25/d, `SLEEVE_MAX_CONCURRENT=1`). Rationale: he's solo-on-a-major 54% of the time (max 3 concurrent), and $100 is better as one position than divided. Baseline-seeded (his NEAR hold NOT adopted). Screen correctly REJECTED FuturAI Labs (b65d's vault). See [[vault-scan-trustworthy-automation]]. **Sub-routing FIXED (`vault_address=SUB`, rule #10) + subs funded to PERP (user did spot→perp).** Manage: `systemctl {status,stop} hl-akka-sleeve|hl-downside-sleeve|hl-807-sleeve|hl-95bfa-sleeve|hl-shadow-downside`.
-- **Tracker findings log (2026-05-26):** `hl-tracker-scan.service` (`scripts/tracker_scan.py`, free HL+Pyth, poll 15m) appends to `data/tracker_findings.md` ONLY on change (78aa moves / candidate opens-closes / shadow round-trip / our-book change) + 12h heartbeat. Prices via Pyth Hermes (`src/tracker/prices.py`, keyless, crypto+equities). Etherscan/Nansen layers pending keys in `.env`. `journalctl -u hl-tracker-scan -f`.
-- **Shadow-scan validation (2026-05-25):** `hl-shadow-scan.service` (`scripts/shadow_candidates.py`, paper-only, poll 60s) tracks 5 leaderboard scan candidates ([[durable-twosided-traders]]: ca41/2c5d/78dc/36f2/05c6) — records their FRESH round-trips out-of-sample (current holds seeded as baseline, NOT scored), per-trader cum return%/WR, state in `data/shadow_scan_state.json`. Validates before any live exposure. `journalctl -u hl-shadow-scan -f`.
-- **COPY_TRADER_WHITELIST:** must be empty in .env — traders.json is the source
-- **Copy model:** STATE-BASED. `reconcile()` (every `COPY_RECONCILE_INTERVAL_S=45s`) rebuilds each trader's net `clearinghouseState`, prunes phantoms vs OUR live HL state (`drop_phantoms`), builds desired portfolio (specialist routing, skip contested, highest-conviction holder), diffs vs held, mirrors net changes. NOT fill-driven. **FRESH-ENTRY-ONLY (`FRESH_ENTRY_ONLY=true`, Stage 2 / zero-copy-lag):** only OPEN on a trader's observed flat→position/flip transition AND within `FRESH_ENTRY_MAX_ATR=0.5`×ATR of their open price; NEVER adopt a position they already hold (stale adoption at a worse price was the copy-lag leak — ETH −$15.61 / SOL −3% vs his +74%). First poll after restart = baseline only; a newly-ADDED trader (roster change/live `traders.json` reload) also seeds to baseline — their existing holds are NOT treated as fresh (this bug once auto-opened an unwanted ETH short on a mid-run reload). (`_detect_fresh_opens`/`_is_fresh_entry`; legacy debounce kept for `FRESH_ENTRY_ONLY=false`.) NOTE: the running bot re-reads `traders.json` every 5 min, so roster edits go LIVE without a restart. **RESIZE close-and-reopen DISABLED (`RESIZE_ENABLED=false`)** — locked running losses + double fees (−$79 of the first −$133); positions ride at entry size until a real exit/flip/stop.
-- **Sizing (weighted, fixed-per-position):** each pos = `COPY_POSITION_PCT=0.12` of the COPY BUDGET × the source trader's `weight`, capped `MAX_POSITION_SIZE_PCT=0.15`. **Copy budget = equity − tracker reserve** (`TRACKER_MARGIN_USD×|TRACKER_COINS|`) so the isolated sleeve & copy book never fight for margin. Fixed-per-position (NOT ÷n) so many-coin generalists don't shrink to dust; book bounded by `MAX_OPEN_POSITIONS` + risk caps (graceful, no wall). Gate `COPY_MIN_CONVICTION_PCT=0.05`; `MIN_POSITION_NOTIONAL=50`. **Scalp leverage:** NEW entries use a FIXED `SCALP_LEVERAGE=12` (capped `COPY_MAX_COPY_LEVERAGE=12`), overriding trader-lev + the old vol-cap so a +1% TP is meaningful $ (12x: +1%TP≈+$8 on the alts, −1.5%SL≈−$12; liq ≈ −7.9% so the soft SL has buffer). `VOL_SCALED_LEV` now unused for entries. Existing positions keep their entry lev.
-- **BUY-WHEN-THEY-ADD (`ADD_MIRROR_ENABLED=true`, trend-gated):** when the source trader grows a coin's notional ≥`ADD_MIN_FRAC=0.10` poll-over-poll AND the daily trend (`close vs SMA(TREND_SMA_DAYS=5)`) aligns with our direction: if HELD → ADD `min(their %, ADD_STEP_MAX=0.50)`×margin (capped); if FLAT → RE-OPEN (`COPY_REOPEN_ON_ADD=true`, the "repeat" after a TP). Notifies. **TRIMS never mirrored** (their trims are early/neg-edge: adds 90–100% WR in trends, trims 0–35%). `action="add"` bypasses one-per-coin + `add_to_position` wtd-avg entry.
-- **Exits = PROBABLE-TP SCALP ("sell at +1% → repeat", `_ride_winners`):** FULL exit at +`COPY_TP_PCT=0.01` favorable price (backtest: their adds hit +1% within 6h ~80% of the time — the probable roof), paired with a TIGHT full-exit SL at −`COPY_SL_PCT=0.015` (a +1% TP needs a small SL). NO trail-lock → re-enter on the trader's next add (the repeat). Supersedes the old +25% bank / ride-trail (`BANK_*`/`RIDE_*`/`SPECIALIST_STOP_ATR` now UNUSED). Guardian −70% nuclear = deep backstop.
-- **Lev-tracker sleeve (`src/signals/lev_tracker.py`, `TRACKER_ENABLED`):** auto-mirrors ONE trader's DIRECTION on `TRACKER_COINS={BTC}` in ISOLATED margin (`TRACKER_MARGIN_USD=200`/coin — applies to his NEXT entry, current pos rides; ≤`TRACKER_MAX_LEV=40`x, poll `TRACKER_POLL_S=10`s). Source `0x78aa…` (verified 50d: 42% win, 2.71 payoff, ~95% long, multi-day BTC holder — see `docs/POSITION_THESIS.md`). Follows open/close/flip (NOT size); **+`TRACKER_TP_PCT=0.01` TP**: banks the sleeve at +1% favorable then `TRACKER_REOPEN_COOLDOWN_S=300`s before re-syncing back in (sell-on-1%-repeat for BTC). Isolated → max loss/coin = margin staked. `TRACKER_DRY_RUN` logs only.
-- **Alerts:** Telegram + ntfy phone push (`NTFY_TOPIC` in .env) — high-signal ONLY (halt / guardian force-close / daily summary), never per-trade.
+- **Equity / accounts (2026-05-28 19:10):** MAIN $702.82 (user discretion, hands-off from all bot signals — recent: BTC short 0.04794 @ $73,583 + scale-in limit @ $74,200, watched by `hl-pos-watch`; legacy PURR funding-carry short still open pending user decision). Sub Baf $483.72 = lead77 sleeve. Other subs drained ~$1 (Downside, SwingDyn, AkkaVault — kept for future re-funding).
+- **Live sleeve (only one):** `hl-77998579-sleeve` on Sub Baf `0xdac952c2…2246`, mirrors `0x77998579` (trust forensic score 66.2, highest vetted) bar-for-bar on BTC+ETH. `MAX_CONCURRENT=3`, `MARGIN_PCT=0.40`, `LEV=4` iso → $773/leg notional, $193 margin, $93 dead-man stop-loss. Fresh-entry-only, baseline-seeded his BTC -13.1 + ETH -74.1 (not adopted).
+- **Live alerts:** `hl-flip-alerts` (cohort flip ≥2 sources / 6h / BTC+ETH+SOL+HYPE → ntfy), `hl-pos-watch` (fill detection + adverse-move ladder $74.2k/74.5k/75.0k/75.5k + auto-disarm), `hl-btc-alert` (range $74k-$78k), `hl-tracker-scan` (findings log).
+- **Live shadows (paper-only, no capital):** `hl-shadow-scan` (5 candidates), `hl-shadow-downside` (Downside vault full alt book), `hl-shadow-2385`.
+- **hl-bot.service:** leaderboard-copy in SHADOW (paper, doesn't touch MAIN) + brain intake server LIVE on `:8787` (HMAC-signed POST from LXC scraper at `bafscrape-1`; probe-only at ≤$50 until brain promotes a source to KEEP — `KEEP_SOURCES` stays empty here, brain owns the gate).
+- **Telegram + ntfy** (`NTFY_TOPIC=bafscraper-1`) for high-signal alerts only: halt / guardian force-close / daily summary / cohort flip / pos-watch ladder.
 
 ---
 
 ## Critical rules — never break these
-1. `_compute_size` returns `(0.0, lev)` to signal SKIP — callers check `our_size == 0`
-2. Copier is STATE-BASED (`reconcile()` diffs trader net positions vs held). NEVER reintroduce `userFills`/fill-stream copying — it churned on TWAP/trim fills and bled fees.
-3. `_refresh_account_values` REBUILDS each trader's snapshot fresh every poll (closed coins must vanish) — don't make it additive.
-4. `reconcile` is idempotent: desired-vs-actual diff. A failed/missed action re-applies next tick. `copier.risk` must be wired so it can see held positions.
-5. Routing: specialist coins (traders.json `specialty`) → that trader only; generalist coins require all holders agree on direction else SKIP (contested); pick highest-conviction holder.
-6. Leverage read from `signal.meta["leverage"]`, never hardcoded. `_sync_positions_from_hl` runs at startup before first reconcile.
-7. Exit signal `direction` = the side WE HOLD (the one being closed), NOT the offsetting side. Guardian/flip/close all follow this; `_close_position` matches on it.
-8. Closes go through `_place_market_close` (reduce-only `market_close`) + `_parse_fill` — never `market_open`, never trust bare `status=="ok"`. A failed close leaves the position in the tracker.
-9. **NEVER ADOPT A HELD POSITION — except at a COMPARABLE price (hard rule, user 2026-05-27):** a copier may open on a WITNESSED flat→position transition (fresh entry) OR, if `SLEEVE_ADOPT_BAND_PCT>0`, adopt a position the source already holds ONLY when current px is within ±band% of his avg entry (so we never enter late/worse — the rule's whole point). Default OFF (pure never-adopt). Sub sleeves run band=1.0% (truly comparable only). Outside the band → baseline-seed & lock out until he's flat. Adopt-style/proportional-peg mirrors (`watch_scale_mirror.py`, 78aa-peg) are uncapped-adopt and still BANNED for copy sleeves. (Within a position, following adds/trims/exit is fine.) See [[never-adopt-held-positions]].
-10. **SUB ORDERS NEED `vault_address`, NOT `account_address` (2026-05-27):** SDK orders sign+POST with `vault_address`; `account_address` only affects reads. `Exchange(wallet, MAINNET, account_address=SUB)` executes orders on MAIN. Use `vault_address=SUB`. ALL sub sleeves were misbuilt this way → STOPPED pending a proven fix. See [[hl-sub-routing-vault-address]].
-
----
-
-## Sizing formula (weighted fixed-per-position — see "Sizing" above)
-```
-budget    = equity − (TRACKER_MARGIN_USD × |TRACKER_COINS|)      # copy budget, tracker reserved
-per_margin = min(budget × COPY_POSITION_PCT × trader.weight, budget × MAX_POSITION_SIZE_PCT)
-our_lev   = min(SCALP_LEVERAGE, COPY_MAX_COPY_LEVERAGE)          # fixed scalp lev (12x)
-our_notional = per_margin × our_lev
-→ skip if our_notional < MIN_POSITION_NOTIONAL ($50)
-→ book bounded by MAX_OPEN_POSITIONS + risk caps (graceful, no margin wall)
-```
-
----
-
-## Open issues
-- Active-swing pivot (2026-05-25) is freshly deployed — UNPROVEN live: the bank (+25%), the ride-trail, and fresh-entries on the new generalists haven't fired yet. Watch the first of each.
-- Generalist deep-vet caveats: 41829013 is a multi-wallet fund op (opaque, hence wt 0.6); 69b05701 is HYPE-beta concentrated (wt 0.4). Re-vet if performance diverges from the perp-durable thesis.
-- `docs/POSITION_THESIS.md` is now stale (pre-pivot roster) — re-pull before trusting per-position detail.
-
----
-
-## Fix log (newest first, keep last 10)
-- 2026-05-28 PM (no-commit, services) DOWNSIDE RETIRED, full capital ($484) consolidated into `hl-77998579-sleeve` on Sub Baf `0xdac952c2…42246`. `MARGIN_PCT` bumped 0.30→0.40 (deploy the full $485 → $773/leg notional × 4x iso, $193 margin, $93 stop-loss, 2-leg realistic worst-case -38%). Why: forensic re-run on whale alternatives ($2.68M/0x99967871, $265k/0x739c52c1, roster vets 0x99df385a/0x807ddb66/0x3093189b/0xeb47e64c) ALL FAILED gates (one-trade-dep / 40x lev / 63% martingale / -$250k blowup day / sporadic). `0x77998579` scored **66.2** (best ever; beats Downside 52.2; 100% closed-WR, WR-by-third improving 88→100→100, maxDD $0, Sharpe 0.51). Address-bug fixed earlier same day: `SLEEVE_SUB` was bound to bogus `0xdac9d09e…2246`; real is `0xdac952c2…2246` (always pull from `subAccounts` API, never infer from CLAUDE.md truncations).
-- `bc21adc` Eyes-on-book stop verification + `/status` echo + reverted premature KEEP: `_place_protective_stop` now RE-QUERIES `open_orders` for the acked oid (3 tries) — ACK ≠ resting; an order that acks but isn't on the book → unstopped → force-close. Executor records per-`signal_id` fill+stop in `_signal_status`; intake serves `GET /status/{sid}` so the brain polls `stop_resting:true`+oid/px instead of trusting "accepted". **Reverted EmberCN→KEEP (back to WATCH): the BRAIN owns the graduation gate, sends only `mode=probe` for WATCH; pre-graduating my side desynced it.** `tests/test_stop_verification.py` 5/5 (confirmed/acked-not-resting/rejected/fail-safe/echo). Deployed PID 110137.
-- `274b580`+`55519c7` B2/B3 + brain-stop fixes: (B2) LIVE entries sized by us — `notional = 1%·equity / stop_dist`, cap 3x; brain's `size_notional` ignored for live, probe keeps ≤$50. (B3) `KEEP_SOURCES` unlocks `mode=live`; **EmberCN graduated WATCH→KEEP** (next live ETH ≈ $300 notional @ 3x). FIXED double-order bug: `_open_position` no longer fires legacy `_place_native_sltp` for brain entries (it had added an unwanted TP @ $2366 to the live probe — cancelled it; brain = stop+TTL only). Brain entries now also set their capped leverage (was gated `is_copy` only). Deployed PID 108410, KEEP loaded, book = 1 stop.
-- `b1bbc69` Fixed `_place_protective_stop` `UnboundLocalError` (`sl` referenced on the brain explicit-stop path) — had force-closed the first live probe at breakeven (contract held: no unstopped position). First clean live brain fill after: 0.0237 ETH @ $2112.5 ($50), stop @ $2029.
-- `93207a8` RISK-POLICY-CONTRACT CLAMP: ≤3x, MAX 1 position, kill-switch −3%/day & −5%/week, NO averaging (adds→REJECT), PROBE-only (≤$50 notional/≤$5 risk) until KEEP, tracker/funding/cascade OFF. Book flattened to comply (equity $1201). B1 native per-order stops + intake server (`intake.py`, aiohttp, HMAC, idempotent, re-checks all cardinals) added. Leaderboard → SHADOW.
-- `f4e6839` Higher-leverage scalp: NEW copy entries use FIXED `SCALP_LEVERAGE=12` (raised `COPY_MAX_COPY_LEVERAGE` 10→12), overriding trader-lev + the vol-cap, so the +1% TP is meaningful (~+$8/scalp on alts vs ~$1 at the old 2.3x vol-cap; −1.5% SL ≈ −$12; liq −7.9% gives the 45s soft-SL buffer). Modelled 10/12/15x; deployed 12x, 0 errors. Above ~12x would need native exchange stops (soft SL polls every 45s).
-- `967eaf4` Probable-TP scalp + buy-on-add-repeat + unblock BTC/HYPE: exits now FULL +1% TP (`COPY_TP_PCT`, backtest 80% hit in 6h) / −1.5% SL (`COPY_SL_PCT`), no trail-lock → re-enter on next add ("repeat"). Buy-when-they-add extended to OPEN-when-flat (`COPY_REOPEN_ON_ADD`). HYPE unblocked (`MANUAL_COINS={}` — user closed manual short). BTC tracker gains a +1% TP + 300s cooldown (sell-on-1%-repeat, isolated). Superseded bank/ride. Dry-run: TP/SL fire correct, desired incl HYPE; deployed 0 errors. NOTE: copyable add-flow is thin (BTC=tracker; backtest ~0.7 trades/day on alts) — value rides on HYPE being unblocked + the tracker.
-- `f32183e` Add-mirroring (scale-IN only, trend-gated): mirror a trader ADDING to a held coin (notional ↑≥10% poll-over-poll) ONLY if the coin's daily trend aligns w/ our dir; add min(their%,50%)×margin capped at per-pos cap + notify. TRIMS not mirrored (their trims are early/neg-edge: adds 90–100% WR in trends vs trims 0–35%). New `action="add"` across risk(approve bypasses one-per-coin + `add_to_position` wtd-avg entry)/executor(`_add_to_position`)/copier(`_emit_add`, `_trend_dir`). Dry-run 5/5; deployed 0 errors.
-- `e05a750` FULL active-swing pivot: roster→3 weighted GENERALISTS (f83858 1.0 / 41829013 0.6 / 69b05701 0.4, deep-vetted organic), dropped conviction-hodlers feec88/a9b95f. Weighted fixed-per-position sizing (`COPY_POSITION_PCT×weight` off copy-budget=equity−tracker-reserve; no ÷n dust, no margin wall). All copy coins ride wider stop (max −9%/lev, 1×ATR). Added `MANUAL_COINS={HYPE}` (user's discretionary short — copier hands-off). FIXED fresh-detection bug: newly-added trader (live traders.json reload) seeds baseline, not fresh-adopted (had auto-opened an unwanted ETH short). Dry-run: feasibility 18% of budget, no dust/wall; deployed clean, 0 errors.
-- `d1019ca` Stage 2 zero-copy-lag (`FRESH_ENTRY_ONLY`): only open on a trader's fresh flat→pos/flip within 0.5×ATR of their open; never adopt stale holds (the copy-lag leak — BTC entered 3.5% late=+27%, HYPE 56% late=+17%, SOL 10% late=−3%). `_detect_fresh_opens`/`_is_fresh_entry`, baseline-seeds on boot. Dry-run: 5/5 logic tests pass; deployed, baseline seeded, book grandfathered.
-- `7a52603` Roster cut to elite-only: a9b95f PINNED→HYPE + feec88 PINNED→SOL (single-coin specialists) + 78aa→BTC tracker; deleted fc667 (gated out) + 4f7634 (closed TON/ZEC). Specialist conviction coins ride wider stop max(−9%/lev, 1.0×ATR).
+1. **NEVER touch MAIN from a hl-bot strategy.** MAIN is user-discretion-only. Any new signal must run as its own `scripts/watch_*.py` against a dedicated sub. (FundingCarry/Cascade/etc. were removed 2026-05-28 because they violated this and opened PURR on MAIN.)
+2. **Sub orders use `vault_address`, not `account_address`** (see `scripts/watch_swing_sleeve.py`). `account_address` only affects reads; orders signed for `vault_address` execute on that sub. Always pull the FULL sub address from the `subAccounts` API — never infer from a truncated CLAUDE.md `0xdac9…2246`.
+3. **NEVER adopt a held position** (sleeve rule). First sighting → baseline-seed (record his current size, do NOT mirror). Only fire on a witnessed flat→position or flip transition. `ADOPT_BAND_PCT>0` allows comparable-price adoption (±band% of his entry) but defaults OFF.
+4. **Sleeve sizes legs from OUR equity** (`MARGIN_PCT × eq × LEV`), never proportional-pegged to the source's notional. Proportional pegs are banned — they uncap exposure to the source's leverage decisions.
+5. **Leaderboard copier (SHADOW) is idempotent state-based reconcile**, never fill-stream. Diff desired-vs-actual every `COPY_RECONCILE_INTERVAL_S=45s`; a missed action self-heals next tick.
+6. **Exits use `_place_market_close`** (reduce-only) + `_parse_fill` — never `market_open`, never trust bare `status=="ok"`. SDK returns `ok` even on errors.
+7. **Brain intake re-verifies every cardinal independently** (HMAC sig + idempotency + size + price + symbol + side). `KEEP_SOURCES` on MY side stays empty unless the brain explicitly graduates a source to KEEP.
+8. **Trust forensic before adding any source.** Score < 50 → reject. Hard gates: martingale rate, concentration, one-trade-dependency, taker%, sample size. The headline WR / PnL on a leaderboard means nothing without these.
 
 ---
 
 ## VPS commands
 ```bash
-sudo journalctl -u hl-bot -f                    # live logs
-sudo journalctl -u hl-bot -n 200 --no-pager    # last 200 lines
-sudo systemctl restart hl-bot                   # restart
-cd ~/hl-bot && git pull && sudo systemctl restart hl-bot  # deploy
+sudo journalctl -u hl-77998579-sleeve -f       # main live sleeve
+sudo journalctl -u hl-flip-alerts -f           # cohort flip detector
+sudo journalctl -u hl-pos-watch -f             # discretionary trade watchdog
+sudo journalctl -u hl-bot -f                   # leaderboard shadow + brain intake
+cd ~/hl-bot && git pull && sudo systemctl restart hl-bot   # deploy
 python -c "import requests; r=requests.post('https://api.hyperliquid.xyz/info', json={'type':'clearinghouseState','user':'<addr>'}); print(r.json()['marginSummary'])"
 ```
 
 ---
 
+## Open issues
+- `hl-pos-watch` only watches one trade at a time (env-parametrized). If you open a second discretionary trade on MAIN, the watchdog needs its own service instance or refactor to multi-trade.
+- Brain pipeline (`scripts/intake.py` → executor): `KEEP_SOURCES` empty by design; only the brain graduates a source. Confirm with brain-side before flipping any source live.
+
+---
+
+## Fix log (newest first, keep last 10)
+- 2026-05-28 PM (`<new commit>`) **Major cleanup.** Removed funding-carry/cascade/OI-squeeze/stat-arb/momentum/lev-tracker signal modules + `find_traders.py` + `test_leaderboard.py` + retired sleeve services (hl-26fe / hl-78aa-tracker / hl-807 / hl-95bfa / hl-akka / hl-downside) + one-shot scan services (hl-deep / hl-drift / hl-jupperp / hl-sol / hl-shadow-b65d) + stale state files. `STRATEGY_FUNDING_CARRY`/`STRATEGY_CASCADE` flags purged from `.env` after FundingCarry rogue-opened PURR on MAIN. `src/main.py` slimmed to leaderboard-shadow + brain-intake only. `config/settings.py` purged of TRACKER_/CASCADE_/FUNDING_/STRATEGY_OI/STAT/MOMENTUM blocks. Net: 9 live services, src/ has no dead signal modules.
+- 2026-05-28 (`dbabcbc`) feat: `hl-pos-watch` (limit-fill + adverse-move ladder watchdog) + `research/trader_candidates.md` (sister-agent handoff).
+- 2026-05-28 (`1cd4c79`) docs: `research/HANDOVER_TO_SCANNER_AGENT.md` (spec for the chain-economy scanner: hard gates, output schema, common traps).
+- 2026-05-28 (`0e81085`) chore: consolidated multi-agent scan/research toolkit + flip-alerts + roster expansion (3→12 traders).
+- 2026-05-28 services: `hl-flip-alerts` (ntfy on cohort rotation). `hl-77998579-sleeve` deployed @ 4x/40% on Sub Baf after Downside RETIRED. `0x77998579` forensic 66.2 (highest ever); whales 0x99967871/0x739c52c1/0x99df385a/0x807ddb66/0x3093189b/0xeb47e64c all FAILED trust gates.
+- 2026-05-27 (`3c60252`) fix(sleeves): `vault_address` sub-routing + fresh-entry one-slot + N+1 API fix; vault scan & forensics tools.
+- 2026-05-26 (`2bb3d41`) feat: `hl-tracker-scan.service` — change-triggered findings log (free HL+Pyth).
+- 2026-05-25 (`d1019ca`) Stage 2 zero-copy-lag (`FRESH_ENTRY_ONLY`): only open on a fresh flat→pos/flip within 0.5×ATR; never adopt stale holds.
+
+---
+
 ## Known HL SDK quirks
-- `Exchange.market_open()` — no `reduce_only` param; use `.order()` for reduce-only
-- `Exchange.market_close()` makes an extra `user_state` API call internally
-- SDK always returns `{"status":"ok"}` even on errors — must check `response.data.statuses[0]`
+- `Exchange.market_open()` — no `reduce_only` param; use `.order()` for reduce-only.
+- `Exchange.market_close()` makes an extra `user_state` API call internally.
+- SDK always returns `{"status":"ok"}` even on errors — must check `response.data.statuses[0]`.
 - WS channel `userFills:{addr}` replays recent fills on reconnect — was a churn source; copier no longer subscribes (state-based). Don't reintroduce it.

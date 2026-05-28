@@ -37,27 +37,15 @@ STALE_SIGNAL_S      = int(os.getenv("STALE_SIGNAL_S", "60"))   # reject signals 
 KEEP_SOURCES        = {s.strip() for s in os.getenv("KEEP_SOURCES", "").split(",") if s.strip()}  # empty = none KEEP → live rejected
 
 # ── Per-strategy slot caps (CONTRACT: only leaderboard, max 1) ────────────────
-STRATEGY_MAX_POSITIONS = {
-    "leaderboard": 1,
-    "funding":      0,
-    "cascade":      0,
-    "squeeze":      0,
-    "arb":          0,
-}
+STRATEGY_MAX_POSITIONS = {"leaderboard": 1}
 
 # ── Strategy toggles ──────────────────────────────────────────────────────────
-STRATEGY_FUNDING_CARRY    = os.getenv("STRATEGY_FUNDING_CARRY", "false").lower() == "true"   # CLAMP: off (contract = leaderboard-only)
+# hl-bot.service runs leaderboard-shadow + brain-intake ONLY. All other signal
+# strategies (funding-carry, cascade, OI-squeeze, stat-arb, momentum) and the
+# old lev-tracker were removed 2026-05-28: model shifted to sleeve-copy on
+# subaccounts (scripts/watch_swing_sleeve.py) + discretionary main. Anything new
+# that touches MAIN should be its own systemd watch_*.py, not a hl-bot strategy.
 STRATEGY_LEADERBOARD_COPY = os.getenv("STRATEGY_LEADERBOARD_COPY", "true").lower() == "true"
-STRATEGY_CASCADE          = os.getenv("STRATEGY_CASCADE", "false").lower() == "true"          # CLAMP: off
-# Phase 2-4 — disabled until calibrated; set to "true" in .env to enable
-STRATEGY_OI_SQUEEZE       = os.getenv("STRATEGY_OI_SQUEEZE", "false").lower() == "true"
-STRATEGY_STAT_ARB         = os.getenv("STRATEGY_STAT_ARB", "false").lower() == "true"
-STRATEGY_MOMENTUM         = os.getenv("STRATEGY_MOMENTUM", "false").lower() == "true"
-
-# ── Funding carry params ──────────────────────────────────────────────────────
-FUNDING_ENTRY_THRESHOLD   = 0.0003      # lower bar — catch more opportunities
-FUNDING_EXIT_THRESHOLD    = 0.0001
-FUNDING_MAX_POSITIONS     = 1           # only 1 carry at a time (capital is small)
 
 # ── Leaderboard copy params ──────────────────────────────────────────────────
 COPY_MIN_ACCOUNT_AGE_DAYS = 20
@@ -182,37 +170,13 @@ COPY_REOPEN_ON_ADD = os.getenv("COPY_REOPEN_ON_ADD", "false").lower() == "true" 
 # polled every 45s — going much above ~12x risks a fast move gapping past it (would need native stops).
 SCALP_LEVERAGE     = int(os.getenv("SCALP_LEVERAGE", "3"))   # CLAMP: contract max 3x
 
-# ── Tracker coins: reserved for the manual "lev-guy" tracker, OFF-LIMITS to copy ─
-# The copy engine never syncs, manages, or desires these — they're a separate manual
-# (isolated-margin) sleeve mirroring trader 0x78aa… So a restart won't auto-close the
-# tracker, and the copier won't open an opposing position that nets against it on HL.
-TRACKER_COINS = {c.strip().upper() for c in
-                 os.getenv("TRACKER_COINS", "BTC").split(",") if c.strip()}
-
-# ── MANUAL coins: the USER trades these by hand — the copier must NEVER touch them ──
-# (e.g. a discretionary HYPE short the user opened). Excluded from sizing, desired,
-# startup sync, and fresh-detection — same as tracker coins. Clear when the bot should
-# resume managing them. 2026-05-25: HYPE = user's manual discretionary short.
+# ── Coins the leaderboard copier (SHADOW) skips entirely ─────────────────────
+# MANUAL_COINS: things the user trades by hand. Excluded from desired-portfolio
+# diff so shadow logs don't show fake "phantom" exits for the user's discretion.
+# (Sub-account sleeves operate on their own subs, so this set doesn't affect them.)
 MANUAL_COINS = {c.strip().upper() for c in
-                os.getenv("MANUAL_COINS", "").split(",") if c.strip()}   # HYPE unblocked 2026-05-25 (user closed manual short)
-# Coins the COPIER skips entirely (tracker sleeve + user-manual). The 78aa tracker still
-# uses TRACKER_COINS for what IT trades; this is only the copier's skip set.
-COPIER_SKIP_COINS = TRACKER_COINS | MANUAL_COINS
-
-# ── Lev-tracker sleeve: mirror ONE trader's DIRECTION on TRACKER_COINS, ISOLATED ─
-# Walled off from the copy engine. Holds a fixed TRACKER_MARGIN_USD of ISOLATED
-# margin per tracker coin in the SAME direction as the source trader; follows his
-# open/close/flip (not his size). Isolated → max loss per coin = the margin staked.
-TRACKER_ENABLED      = os.getenv("TRACKER_ENABLED", "false").lower() == "true"  # CLAMP: 40x tracker violates 3x + 1-pos
-TRACKER_DRY_RUN      = os.getenv("TRACKER_DRY_RUN", "false").lower() == "true"  # log only
-TRACKER_SOURCE_ADDR  = os.getenv("TRACKER_SOURCE_ADDR",
-                                 "0x78aa6328eae8028a089c35d2819f79c78de2a7e5")  # the 40x guy
-TRACKER_MARGIN_USD   = float(os.getenv("TRACKER_MARGIN_USD", "200"))   # margin staked per coin (applies to 78aa's NEXT entry; current open BTC pos rides untouched)
-TRACKER_MAX_LEV      = int(os.getenv("TRACKER_MAX_LEV", "40"))          # cap (he runs ~40x)
-TRACKER_POLL_S       = int(os.getenv("TRACKER_POLL_S", "10"))           # direction poll cadence (10s: tight follow on his open/close/flip; 2 API calls/tick = trivial rate-limit load)
-TRACKER_TP_PCT       = 0.01    # sell the isolated BTC sleeve at +1% favorable, then re-sync re-buys (sell-on-1%-repeat)
-TRACKER_REOPEN_COOLDOWN_S = 300  # after a TP, wait this long before re-opening (bounds 40x churn)
-ATR_REFRESH_S           = 3600   # re-fetch a coin's ATR at most this often (it moves slowly)
+                os.getenv("MANUAL_COINS", "").split(",") if c.strip()}
+COPIER_SKIP_COINS = MANUAL_COINS
 COPY_MIN_THEIR_NOTIONAL   = 100         # position-aware tracking handles dedup; $100 = anti-dust
 COPY_MAX_POSITIONS_PER_TRADER = 5       # allow up to 5 (a9b95f has 3, fc667 has 6)
 # Margin-based sizing cap: cap is on MARGIN (not notional).
@@ -255,10 +219,6 @@ COPY_TRADER_WHITELIST: set[str] = (
 )
 
 # ── Cascade params ── more sensitive triggers ─────────────────────────────────
-CASCADE_OI_PERCENTILE     = 75          # lowered from 90 — fires more often
-CASCADE_FUNDING_THRESHOLD = 0.0002      # more sensitive
-CASCADE_MOVE_1H_PCT       = 0.012       # 1.2% move triggers (was 1.8%)
-CASCADE_IMBALANCE_MIN     = 0.62        # lower bar (was 0.70)
 
 # ── Monitoring ────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")

@@ -29,21 +29,14 @@ from execution.executor import Executor
 from monitoring.alerts import TelegramAlerter
 from monitoring.squeeze_guard import SqueezeGuard
 
-# Conditionally import enabled strategies
-if settings.STRATEGY_FUNDING_CARRY:
-    from signals.funding_carry import FundingCarryScanner
+# The hl-bot main process is now leaderboard-shadow + brain-intake only.
+# Funding-carry / cascade / OI-squeeze / stat-arb / momentum / lev-tracker were
+# removed 2026-05-28: model shifted to sleeve-copy on subaccounts + discretionary
+# main book, so any signal that touched MAIN here was a foot-gun. If a strategy
+# needs to come back, run it as its own watch_*.py systemd service against a
+# dedicated sub (see scripts/watch_swing_sleeve.py for the pattern).
 if settings.STRATEGY_LEADERBOARD_COPY:
     from signals.leaderboard_copy import LeaderboardCopier
-if settings.STRATEGY_CASCADE:
-    from signals.cascade_detector import CascadeDetector
-if settings.STRATEGY_OI_SQUEEZE:
-    from signals.oi_funding_squeeze import OIFundingSqueeze
-if settings.STRATEGY_STAT_ARB:
-    from signals.stat_arb import StatArbScanner
-if settings.STRATEGY_MOMENTUM:
-    from signals.momentum_ignition import MomentumIgnition
-if settings.TRACKER_ENABLED:
-    from signals.lev_tracker import LevTracker
 
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
@@ -58,12 +51,8 @@ async def main():
     logger.info("=" * 60)
     logger.info("HL-BOT STARTING")
     logger.info(f"Testnet: {settings.HL_TESTNET}")
-    logger.info(f"Strategies: funding={settings.STRATEGY_FUNDING_CARRY} "
-                f"leaderboard={settings.STRATEGY_LEADERBOARD_COPY} "
-                f"cascade={settings.STRATEGY_CASCADE} "
-                f"oi_squeeze={settings.STRATEGY_OI_SQUEEZE} "
-                f"stat_arb={settings.STRATEGY_STAT_ARB} "
-                f"momentum={settings.STRATEGY_MOMENTUM}")
+    logger.info(f"Strategies: leaderboard={settings.STRATEGY_LEADERBOARD_COPY} (SHADOW={settings.COPY_SHADOW}) "
+                f"intake={settings.INTAKE_ENABLED}")
     logger.info("=" * 60)
 
     # ── Init components ────────────────────────────────────────────────────────
@@ -131,17 +120,6 @@ async def main():
     # ── Wire signal engines ────────────────────────────────────────────────────
     scheduler = AsyncIOScheduler()
 
-    if settings.STRATEGY_FUNDING_CARRY:
-        carry = FundingCarryScanner(store)
-
-        async def run_carry_scan():
-            signals = await carry.scan()
-            for sig in signals:
-                await executor.enqueue(sig)
-
-        scheduler.add_job(run_carry_scan, "interval", seconds=30, id="funding_carry")
-        logger.info("Strategy FUNDING CARRY enabled")
-
     if settings.STRATEGY_LEADERBOARD_COPY:
         from datetime import datetime as _dt, timedelta as _td
         copier = LeaderboardCopier(store, feed)
@@ -165,54 +143,6 @@ async def main():
         scheduler.add_job(run_reconcile, "date",
                           run_date=_dt.now() + _td(seconds=8), id="lb_reconcile_startup")
         logger.info("Strategy LEADERBOARD COPY enabled (state-based reconcile)")
-
-    if settings.STRATEGY_CASCADE:
-        cascade = CascadeDetector(store)
-
-        async def on_price_tick_for_cascade(msg):
-            mids = msg.get("data", {}).get("mids", {})
-            for coin, price_str in mids.items():
-                sigs = await cascade.on_price_update(coin, float(price_str))
-                for sig in sigs:
-                    await executor.enqueue(sig)
-
-        feed.subscribe("allMids", on_price_tick_for_cascade)
-        logger.info("Strategy CASCADE enabled")
-
-    if settings.STRATEGY_OI_SQUEEZE:
-        oi_squeeze = OIFundingSqueeze(store)
-
-        async def run_oi_squeeze():
-            signals = await oi_squeeze.scan()
-            for sig in signals:
-                await executor.enqueue(sig)
-
-        scheduler.add_job(run_oi_squeeze, "interval", seconds=30, id="oi_squeeze")
-        logger.info("Strategy OI/FUNDING SQUEEZE enabled")
-
-    if settings.STRATEGY_STAT_ARB:
-        stat_arb = StatArbScanner(store)
-
-        async def run_stat_arb():
-            signals = await stat_arb.scan()
-            for sig in signals:
-                await executor.enqueue(sig)
-
-        scheduler.add_job(run_stat_arb, "interval", seconds=15, id="stat_arb")
-        logger.info("Strategy STAT ARB enabled")
-
-    if settings.STRATEGY_MOMENTUM:
-        momentum = MomentumIgnition(store)
-
-        async def on_price_tick_for_momentum(msg):
-            mids = msg.get("data", {}).get("mids", {})
-            for coin, price_str in mids.items():
-                sigs = await momentum.on_price_update(coin, float(price_str))
-                for sig in sigs:
-                    await executor.enqueue(sig)
-
-        feed.subscribe("allMids", on_price_tick_for_momentum)
-        logger.info("Strategy MOMENTUM IGNITION enabled")
 
     # ── Position guardian ─────────────────────────────────────────────────────
     # Philosophy: trust the traders we whitelisted.
@@ -312,10 +242,7 @@ async def main():
             sig = await signal_queue.get()
             await executor.enqueue(sig)
 
-    # Walled-off lev-tracker sleeve (mirrors one trader on TRACKER_COINS, isolated).
     tasks = [feed.run(), executor.run(), position_guardian(), relay_signals()]
-    if settings.TRACKER_ENABLED:
-        tasks.append(LevTracker(alerter=alerter).run())
     # Brain intake (B4): HMAC-signed signal receiver (LXC brain → this executor).
     if settings.INTAKE_ENABLED:
         from execution.intake import IntakeServer
