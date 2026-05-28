@@ -38,6 +38,7 @@ COINS      = [c.strip().upper() for c in os.getenv("SLEEVE_COINS", "BTC").split(
 MARGIN_PCT = float(os.getenv("SLEEVE_MARGIN_PCT", "0.40"))   # per-coin margin frac of sub equity
 LEV        = int(os.getenv("SLEEVE_LEV", "3"))
 MAX_CONCURRENT = int(os.getenv("SLEEVE_MAX_CONCURRENT", "0"))  # 0=unlimited; 1=one-slot (concentrate)
+ADOPT_BAND_PCT = float(os.getenv("SLEEVE_ADOPT_BAND_PCT", "0"))  # 0=OFF (pure never-adopt). >0: adopt a HELD position only if current px is within ±band% of source's avg entry (comparable entry, not late). See CLAUDE.md rule #9.
 STOP_PCT   = float(os.getenv("SLEEVE_STOP_PCT", "0.08"))
 HALT_USD   = float(os.getenv("SLEEVE_HALT_USD", "40"))
 POLL_S     = int(os.getenv("SLEEVE_POLL_S", "20"))
@@ -139,6 +140,20 @@ def main():
                 f"| fresh-entry-only, exit-on-his-flip/flat")
     state = _load()
 
+    def enter_leg(coin, his, px, reason):
+        """Open our scaled leg in his direction + place dead-man stop. Returns True if filled. (eq late-bound from loop.)"""
+        notional = eq * MARGIN_PCT * LEV
+        size = _round_sz(coin, notional / px)
+        if size <= 0: return False
+        side_buy = his > 0
+        logger.success(f"[{NAME}] ENTER {coin} {'long' if side_buy else 'short'} {size} (his={his}, ${notional:,.0f}) [{reason}]")
+        try: ex.market_open(coin, side_buy, size)
+        except Exception as e: logger.error(f"[{NAME}] {coin} open EXC: {e}"); return False
+        time.sleep(1.0); ns, ne = _pos(info, SUB, coin)
+        if abs(ns) > FLAT_EPS:
+            _ensure_stop(ex, info, SUB, coin, ns > 0, abs(ns), ne); return True
+        return False
+
     while True:
         try:
             src_state = info.user_state(SOURCE)          # ONE call → all source coins
@@ -146,7 +161,7 @@ def main():
             mids      = info.all_mids()                  # ONE call
             realized  = _today_realized(info, SUB)       # ONE call (fills)
             eq        = float(sub_state["marginSummary"]["accountValue"])
-            snap      = {c: (_pos_from(src_state, c)[0], _pos_from(sub_state, c)) for c in COINS}
+            snap      = {c: (_pos_from(src_state, c), _pos_from(sub_state, c)) for c in COINS}  # (his_szi,his_entry),(our_szi,our_entry)
         except Exception as e:
             logger.warning(f"[{NAME}] read failed (skip): {e}"); time.sleep(POLL_S); continue
 
@@ -159,38 +174,45 @@ def main():
 
         opened_now = 0                                    # positions opened within THIS poll (snap is start-of-poll)
         for coin in COINS:
-            his = snap[coin][0]; ours, entry = snap[coin][1]
+            his, his_entry = snap[coin][0]; ours, entry = snap[coin][1]
             try: px = float(mids[coin])
             except Exception: continue
             eps = max(_eps(coin), EPS_HIS)
             key = f"his_prev_{coin}"
+            we_flat = abs(ours) < eps
 
-            if key not in state:                              # baseline-seed (never adopt)
+            def slot_open():                                  # one-slot capacity check (incl in-poll opens)
+                hc = sum(1 for cc in COINS if abs(snap[cc][1][0]) > FLAT_EPS) + opened_now
+                return not (MAX_CONCURRENT and hc >= MAX_CONCURRENT), hc
+
+            if key not in state:                              # FIRST sighting of this coin
+                # never-adopt by default; ADOPT only if his held position is at a COMPARABLE price now (±band%)
+                if ADOPT_BAND_PCT > 0 and abs(his) > eps and we_flat and his_entry > 0:
+                    dist = abs((px - his_entry) / his_entry * 100)
+                    ok, hc = slot_open()
+                    if dist <= ADOPT_BAND_PCT and ok:
+                        if enter_leg(coin, his, px, f"adopt @comparable px {dist:.2f}%≤{ADOPT_BAND_PCT}% of his {his_entry:.4f}"): opened_now += 1
+                    elif dist <= ADOPT_BAND_PCT:
+                        logger.info(f"[{NAME}] {coin} comparable-adopt skipped (one-slot full {hc}/{MAX_CONCURRENT})")
+                    else:
+                        logger.info(f"[{NAME}] baseline {coin} his={his} (NOT comparable: {dist:.2f}% > {ADOPT_BAND_PCT}% band — no adopt)")
+                else:
+                    logger.info(f"[{NAME}] baseline {coin} his={his} (no adopt); awaiting his next move")
                 state[key] = his; _save(state)
-                logger.info(f"[{NAME}] baseline {coin} his={his} (no adopt); awaiting his next move")
                 continue
             prev = state[key]
 
             his_inc  = abs(his) > abs(prev) + eps and (prev == 0 or math.copysign(1, his) == math.copysign(1, prev))
             his_flip = prev != 0 and abs(his) > eps and (his > 0) != (prev > 0)
             his_flat = abs(his) < eps and abs(prev) >= eps
-            we_flat  = abs(ours) < eps
 
             if we_flat:
-                if his_inc or his_flip:                       # ENTER in his direction at our scaled size
-                    held_count = sum(1 for cc in COINS if abs(snap[cc][1][0]) > FLAT_EPS) + opened_now
-                    if MAX_CONCURRENT and held_count >= MAX_CONCURRENT:
-                        logger.info(f"[{NAME}] skip {coin} fresh-open (one-slot full: {held_count}/{MAX_CONCURRENT} held)")
-                        state[key] = his; continue            # concentrate: ignore extra fresh opens while slot filled
-                    notional = eq * MARGIN_PCT * LEV
-                    size = _round_sz(coin, notional / px)
-                    if size > 0:
-                        side_buy = his > 0
-                        logger.success(f"[{NAME}] ENTER {coin} {'long' if side_buy else 'short'} {size} (his={his}, ${notional:,.0f})")
-                        try: ex.market_open(coin, side_buy, size)
-                        except Exception as e: logger.error(f"[{NAME}] {coin} open EXC: {e}"); continue
-                        time.sleep(1.0); ns, ne = _pos(info, SUB, coin)
-                        if abs(ns) > FLAT_EPS: _ensure_stop(ex, info, SUB, coin, ns > 0, abs(ns), ne); opened_now += 1
+                if his_inc or his_flip:                       # fresh ENTER in his direction
+                    ok, hc = slot_open()
+                    if not ok:
+                        logger.info(f"[{NAME}] skip {coin} fresh-open (one-slot full: {hc}/{MAX_CONCURRENT} held)")
+                        state[key] = his; continue
+                    if enter_leg(coin, his, px, "fresh"): opened_now += 1
             else:
                 if his_flat or his_flip:                      # EXIT (he left / flipped)
                     logger.success(f"[{NAME}] source {'flat' if his_flat else 'flipped'} on {coin} (his={his}) → close ours ({ours})")
