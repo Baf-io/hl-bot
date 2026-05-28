@@ -24,17 +24,16 @@ import requests
 from loguru import logger
 
 API   = "https://api.hyperliquid.xyz/info"
-POLL_S = 60
+POLL_S = 300     # 5 min — paper validation doesn't need 60s; saves rate-limit budget
 STAKE  = 100.0   # nominal $ per paper position (for $ display; ranking uses return%)
 STATE  = "/root/hl-bot/data/shadow_scan_state.json"
 
-# top-5 copyable candidates from the 2026-05-25 edge-density scan
+# Trimmed 2026-05-28: ca41/2c5d/78dc dropped (zero fresh entries in 3 days — too quiet
+# to validate via shadow), 05c6 dropped (-41% on 7/7 catch-knife losses). Only 36f2
+# retained — 67% WR on small sample, currently HYPE long. If shadow holds positive over
+# 2 more weeks of data, candidate for sleeve.
 CANDS = {
-    "ca41_HYPE2sided": "0x0ca4109c94438dde8d7386da27180f414de80fa8",
-    "2c5d_ZEC":        "0x2c5dc7e67fce4bc252221c46c1cdc7651838b2d8",
-    "78dc_diversified":"0x78dcfb97b85b83b92c1b1a2d91b4e6cd03a4e120",
     "36f2_patient":    "0x36f26e2e5bed062968c17fc770863fd740713205",
-    "05c6_altlong":    "0x05c6959d997cde99d2f967367e5e9f1959ba9706",
 }
 FLAT_EPS = 1e-9
 

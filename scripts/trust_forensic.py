@@ -127,6 +127,15 @@ def forensic(addr):
         p=ap["position"]; szi=float(p["szi"]); c=p["coin"]; lev=p["leverage"].get("value")
         mid=float(mids.get(c,0) or p.get("entryPx") or 0); val=szi*mid; netusd+=val
         pos.append(f"{c} {'L' if szi>0 else 'S'} ${abs(val):,.0f}@{lev}x uPnL${float(p['unrealizedPnl']):,.0f}")
+    # ── knife-trap detector: small wins, big losses = he catches falling knives ──
+    # Payoff < 0.5 with a high WR is the classic loss-hider / knife-catcher signature
+    # (closes winners small to keep WR, holds losers until they slice through stops).
+    avg_win  = (sum(wins)/len(wins)) if wins else 0
+    avg_loss = (sum(abs(x) for x in losses)/len(losses)) if losses else 0
+    payoff   = avg_win/avg_loss if avg_loss > 0 else (10.0 if avg_win > 0 else 0)
+    # Open uPnL drag: how much paper-loss he's currently hiding relative to realized
+    open_upnl = sum(float(ap["position"].get("unrealizedPnl",0)) for ap in cs.get("assetPositions",[]))
+    paper_drag = abs(min(open_upnl, 0)) / max(abs(realized), 1) if realized > 0 else 0
     return dict(addr=addr, fills=len(fl), span=round(span,1), active_days=active_days,
         recency_d=round(recency_d,1), max_gap_d=round(max_gap_d,1), realized=round(realized),
         n_closed=len(closes), wr=round(len(wins)/max(len(wins)+len(losses),1)*100),
@@ -136,6 +145,8 @@ def forensic(addr):
         adds=adds, adds_down=adds_down, avg_down_ratio=round(adds_down/max(adds,1),2),
         hour_cov=round(hour_cov,2), overnight_frac=round(overnight/n,2), weekend_frac=round(weekend/n,2),
         interval_cv=round(intervals_cv,2), taker_frac=round(taker_frac,2),
+        avg_win=round(avg_win), avg_loss=round(avg_loss), payoff=round(payoff,2),
+        open_upnl=round(open_upnl), paper_drag=round(paper_drag,2),
         net_usd_now=round(netusd), positions=pos[:6], biggest_trip=biggest)
 
 def is_bot(p):
@@ -153,6 +164,12 @@ def gates(p):
     if p["avg_down_ratio"]>0.30 and p["adds"]>=5: fails.append(f"MARTINGALE — averages into losers ({int(p['avg_down_ratio']*100)}% of adds)")
     if p["active_days"]/max(p["span"],1)<0.15: fails.append(f"sporadic ({p['active_days']} active days in {int(p['span'])})")
     if p["recency_d"]>14: fails.append(f"stale (last trade {int(p['recency_d'])}d ago)")
+    # KNIFE-TRAP: small wins + big losses = catches falling knives. Combined w/ high WR = loss-hider.
+    if p["payoff"]<0.40 and p["n_closed"]>=10:
+        fails.append(f"KNIFE-TRAP — small wins/big losses (payoff {p['payoff']}, avg win ${p['avg_win']} vs avg loss ${p['avg_loss']})")
+    # PAPER-DRAG: he's sitting on open losses ≥ his realized PnL (hiding losers in unrealized)
+    if p["paper_drag"]>1.0:
+        fails.append(f"PAPER-DRAG — open uPnL ${p['open_upnl']:,} hides losses (drag {int(p['paper_drag']*100)}% of realized)")
     return fails
 
 def cscore(p):
@@ -199,6 +216,7 @@ def report(addr):
        f"**{verdict}**",
        f"- **Automation**: {bot} — 24/7 hour-coverage {int(p['hour_cov']*100)}%, overnight {int(p['overnight_frac']*100)}%, weekend {int(p['weekend_frac']*100)}%, interval-CV {p['interval_cv']}, taker {int(p['taker_frac']*100)}%",
        f"- **TRUST (martingale test)**: averages-into-losers **{int(p['avg_down_ratio']*100)}% of {p['adds']} adds** {'⚠️ UNTRUSTWORTHY' if p['avg_down_ratio']>0.3 and p['adds']>=5 else '✅ disciplined'}",
+       f"- **Knife-trap test**: payoff {p['payoff']} (avg win ${p['avg_win']:,} / avg loss ${p['avg_loss']:,}) {'⚠️ CATCHES KNIVES' if p['payoff']<0.4 and p['n_closed']>=10 else '✅ asymmetric'} · open uPnL ${p['open_upnl']:,} (paper-drag {int(p['paper_drag']*100)}%)",
        f"- **Consistency**: concentration {int(p['concentration']*100)}% (biggest trip ${p['biggest_trip']:,}) · maxDD ${p['maxdd']:,} ({int(p['maxdd_ratio']*100)}% of realized, {p['dd_duration']} trips underwater) · daily-Sharpe {p['sharpe']} · positive-days {int(p['pos_day_ratio']*100)}% · WR-by-third {p['wr_thirds']}",
        f"- **Activity**: {p['active_days']} active days / {p['span']}d span · last trade {p['recency_d']}d ago · max gap {p['max_gap_d']}d · {p['n_closed']} closed trips · WR {p['wr']}%",
        f"- **Worst day**: ${p['worst_day']:,} ({int(p['worst_day_ratio']*100)}% of realized) · realized ${p['realized']:,}",
