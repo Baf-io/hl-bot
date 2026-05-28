@@ -175,6 +175,8 @@ class Executor:
     # ── Order placement ────────────────────────────────────────────────────────
 
     async def _open_position(self, signal: TradeSignal, size_usd: float):
+        import time as _time
+        _t0 = _time.perf_counter()
         coin = signal.coin
         direction = signal.direction
 
@@ -208,7 +210,37 @@ class Executor:
                 logger.warning(f"[Executor] Could not set leverage for {coin}: {e}")
 
         # All strategies use market orders — latency matters, maker rebate is tiny vs missed entry
-        result = await self._place_market(coin, is_buy, size_coin)
+        # Tier 2a: for brain signals carrying an explicit stop_px, batch entry + native stop
+        # in a SINGLE signed HL payload (grouping='normalTpsl'). Cuts a full HL round-trip vs
+        # sequential market_open + place_stop. Copy/other paths keep the legacy sequential flow.
+        explicit_stop = signal.meta.get("stop_px")
+        use_batch = bool(explicit_stop) and float(explicit_stop or 0) > 0
+        if use_batch:
+            sl_px = self._round_px(float(explicit_stop))
+            # Direction sanity (must protect the trade, not adversely cross it)
+            if is_buy and not (sl_px < mid):
+                logger.warning(f"[Executor] {coin}: stop {sl_px} not below long entry {mid} — fall back to sequential")
+                use_batch = False
+            elif not is_buy and not (sl_px > mid):
+                logger.warning(f"[Executor] {coin}: stop {sl_px} not above short entry {mid} — fall back to sequential")
+                use_batch = False
+
+        _t_pre_market = _time.perf_counter()
+        if use_batch:
+            result = await self._place_market_with_stop_batch(coin, is_buy, size_coin, sl_px)
+            _t_post_market = _time.perf_counter()
+            batched_stop_oid = None
+            try:
+                if result and result.get("status") == "ok":
+                    statuses = result["response"]["data"]["statuses"]
+                    if len(statuses) >= 2:
+                        batched_stop_oid = (statuses[1].get("resting") or {}).get("oid")
+            except Exception as e:
+                logger.warning(f"[Executor] batched stop oid parse failed: {e}")
+        else:
+            result = await self._place_market(coin, is_buy, size_coin)
+            _t_post_market = _time.perf_counter()
+            batched_stop_oid = None
 
         filled, fill_px, err = self._parse_fill(result)
         if filled:
@@ -231,8 +263,36 @@ class Executor:
             # ── CONTRACT (B1): EVERY order MUST carry a native exchange stop. Place it
             # immediately after the fill; if it can't be confirmed, REJECT = close the
             # position right away (never hold an unstopped position).
-            stop_ok = await self._place_protective_stop(coin, is_buy, size_coin, actual_px,
-                                                        stop_px=signal.meta.get("stop_px"))
+            if batched_stop_oid is not None:
+                # Tier 2a fast path: the stop was already grouped with the entry. Verify it
+                # is actually resting (B1 contract — ack ≠ on-book) and skip the second POST.
+                stop_ok = False
+                for attempt in range(2):
+                    if attempt > 0:
+                        await asyncio.sleep(0.15)
+                    else:
+                        await asyncio.sleep(0.05)
+                    try:
+                        oo = self._info.open_orders(settings.HL_WALLET_ADDRESS)
+                        if any(o.get("oid") == batched_stop_oid for o in oo):
+                            stop_ok = True; break
+                    except Exception as e:
+                        logger.warning(f"[Executor] batched-stop verify {coin} attempt {attempt}: {e}")
+                if stop_ok:
+                    self._last_stop = {"coin": coin, "oid": batched_stop_oid, "px": sl_px}
+                    logger.success(f"[Executor] 🛡️ batched native STOP {coin} @ ${sl_px} oid={batched_stop_oid} CONFIRMED on book")
+                else:
+                    logger.error(f"[Executor] batched stop {coin} oid={batched_stop_oid} ACKed but NOT resting — treat as unstopped")
+            else:
+                stop_ok = await self._place_protective_stop(coin, is_buy, size_coin, actual_px,
+                                                            stop_px=signal.meta.get("stop_px"))
+            _t_post_stop = _time.perf_counter()
+            logger.info(
+                f"[Executor] T+ms {coin} prep={(_t_pre_market-_t0)*1000:.0f} "
+                f"{'batched_market+stop' if batched_stop_oid else 'market'}={(_t_post_market-_t_pre_market)*1000:.0f} "
+                f"stop_verify={(_t_post_stop-_t_post_market)*1000:.0f} "
+                f"total={(_t_post_stop-_t0)*1000:.0f}"
+            )
             sid = signal.meta.get("signal_id")
             if not stop_ok:
                 logger.error(
@@ -406,6 +466,33 @@ class Executor:
             logger.error(f"[Executor] market_open failed: {e}")
             return None
 
+    async def _place_market_with_stop_batch(self, coin: str, is_buy: bool, size: float,
+                                            stop_px: float, slippage: float = 0.001) -> dict | None:
+        """Tier 2a: single signed payload that places market entry + native protective stop.
+        HL `grouping='normalTpsl'` activates the stop only when the entry fills. Cuts a full
+        HL round-trip (~200-400ms saved vs sequential market_open + place_stop).
+        Response: statuses[0]=entry fill, statuses[1]=stop resting."""
+        if not self._exchange:
+            return None
+        try:
+            aggressive_px = self._exchange._slippage_price(coin, is_buy, slippage, None)
+            entry = {
+                "coin": coin, "is_buy": is_buy, "sz": size,
+                "limit_px": aggressive_px,
+                "order_type": {"limit": {"tif": "Ioc"}},
+                "reduce_only": False,
+            }
+            stop = {
+                "coin": coin, "is_buy": not is_buy, "sz": size,
+                "limit_px": stop_px,
+                "order_type": {"trigger": {"triggerPx": stop_px, "isMarket": True, "tpsl": "sl"}},
+                "reduce_only": True,
+            }
+            return self._exchange.bulk_orders([entry, stop], grouping="normalTpsl")
+        except Exception as e:
+            logger.error(f"[Executor] batched entry+stop failed: {e}")
+            return None
+
     async def _place_market_close(self, coin: str, sz: float | None = None) -> dict | None:
         """
         Close the live position for `coin`. Reduce-only by nature — the SDK reads the
@@ -525,15 +612,22 @@ class Executor:
             if oid is None:
                 logger.error(f"[Executor] stop {coin}: no resting oid in ack ({st}) — treat as unstopped")
                 return False
+            # Tier 1b: tighter eyes-on-book verify. HL typically makes a resting order
+            # visible within 50-150ms of ack; old 3-tries×0.4s baked in ~1.2s of polling.
+            # 2-tries × 0.15s = ~300ms worst case, still defense-in-depth against the
+            # rare "acked but not resting" failure mode that B1 is built to catch.
             resting = False
-            for attempt in range(3):
+            for attempt in range(2):
+                if attempt > 0:
+                    await asyncio.sleep(0.15)
+                else:
+                    await asyncio.sleep(0.05)   # tiny initial nudge — give HL the visibility window
                 try:
                     oo = self._info.open_orders(settings.HL_WALLET_ADDRESS)
                     if any(o.get("oid") == oid for o in oo):
                         resting = True; break
                 except Exception as e:
                     logger.warning(f"[Executor] stop re-query {coin} attempt {attempt}: {e}")
-                await asyncio.sleep(0.4)
             if not resting:
                 logger.error(f"[Executor] stop {coin} oid={oid} ACKed but NOT resting on HL — treat as unstopped")
                 return False

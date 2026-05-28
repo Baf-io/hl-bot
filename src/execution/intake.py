@@ -107,12 +107,19 @@ class IntakeServer:
 
     # ── HTTP handler ──────────────────────────────────────────────────────────
     async def intake(self, request: web.Request) -> web.Response:
+        # Tier 1c: stage timing instrumentation. Captures intake-stage latencies so
+        # we can see in logs where the brain-signal→stopped-position budget actually
+        # goes. Each stage logs its delta in ms; full breakdown only logged for
+        # accepted signals.
+        t0 = time.perf_counter()
         raw = await request.read()
+        t_recv = (time.perf_counter() - t0) * 1000
         sid = request.headers.get("X-Signal-Id", "")
         sig = request.headers.get("X-Signature", "")
         if not self._verify(raw, sig):
             logger.warning(f"[Intake] ⛔ REJECT bad/absent HMAC (sid={sid[:16]})")
             return web.json_response({"accepted": False, "reason": "bad signature", "order_ref": None}, status=401)
+        t_hmac = (time.perf_counter() - t0) * 1000
         if not sid:
             return web.json_response({"accepted": False, "reason": "missing X-Signal-Id", "order_ref": None}, status=400)
         if sid in self._seen:
@@ -126,6 +133,7 @@ class IntakeServer:
         if not ok:
             logger.warning(f"[Intake] ⛔ REJECT sid={sid[:16]} {p.get('coin')} {p.get('mode')}: {reason}")
             return web.json_response({"accepted": False, "reason": reason, "order_ref": None})
+        t_validate = (time.perf_counter() - t0) * 1000
         if settings.INTAKE_ACK_ONLY:
             logger.success(
                 f"[Intake] ✅ ACK-ONLY (handshake, NO order) sid={sid[:16]} "
@@ -135,6 +143,12 @@ class IntakeServer:
             return web.json_response({"accepted": True, "reason": "ack-only handshake — order NOT placed", "order_ref": None})
         # ── real execution (enabled after handshake) ──
         ref = await self._execute(p)
+        t_total = (time.perf_counter() - t0) * 1000
+        # Brain-side budget breakdown — see where the latency goes in real traffic.
+        logger.info(
+            f"[Intake] T+ms sid={sid[:16]} recv={t_recv:.1f} hmac={t_hmac:.1f} "
+            f"validate={t_validate:.1f} exec_enqueue={t_total:.1f}"
+        )
         return web.json_response({"accepted": ref is not None, "reason": "accepted" if ref else "enqueue failed", "order_ref": ref})
 
     async def _execute(self, p: dict) -> str | None:
