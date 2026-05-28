@@ -1,6 +1,7 @@
 # Smart Money Candidates — Research Handoff
-Generated: 2026-05-28 | Source: overnight deep-scan of 1,050+ HL wallets
+Generated: 2026-05-28 | Updated: 2026-05-28 (FULL 3,837-wallet scan complete)
 Filters: taker>=90%, no perfect 100% WR, n>=100 closed trades, positive realized PnL, paper-loss check, active or maxed fills
+Full scan: 280 qualified shorts, 420 qualified longs found across 3,837 wallets
 
 ---
 
@@ -15,6 +16,50 @@ Each wallet below has been vetted for copyability:
 - **ACTIVE** = currently has open positions or maxed fills
 
 Eliminated: makers, 100% WR (fake/thin), thin samples (<100), WR/PnL mismatch, scale-adders hiding paper losses, hyna:/@ dominated coins
+
+---
+
+## CRYPTO SHORT — TIER 1 BEARS (NEW — from full scan)
+
+### #1 BEAR MONSTER — 0x9c16bc8f1104e4d2f72267eb981fa12de7cc4a6f
+- Direction: SHORT | WR: 99.7% | n=872 | PnL: $4,101,028
+- Span: 163 days | Fills: MAXED | Status: ACTIVE
+- Open: SHORT BTC upnl=+$58,608 | SHORT ETH upnl=+$204,185 | SHORT SOL upnl=+$639,141
+- Top coins: SOL, BTC, ETH
+- Note: Largest short PnL in entire dataset. 163-day record. Positioned short all 3 majors RIGHT NOW. Undisputed #1 bear.
+
+### #2 BEAR — 0x6bea81d7a0c5939a5ce5552e125ab57216cc597f
+- Direction: SHORT | WR: 94.8% | n=1,778 | PnL: $1,880,477
+- Span: 56 days | Fills: MAXED | Status: ACTIVE
+- Open: SHORT BTC upnl=+$16,915 | SHORT ETH upnl=+$23,962 | SHORT SOL upnl=+$342,903
+- Top coins: SOL, BTC, ETH
+- Note: Largest n of any bear (1,778 trades). Same positions as #1 bear — coordinated signal.
+
+### #3 BEAR — 0xf899937184168b1d9dee75acbaa3fef0f52888db
+- Direction: SHORT | WR: 95.2% | n=1,127 | PnL: $971,433
+- Span: 96 days | Fills: MAXED | Status: ACTIVE
+- Open: SHORT BTC upnl=+$16,693 | SHORT ETH upnl=+$36,914 | SHORT SOL upnl=+$191,672
+- Top coins: SOL, BTC, ETH
+- Note: 96-day record. Third bear all positioned short BTC/ETH/SOL — STRONG CONSENSUS signal.
+
+> WARNING: All 3 top bears currently short BTC/ETH/SOL with combined $1.5M+ unrealized profits. This is a coordinated bear consensus — either copy or treat as macro signal.
+
+---
+
+## CRYPTO LONG — TIER 1 BULLS (NEW — from full scan)
+
+### #1 BULL MONSTER — 0x015354106478dda69c4aae3c0cf801290b738052
+- Direction: LONG | WR: 92.5% | n=1,238 | PnL: $3,001,665
+- Span: 206 days | Fills: MAXED | Status: FLAT
+- Top coins: BTC, ETH, XPL
+- Note: Largest long PnL in entire dataset ($3M). 206-day track record. Currently flat — wait for entry signal.
+
+### #2 BULL HIGH-WR — 0xbb34960afec64f3f1cc78b0c9c342c4657021696
+- Direction: LONG | WR: 96.3% | n=925 | PnL: $968,707
+- Span: 49 days | Fills: MAXED | Status: ACTIVE
+- Open: LONG BTC upnl=-$110,831 | LONG ETH upnl=-$431,415 | LONG HYPE upnl=+$1,677,712
+- Top coins: ETH, HYPE, BTC
+- Note: Net unrealized +$1.14M dominated by HYPE. Long BTC/ETH at current levels (paper losses) — wait and see.
 
 ---
 
@@ -38,6 +83,17 @@ Eliminated: makers, 100% WR (fake/thin), thin samples (<100), WR/PnL mismatch, s
 - Span: 102 days | Fills: MAXED | Status: ACTIVE
 - Open: 2 positions, upnl=+$17,169
 - Top coins: ETH, HYPE, BTC, xyz:SILVER
+
+### NEW #4 HIGH-WR — 0x962bdd83c3943fe08b62101fd9f9a8b923a0b475
+- Direction: SHORT | WR: 99.4% | n=524 | PnL: $316,000
+- Span: 85 days | Fills: 1,493 | Status: ACTIVE
+- Open: LONG ETH upnl=-$133,773 (counterposition — watch)
+- Top coins: xyz:CL, xyz:BRENTOIL, xyz:SP500
+
+### NEW #5 TRACK RECORD — 0x0050f3427e5388e9cc458e977bc3444faf015618
+- Direction: SHORT | WR: 80.9% | n=456 | PnL: $336,000
+- Span: 117 days | Fills: MAXED | Status: FLAT
+- Top coins: xyz:CL, xyz:SILVER, xyz:COPPER
 
 ---
 
@@ -66,6 +122,25 @@ Eliminated: makers, 100% WR (fake/thin), thin samples (<100), WR/PnL mismatch, s
 - Span: 50 days | Fills: MAXED | Status: ACTIVE
 - Open: 1 position, upnl=+$121,288
 - Top coins: BTC, xyz:SILVER, xyz:SP500
+
+### NEW #5 — 0x2d99fe0f36c1aebd28a1a2c0e82e8ca13c2ea351
+- Direction: LONG | WR: 91.2% | n=887 | PnL: $1,234,772
+- Span: 22 days | Fills: MAXED | Status: ACTIVE
+- Open: SHORT HYPE upnl=-$122,098 (hedge or error — watch)
+- Top coins: BTC, TON, xyz:CL
+- Note: $1.23M in 22 days. Likely automated. Strong commodity/crypto mix.
+
+### NEW #6 — 0x8bae3527e5a33fa0cf184f37bc112d071463ab6d
+- Direction: LONG | WR: 81.2% | n=897 | PnL: $1,146,324
+- Span: 47 days | Fills: MAXED | Status: ACTIVE
+- Open: LONG FET upnl=+$9,649
+- Top coins: cash:INTC, xyz:CL, xyz:BRENTOIL
+- Note: $1.15M. Unique INTC + commodity mix. 47-day record.
+
+### NEW #7 — 0xb9eb061e64d32c8e0a6c6992a7dc32a32df9cb74
+- Direction: LONG | WR: 93.8% | n=822 | PnL: $416,380
+- Span: 44 days | Fills: MAXED | Status: FLAT
+- Top coins: xyz:SNDK, xyz:CL, xyz:TSM
 
 ---
 
@@ -164,18 +239,24 @@ Eliminated: makers, 100% WR (fake/thin), thin samples (<100), WR/PnL mismatch, s
 
 ---
 
-## SUMMARY TABLE — TOP PICKS PER SLOT
+## SUMMARY TABLE — TOP PICKS PER SLOT (Updated after full 3,837-wallet scan)
 
-| Slot | Address | Dir | WR | PnL | Span | Status |
-|------|---------|-----|----|-----|------|--------|
-| COMMODITY_SHORT | 0x9c972d06ec | SHORT | 99.3% | $135k | 77d | ACTIVE |
-| COMMODITY_SHORT_VET | 0xc7be26ab | SHORT | 93.0% | $87k | 491d | FLAT |
-| COMMODITY_LONG | 0xd360ecb9 | LONG | 89.6% | $104k | 925d | FLAT |
-| COMMODITY_LONG_ACT | 0x6b7076bf | LONG | 93.6% | $73k | 23d | ACTIVE |
-| EQUITY_SHORT | 0xa243ecc6 | SHORT | 79.5% | $160k | 139d | ACTIVE |
-| EQUITY_LONG | 0x27c5fdef | LONG | 90.1% | $188k | 801d | ACTIVE |
-| CRYPTO_SHORT | 0x2f01afc9 | SHORT | 95.7% | $312k | 238d | ACTIVE |
-| CRYPTO_LONG | 0x24a44aef | LONG | 99.6% | $463k | 299d | ACTIVE |
+| Slot | Address | Dir | WR | PnL | Span | Status | Notes |
+|------|---------|-----|----|-----|------|--------|-------|
+| CRYPTO_SHORT_#1 | 0x9c16bc8f | SHORT | 99.7% | $4.1M | 163d | ACTIVE | Short BTC/ETH/SOL now |
+| CRYPTO_SHORT_#2 | 0x6bea81d7 | SHORT | 94.8% | $1.88M | 56d | ACTIVE | Same positions as #1 |
+| CRYPTO_SHORT_#3 | 0xf8999371 | SHORT | 95.2% | $971k | 96d | ACTIVE | Same positions as #1 |
+| CRYPTO_LONG_#1 | 0x015354106 | LONG | 92.5% | $3.0M | 206d | FLAT | Wait for entry |
+| CRYPTO_LONG_#2 | 0x24a44aef | LONG | 99.6% | $463k | 299d | ACTIVE | Longest crypto long record |
+| CRYPTO_LONG_#3 | 0xbb34960a | LONG | 96.3% | $969k | 49d | ACTIVE | Long HYPE +$1.68M |
+| COMMODITY_SHORT_#1 | 0x9c972d06ec | SHORT | 99.3% | $135k | 77d | ACTIVE | Crude oil |
+| COMMODITY_SHORT_VET | 0xc7be26ab | SHORT | 93.0% | $87k | 491d | FLAT | 491d record |
+| COMMODITY_SHORT_NEW | 0x0050f342 | SHORT | 80.9% | $336k | 117d | FLAT | CL/Silver/Copper |
+| COMMODITY_LONG_#1 | 0xd360ecb9 | LONG | 89.6% | $104k | 925d | FLAT | 925d record |
+| COMMODITY_LONG_NEW | 0x2d99fe0f | LONG | 91.2% | $1.23M | 22d | ACTIVE | BTC+CL mix, likely auto |
+| COMMODITY_LONG_NEW2 | 0x8bae3527 | LONG | 81.2% | $1.15M | 47d | ACTIVE | INTC+CL |
+| EQUITY_SHORT | 0xa243ecc6 | SHORT | 79.5% | $160k | 139d | ACTIVE | SP500 |
+| EQUITY_LONG | 0x27c5fdef | LONG | 90.1% | $188k | 801d | ACTIVE | NVDA/HYPE |
 
 ---
 

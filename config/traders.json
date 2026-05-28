@@ -154,5 +154,57 @@
     "avg_leverage": 14,
     "trade_count": 2000,
     "account_age_days": 248
+  },
+  {
+    "address": "0x9c16bc8f1104e4d2f72267eb981fa12de7cc4a6f",
+    "label": "9c16bc8f (CRYPTO-BEAR MONSTER)",
+    "note": "99.7% WR, 100% taker, $4.1M realized / 163d. SOL/BTC/ETH short specialist. 872 closed shorts. MAXED fills. ACTIVE NOW: SHORT BTC +$58k, SHORT ETH +$204k, SHORT SOL +$639k. Largest short PnL in full 3837-wallet scan. Undisputed #1 bear.",
+    "specialty": "BTC",
+    "weight": 1.0,
+    "alltime_pnl": 4101028,
+    "win_rate": 0.997,
+    "max_drawdown": 0.1,
+    "avg_leverage": 15,
+    "trade_count": 2000,
+    "account_age_days": 163
+  },
+  {
+    "address": "0x24a44aef48aeb27c7708dabfccda14b41fbf0ae1",
+    "label": "24a44aef (crypto-long #1)",
+    "note": "99.6% WR, 100% taker, $462k realized / 299d. HYPE/ETH/XPL/ASTER dominant. 805 closed longs. MAXED fills. ACTIVE: 4 open longs, upnl +$160k. Longest active crypto long record. Undisputed #1 crypto bull.",
+    "specialty": null,
+    "weight": 0.9,
+    "alltime_pnl": 462616,
+    "win_rate": 0.996,
+    "max_drawdown": 0.1,
+    "avg_leverage": 8,
+    "trade_count": 2000,
+    "account_age_days": 299
+  },
+  {
+    "address": "0x9c972d06eceee9dc08e2d295742d2045f8e54fa2",
+    "label": "9c972d06 (commodity-short active)",
+    "note": "99.3% WR, 100% taker, $134k realized / 77d. xyz:CL crude oil specialist. 442 closed shorts. MAXED fills. ACTIVE: 1 position +$6k. Highest PnL commodity short currently positioned.",
+    "specialty": "commodity",
+    "weight": 0.7,
+    "alltime_pnl": 134652,
+    "win_rate": 0.993,
+    "max_drawdown": 0.08,
+    "avg_leverage": 5,
+    "trade_count": 2000,
+    "account_age_days": 77
+  },
+  {
+    "address": "0x27c5fdef9a082abd0711c611dbde9d7db9611aae",
+    "label": "27c5fdef (equity-long veteran)",
+    "note": "90.1% WR, 100% taker, $187k realized / 801d. HYPE/BTC/xyz:NVDA. 343 closed longs. ACTIVE: 1 position +$4k. Most battle-tested equity long in dataset. 801d = 2.2yr record.",
+    "specialty": "equity",
+    "weight": 0.7,
+    "alltime_pnl": 187945,
+    "win_rate": 0.901,
+    "max_drawdown": 0.15,
+    "avg_leverage": 4,
+    "trade_count": 857,
+    "account_age_days": 801
   }
 ]
