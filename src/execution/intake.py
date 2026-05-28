@@ -92,10 +92,13 @@ class IntakeServer:
         else:  # live
             if p["source"] not in settings.KEEP_SOURCES:
                 return False, f"live but source '{p['source']}' not KEEP-validated"
-        # max 1 open position
-        if len(self.risk.open_positions) >= settings.MAX_OPEN_POSITIONS:
-            return False, f"max {settings.MAX_OPEN_POSITIONS} open position(s) reached"
-        # no averaging into an existing coin
+        # max-positions count excludes "synced" (user discretion on MAIN at boot) so the
+        # bot's 1-slot quota isn't permanently consumed by hand trades.
+        bot_open = [x for x in self.risk.open_positions if x.strategy != "synced"]
+        if len(bot_open) >= settings.MAX_OPEN_POSITIONS:
+            return False, f"max {settings.MAX_OPEN_POSITIONS} bot-managed position(s) reached"
+        # no averaging into an existing coin (including user's discretionary MAIN —
+        # brain may not open the same coin the user is already in)
         if any(x.coin == p["coin"] for x in self.risk.open_positions):
             return False, f"already hold {p['coin']} (no averaging)"
         # kill-switches

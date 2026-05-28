@@ -179,6 +179,11 @@ async def main():
                 await alerter.halt_alert(risk._daily_pnl / risk.portfolio_value)
             was_halted = risk._trading_halted
             for pos in list(risk.open_positions):
+                # MAIN-is-hands-off contract: positions discovered at boot via
+                # _sync_positions_from_hl are user-discretion; the guardian must NOT
+                # zombie/nuclear-close them. (CLAUDE.md rule #1.)
+                if pos.strategy == "synced":
+                    continue
                 current_price = store.latest_mid(pos.coin)
                 if current_price:
                     risk.update_unrealized(pos.coin, current_price)

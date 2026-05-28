@@ -25,7 +25,7 @@ class FundingSnapshot:
 
 @dataclass
 class TradeSignal:
-    strategy: str           # "funding_carry" | "leaderboard" | "cascade"
+    strategy: str           # "leaderboard" (shadow) | "brain" (intake) | "synced" (user MAIN at boot)
     coin: str
     direction: str          # "long" | "short"
     size_usd: float
