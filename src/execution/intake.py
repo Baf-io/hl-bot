@@ -36,6 +36,13 @@ class IntakeServer:
         self.alerter = alerter
         self._seen: set[str] = set()          # idempotency keys (X-Signal-Id)
         self._seen_order: deque[str] = deque(maxlen=5000)  # bound memory
+        # Heartbeat tracking — keyed by box (e.g. "gaming-pc", "bafscrape-1"). Last seen
+        # per box; lets us see in /heartbeat-status if an external pipeline is alive.
+        self._heartbeats: dict[str, dict] = {}
+        # Source-types that POST signals without needing KEEP_SOURCES graduation. They're
+        # auto-allowed at probe size (or info-only mode) because the gating happens upstream
+        # in the brain/gaming-PC pipelines, not here.
+        self._auto_allow_source_types = {"whaleflow", "funding_div"}
 
     # ── auth ──────────────────────────────────────────────────────────────────
     def _verify(self, raw: bytes, sig: str) -> bool:
@@ -53,22 +60,31 @@ class IntakeServer:
 
     # ── independent cardinal re-enforcement (reject if violated) ──────────────
     def _validate(self, p: dict) -> tuple[bool, str]:
-        req = ["signal_id", "coin", "direction", "size_notional", "entry", "stop",
-               "hold_seconds", "mode", "source", "ts_emitted"]
+        # info_only mode (gaming-PC funding-divergence etc.): log+ntfy, no execution.
+        # Has lighter required-fields since there's no order to place.
+        is_info = p.get("mode") == "info_only"
+        if is_info:
+            req = ["signal_id", "coin", "direction", "mode", "source", "ts_emitted"]
+        else:
+            req = ["signal_id", "coin", "direction", "size_notional", "entry", "stop",
+                   "hold_seconds", "mode", "source", "ts_emitted"]
         for k in req:
             if k not in p:
                 return False, f"missing field {k}"
         d = p["direction"]
         if d not in ("long", "short"):
             return False, "bad direction"
-        if p["mode"] not in ("probe", "live"):
+        if p["mode"] not in ("probe", "live", "info_only"):
             return False, "bad mode"
+        if time.time() - float(p["ts_emitted"]) > settings.STALE_SIGNAL_S:
+            return False, "stale ts_emitted"
+        # info_only short-circuits — no entry/stop/size to validate
+        if is_info:
+            return True, "ok (info_only)"
         try:
             entry = float(p["entry"]); stop = float(p["stop"]); sz = float(p["size_notional"])
         except (TypeError, ValueError):
             return False, "non-numeric entry/stop/size"
-        if time.time() - float(p["ts_emitted"]) > settings.STALE_SIGNAL_S:
-            return False, "stale ts_emitted"
         # stop present + on the correct side of entry
         if entry <= 0 or stop <= 0:
             return False, "entry/stop must be > 0"
@@ -90,7 +106,10 @@ class IntakeServer:
             if risk_usd > settings.PROBE_MAX_RISK_USD:
                 return False, f"probe risk ${risk_usd:.2f} > ${settings.PROBE_MAX_RISK_USD}"
         else:  # live
-            if p["source"] not in settings.KEEP_SOURCES:
+            # Auto-allow recognized source_types (gaming-PC pipelines) without forcing KEEP
+            # graduation — they're upstream-gated. Other sources still need KEEP for live.
+            stype = p.get("source_type")
+            if stype not in self._auto_allow_source_types and p["source"] not in settings.KEEP_SOURCES:
                 return False, f"live but source '{p['source']}' not KEEP-validated"
         # max-positions count excludes "synced" (user discretion on MAIN at boot) so the
         # bot's 1-slot quota isn't permanently consumed by hand trades.
@@ -138,12 +157,19 @@ class IntakeServer:
             return web.json_response({"accepted": False, "reason": reason, "order_ref": None})
         t_validate = (time.perf_counter() - t0) * 1000
         if settings.INTAKE_ACK_ONLY:
+            sz = p.get("size_notional", "n/a"); en = p.get("entry", "n/a"); st_ = p.get("stop", "n/a")
             logger.success(
                 f"[Intake] ✅ ACK-ONLY (handshake, NO order) sid={sid[:16]} "
-                f"{p['mode']} {p['direction']} {p['coin']} ${p['size_notional']:.0f} "
-                f"entry {p['entry']} stop {p['stop']} ttl {p['hold_seconds']}s src={p['source']}"
+                f"{p['mode']} {p['direction']} {p['coin']} sz={sz} "
+                f"entry {en} stop {st_} src={p['source']} type={p.get('source_type', 'brain')}"
             )
             return web.json_response({"accepted": True, "reason": "ack-only handshake — order NOT placed", "order_ref": None})
+        # info_only: log + ntfy + persist short-status, do NOT execute. Gaming-PC funding-
+        # divergence and similar advisory signals go here. The brain/upstream owns the
+        # decision to escalate to probe/live later.
+        if p["mode"] == "info_only":
+            await self._handle_info_only(p)
+            return web.json_response({"accepted": True, "reason": "info_only logged + alerted", "order_ref": p["signal_id"]})
         # ── real execution (enabled after handshake) ──
         ref = await self._execute(p)
         t_total = (time.perf_counter() - t0) * 1000
@@ -184,6 +210,45 @@ class IntakeServer:
         logger.success(f"[Intake] ▶ ENQUEUED {p['direction']} {p['coin']} ${size_usd:.0f} (src {p['source']}, {p['mode']})")
         return p["signal_id"]
 
+    async def _handle_info_only(self, p: dict):
+        """Log + ntfy an advisory signal without executing. Source-type-aware message."""
+        sid = p["signal_id"]; coin = p["coin"]; dirn = p["direction"]
+        stype = p.get("source_type", "advisory"); src = p["source"]
+        ev = p.get("evidence", {})
+        ev_brief = " · ".join(f"{k}={v}" for k, v in list(ev.items())[:4]) if ev else ""
+        logger.success(f"[Intake] 📰 INFO sid={sid[:16]} {stype} {dirn} {coin} src={src} | {ev_brief}")
+        if self.alerter:
+            try:
+                await self.alerter.send(
+                    f"📰 *{stype}* {dirn.upper()} {coin}\n"
+                    f"src: {src}\n{ev_brief}"
+                )
+            except Exception as e:
+                logger.warning(f"[Intake] info_only alerter fail: {e}")
+
+    async def heartbeat(self, request: web.Request) -> web.Response:
+        """External pipelines (LXC brain, gaming-PC ETL) POST liveness here. We don't
+        verify HMAC for this endpoint — heartbeats are non-actionable, low-value. Body:
+        {"box": "gaming-pc", "pipeline": "whaleflow", "last_run_ts": ..., "last_success_ts": ..., "queue_depth": ...}"""
+        try:
+            p = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "reason": "bad json"}, status=400)
+        box = p.get("box", "unknown"); pipeline = p.get("pipeline", "")
+        key = f"{box}:{pipeline}" if pipeline else box
+        self._heartbeats[key] = {**p, "received_at": int(time.time())}
+        logger.debug(f"[Intake] 💓 heartbeat {key} last_success={p.get('last_success_ts')} q={p.get('queue_depth')}")
+        return web.json_response({"ok": True})
+
+    async def heartbeat_status(self, request: web.Request) -> web.Response:
+        """GET — returns the last-seen heartbeat per (box, pipeline). Used for ops checks."""
+        now = int(time.time())
+        out = {}
+        for k, v in self._heartbeats.items():
+            age = now - int(v.get("received_at", 0))
+            out[k] = {**v, "age_s": age, "stale": age > 1800}
+        return web.json_response({"now": now, "boxes": out})
+
     async def status(self, request: web.Request) -> web.Response:
         """Brain polls this after sending: echoes the FILL + whether the protective stop is
         actually resting on HL (verified, not 'accepted'). 404-ish {pending} until the
@@ -199,6 +264,8 @@ class IntakeServer:
         app.router.add_post("/intake", self.intake)
         app.router.add_get("/status/{sid}", self.status)
         app.router.add_get("/health", lambda r: web.json_response({"ok": True, "ack_only": settings.INTAKE_ACK_ONLY}))
+        app.router.add_post("/heartbeat", self.heartbeat)
+        app.router.add_get("/heartbeat-status", self.heartbeat_status)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, settings.INTAKE_HOST, settings.INTAKE_PORT)
