@@ -31,22 +31,30 @@ STATE  = "/root/hl-bot/data/shadow_scan_state.json"
 # Rewritten 2026-05-29 after the 3,837-wallet scan + upgraded forensic gates
 # (knife-trap, paper-drag, sample-aware concentration, warn-vs-reject tiering).
 #
-# ALL 5 sister-agent picks from the bigger data bank (0x9c16bc8f bear monster,
-# 0x6bea81d7, 0xf8999371, 0x9c972d06, 0x27c5fdef) hard-rejected under the new
-# forensic — same 99%-WR loss-hider footprint that's failed every prior whale
-# sweep. Bigger pool, same lesson: real copy edge is rare. Do not shadow them.
+# Expanded 2026-05-29 PM after the v2.1 scan (23 survivors) + live spot-check.
+# Added 3 names from the v2.1 batch + 1 explicit HFT lag-test:
+#   - 0x8a820d3b  live cscore 66.5 CLEAN, SOL swing, 4-leg book live, sharpest
+#                 payoff (5.32) in the copyable set. 29 trips → small sample
+#                 so shadow first; promote only if paper holds.
+#   - 0x186a0ede  live cscore 54.6 CLEAN, ETH swing, 88% WR, currently flat.
+#                 Sporadic (max gap 60d) so shadow tests whether he stays active.
+#   - 0x0526345b  HFT lag-test. Real cscore 92.5 but 183 trips/day @ $25 avg
+#                 win = uncopyable in theory. Shadow PROVES the lag eats the
+#                 edge (or doesn't) at 20s poll — definitive data point.
 #
-# What IS shadow-worthy: the 4 COPYABLE_DB Tier 1 names that pass forensic
-# but aren't yet sleeved. Shadow tracks "what would a sleeve have realized"
-# while source-health tracks the trust score — complementary signals.
-#
-# Kept 36f2 from the prior batch (67% WR small sample, still inconclusive).
+# v2.1 scanner shipped 0x0252f92e as CLEAN cscore 46.3 but live forensic says
+# REJECT (90% one-trade-dep, stale 146d). Scanner has a realized_pnl / recency_d
+# bug — see research/SCANNER_v2.1_BUGREPORT.md. Do not promote his row until
+# the LXC fixes the calc + re-ships.
 CANDS = {
     "36f2_patient":         "0x36f26e2e5bed062968c17fc770863fd740713205",
     "da830d2d_HYPEmajors":  "0xda830d2d83a57cea255bcfd0cf89c3e94abde0fd",
     "c4ea203e_liquidmajor": "0xc4ea203e2eb096c4d949b9a64a5d49c0a8a1d8b3",
     "e6deb805_BTCSOLswing": "0xe6deb8055207cf89fd3111f581708705a1bd0c4f",
     "74dd1b67_ETHBNB":      "0x74dd1b672c1efbdd2559aa39e31cb56792a151bd",
+    "8a820d3b_SOLswing":    "0x8a820d3b050bafc0a1f3156706f28038aa292dce",
+    "186a0ede_ETHsharp":    "0x186a0ede279bb1e46fc383d990635d32dda655f2",
+    "0526345b_HFT_lagtest": "0x0526345bf8e09eb32256008c2844c8949ee3bb9a",
 }
 FLAT_EPS = 1e-9
 
