@@ -28,12 +28,25 @@ POLL_S = 300     # 5 min — paper validation doesn't need 60s; saves rate-limit
 STAKE  = 100.0   # nominal $ per paper position (for $ display; ranking uses return%)
 STATE  = "/root/hl-bot/data/shadow_scan_state.json"
 
-# Trimmed 2026-05-28: ca41/2c5d/78dc dropped (zero fresh entries in 3 days — too quiet
-# to validate via shadow), 05c6 dropped (-41% on 7/7 catch-knife losses). Only 36f2
-# retained — 67% WR on small sample, currently HYPE long. If shadow holds positive over
-# 2 more weeks of data, candidate for sleeve.
+# Rewritten 2026-05-29 after the 3,837-wallet scan + upgraded forensic gates
+# (knife-trap, paper-drag, sample-aware concentration, warn-vs-reject tiering).
+#
+# ALL 5 sister-agent picks from the bigger data bank (0x9c16bc8f bear monster,
+# 0x6bea81d7, 0xf8999371, 0x9c972d06, 0x27c5fdef) hard-rejected under the new
+# forensic — same 99%-WR loss-hider footprint that's failed every prior whale
+# sweep. Bigger pool, same lesson: real copy edge is rare. Do not shadow them.
+#
+# What IS shadow-worthy: the 4 COPYABLE_DB Tier 1 names that pass forensic
+# but aren't yet sleeved. Shadow tracks "what would a sleeve have realized"
+# while source-health tracks the trust score — complementary signals.
+#
+# Kept 36f2 from the prior batch (67% WR small sample, still inconclusive).
 CANDS = {
-    "36f2_patient":    "0x36f26e2e5bed062968c17fc770863fd740713205",
+    "36f2_patient":         "0x36f26e2e5bed062968c17fc770863fd740713205",
+    "da830d2d_HYPEmajors":  "0xda830d2d83a57cea255bcfd0cf89c3e94abde0fd",
+    "c4ea203e_liquidmajor": "0xc4ea203e2eb096c4d949b9a64a5d49c0a8a1d8b3",
+    "e6deb805_BTCSOLswing": "0xe6deb8055207cf89fd3111f581708705a1bd0c4f",
+    "74dd1b67_ETHBNB":      "0x74dd1b672c1efbdd2559aa39e31cb56792a151bd",
 }
 FLAT_EPS = 1e-9
 
