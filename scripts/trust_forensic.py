@@ -156,24 +156,57 @@ def is_bot(p):
     if p["overnight_frac"]<0.05 and p["hour_cov"]<0.6: return "discretionary (human hours)"
     return "mixed"
 
+def _conc_sample_floor(n):
+    """Sample-aware concentration floor: a trader w/ many closed trips earns a tighter
+    ceiling; a small sample gets more headroom (one big close shouldn't auto-disqualify).
+    n=10 → 0.40, n=26 → 0.34, n=100 → 0.31, n=1000 → 0.30. Capped at 0.50 (hard fail)."""
+    return min(0.30 + 1.0 / max(n, 1), 0.50)
+
 def gates(p):
+    """HARD REJECT gates — flunk any of these and the source is uncopyable."""
     fails=[]
-    if p["concentration"]>0.30: fails.append(f"one-trade-dependent ({int(p['concentration']*100)}% from 1 trip)")
+    n = max(p["n_closed"], 1)
+    # Concentration: hard fail only at >50% (one trade > half of realized). The 30-50%
+    # band w/ sample-aware floor is now WATCH (see warns()), not REJECT.
+    if p["concentration"]>0.50:
+        fails.append(f"one-trade-dependent ({int(p['concentration']*100)}% from 1 trip)")
     if p["maxdd_ratio"]>0.40: fails.append(f"deep drawdown ({int(p['maxdd_ratio']*100)}% of realized)")
     if p["worst_day_ratio"]>0.40: fails.append(f"blowup day (-${abs(p['worst_day']):,})")
     if p["avg_down_ratio"]>0.30 and p["adds"]>=5: fails.append(f"MARTINGALE — averages into losers ({int(p['avg_down_ratio']*100)}% of adds)")
     if p["active_days"]/max(p["span"],1)<0.15: fails.append(f"sporadic ({p['active_days']} active days in {int(p['span'])})")
     if p["recency_d"]>14: fails.append(f"stale (last trade {int(p['recency_d'])}d ago)")
-    # KNIFE-TRAP: small wins + big losses = catches falling knives. Combined w/ high WR = loss-hider.
     if p["payoff"]<0.40 and p["n_closed"]>=10:
         fails.append(f"KNIFE-TRAP — small wins/big losses (payoff {p['payoff']}, avg win ${p['avg_win']} vs avg loss ${p['avg_loss']})")
-    # PAPER-DRAG: he's sitting on open losses ≥ his realized PnL (hiding losers in unrealized)
     if p["paper_drag"]>1.0:
         fails.append(f"PAPER-DRAG — open uPnL ${p['open_upnl']:,} hides losses (drag {int(p['paper_drag']*100)}% of realized)")
     return fails
 
+def warns(p):
+    """SOFT yellow flags — metrics in a grey zone. Each one reduces cscore by 25% but
+    doesn't auto-reject. Lets us see degradation early w/o false-flagging healthy
+    behavior (e.g. a continuous trader closing one meaningfully sized winner)."""
+    out=[]
+    n = max(p["n_closed"], 1)
+    # Concentration above the sample-aware floor but not yet at hard-fail (>50%)
+    floor = _conc_sample_floor(n)
+    if floor < p["concentration"] <= 0.50:
+        out.append(f"yellow: concentration {int(p['concentration']*100)}% > sample-floor {int(floor*100)}% (n={n})")
+    # Payoff in mid-zone — not knife-trap but not asymmetric either
+    if 0.40 <= p["payoff"] < 0.7 and p["n_closed"] >= 10:
+        out.append(f"yellow: payoff {p['payoff']} — small wins (asymmetry weak)")
+    # Paper-drag between 50-100% of realized: he's holding meaningful unrealized losses
+    if 0.50 < p["paper_drag"] <= 1.0:
+        out.append(f"yellow: paper-drag {int(p['paper_drag']*100)}% — open losses ≥ half of realized")
+    # WR degrading across thirds (last third < first third by >20pts)
+    th = p.get("wr_thirds") or []
+    if len(th) == 3 and th[0] - th[2] >= 20:
+        out.append(f"yellow: WR degrading by third {th}")
+    return out
+
 def cscore(p):
-    # consistency-first composite (no ROI, no size). 0..100.
+    # consistency-first composite (no ROI, no size). 0..100. Each WATCH-tier warn
+    # (see warns()) compounds a 25% penalty so a yellow source still scores but lower —
+    # so a sample-aware concentration trip doesn't pretend the trader is perfect.
     if p["realized"]<=0: return 0
     c_conc=max(0,1-p["concentration"]/0.5)
     c_dd  =max(0,1-p["maxdd_ratio"]/0.6)
@@ -183,7 +216,9 @@ def cscore(p):
     consistency=(0.28*c_conc+0.24*c_dd+0.18*c_shp+0.15*c_pos+0.15*c_act)
     trust=1.0-min(p["avg_down_ratio"],1.0)*0.7          # martingale crushes trust
     fresh=1.0 if p["recency_d"]<=7 else (0.6 if p["recency_d"]<=14 else 0.2)
-    return round(consistency*trust*fresh*100,1)
+    base = consistency*trust*fresh*100
+    warn_penalty = 0.75 ** len(warns(p))                # each yellow → ×0.75
+    return round(base * warn_penalty, 1)
 
 def etherscan_origin(addr):
     if not ETHERSCAN: return "n/a"
@@ -209,9 +244,14 @@ def hl_vault(addr):
 def report(addr):
     p=forensic(addr)
     if not p: return f"\n## `{addr}`\n_insufficient history_\n", 0
-    fails=gates(p); score=0 if fails else cscore(p)
+    fails=gates(p); warn=warns(p); score=0 if fails else cscore(p)
     bot=is_bot(p); ev=etherscan_origin(addr); vault=hl_vault(addr)
-    verdict = ("❌ REJECT — "+"; ".join(fails)) if fails else f"✅ CLEAN — consistency score {score}"
+    if fails:
+        verdict = "❌ REJECT — "+"; ".join(fails)
+    elif warn:
+        verdict = f"🟡 WATCH (score {score}, {len(warn)} yellow flag{'s' if len(warn)>1 else ''}) — "+"; ".join(warn)
+    else:
+        verdict = f"✅ CLEAN — consistency score {score}"
     L=[f"\n## `{addr}`",
        f"**{verdict}**",
        f"- **Automation**: {bot} — 24/7 hour-coverage {int(p['hour_cov']*100)}%, overnight {int(p['overnight_frac']*100)}%, weekend {int(p['weekend_frac']*100)}%, interval-CV {p['interval_cv']}, taker {int(p['taker_frac']*100)}%",

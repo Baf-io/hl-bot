@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 load_dotenv("/root/hl-bot/.env")
 
 sys.path.insert(0, "/root/hl-bot/scripts")
-from trust_forensic import forensic, gates, cscore
+from trust_forensic import forensic, gates, cscore, warns
 
 STATE     = "/root/hl-bot/data/source_health.json"
 TOPIC     = os.getenv("NTFY_TOPIC", "")
@@ -67,11 +67,12 @@ def save_state(s): json.dump(s, open(STATE, "w"), indent=2)
 
 
 def score_one(addr):
-    """Returns (score, fails, metrics) where metrics has the key numbers we care about."""
+    """Returns (score, fails, warn, metrics)."""
     p = forensic(addr)
     if not p:
-        return None, ["insufficient history"], None
+        return None, ["insufficient history"], [], None
     f = gates(p)
+    w = warns(p)
     s = 0.0 if f else float(cscore(p))
     metrics = {
         "wr": p.get("wr"),
@@ -83,17 +84,20 @@ def score_one(addr):
         "realized": p.get("realized"),
         "recency_d": p.get("recency_d"),
     }
-    return s, f, metrics
+    return s, f, w, metrics
 
 
 def check_one(short, addr, note, state):
     print(f"  [{short}] {note} — running forensic...", flush=True)
-    score, fails, m = score_one(addr)
+    score, fails, warn, m = score_one(addr)
     now = int(time.time())
     prev = state.get(short, {})
     baseline = prev.get("baseline_score")
     last_score = prev.get("last_score")
-    was_clean = (last_score or 0) > 0 and not (prev.get("last_fails") or [])
+    prev_fails = prev.get("last_fails") or []
+    prev_warns = prev.get("last_warns") or []
+    was_clean = (last_score or 0) > 0 and not prev_fails and not prev_warns
+    was_watch = (last_score or 0) > 0 and not prev_fails and prev_warns
 
     entry = {
         "addr": addr, "note": note,
@@ -102,28 +106,34 @@ def check_one(short, addr, note, state):
         "last_check_ts": now,
         "last_check_iso": dt.datetime.fromtimestamp(now, dt.UTC).strftime("%Y-%m-%dT%H:%MZ"),
         "last_fails": fails or [],
+        "last_warns": warn or [],
         "history": (prev.get("history") or []) + [{
-            "ts": now, "score": score, "fails": fails or [], **(m or {})
+            "ts": now, "score": score, "fails": fails or [], "warns": warn or [], **(m or {})
         }],
     }
     entry["history"] = entry["history"][-HIST_KEEP:]
     state[short] = entry
 
     if baseline is None:
-        # First-ever check — seed baseline. If the seed is already failing, ntfy NOW —
-        # otherwise we'd wait forever for a "drop from 0" that can't happen.
-        print(f"     baseline seeded @ score={score} fails={fails}", flush=True)
-        if (score or 0) < ABS_FAIL or fails:
+        # First-ever check — seed baseline. If the seed is already failing / on watch,
+        # ntfy NOW — otherwise we'd wait forever for a "drop from 0" that can't happen.
+        print(f"     baseline seeded @ score={score} fails={fails} warns={warn}", flush=True)
+        if (score or 0) < ABS_FAIL or fails or warn:
             metrics_line = (f"wr={m['wr']}% n={m['n_closed']} payoff={m['payoff']} "
                             f"mart={int(m['avg_down_ratio']*100)}% paper={int(m['paper_drag']*100)}%"
                             if m else "(no metrics)")
-            push(f"Source health: {short} BASELINE FAIL",
-                 f"{note}\nFirst check is already failing — no historical baseline established.\n"
-                 f"Fails: {', '.join(fails[:3]) if fails else 'low score'}\n{metrics_line}",
+            issues = ", ".join((fails or []) + (warn or [])) or "low score"
+            push(f"Source health: {short} BASELINE {('REJECT' if fails else 'WATCH')}",
+                 f"{note}\nFirst check tier: {('REJECT' if fails else 'WATCH')}.\n"
+                 f"Issues: {issues}\n{metrics_line}",
                  tags="warning", prio="default")
         return
 
-    # Detection
+    # Three-tier verdict: CLEAN / WATCH / REJECT
+    is_clean_now  = (score or 0) > 0 and not fails and not warn
+    is_watch_now  = (score or 0) > 0 and not fails and warn
+    is_reject_now = bool(fails)
+
     alerts = []
     if score is not None and baseline is not None:
         drop = baseline - score
@@ -131,9 +141,10 @@ def check_one(short, addr, note, state):
             alerts.append(("SCORE DROP", f"score {baseline:.1f}→{score:.1f} (-{drop:.1f}pts vs baseline)"))
         if score < ABS_FAIL and (last_score or baseline) >= ABS_FAIL:
             alerts.append(("ABS FAIL", f"score {score:.1f} < {ABS_FAIL:.0f} floor"))
-    is_clean_now = (score or 0) > 0 and not fails
-    if was_clean and not is_clean_now:
-        alerts.append(("GATE FLIP", f"newly failing: {', '.join(fails[:2]) if fails else 'low score'}"))
+    if was_clean and is_watch_now:
+        alerts.append(("CLEAN->WATCH", f"yellow flags: {', '.join(warn[:2])}"))
+    if (was_clean or was_watch) and is_reject_now:
+        alerts.append(("REJECT", f"newly failing: {', '.join(fails[:2]) if fails else 'low score'}"))
     if (not was_clean) and is_clean_now and last_score is not None:
         alerts.append(("RECOVERY", f"back to CLEAN @ score {score:.1f}"))
 
@@ -145,9 +156,11 @@ def check_one(short, addr, note, state):
                         if m else "(no metrics)")
         msg = (f"{note}\n{details}\n\n{metrics_line}\nrealized=${m['realized'] if m else '?':,}, "
                f"recency={m['recency_d'] if m else '?'}d")
+        # priority: REJECT = high (action), WATCH = default (info), RECOVERY = default
+        is_reject_alert = "REJECT" in kinds or "ABS FAIL" in kinds
         push(f"Source health: {short} {kinds}", msg,
-             tags="rotating_light" if "RECOVERY" not in kinds else "green_circle",
-             prio="high" if "RECOVERY" not in kinds else "default")
+             tags="rotating_light" if is_reject_alert else ("warning" if "WATCH" in kinds else "green_circle"),
+             prio="high" if is_reject_alert else "default")
 
 
 def run_cycle():
