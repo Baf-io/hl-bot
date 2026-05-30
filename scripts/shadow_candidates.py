@@ -1,51 +1,42 @@
 #!/usr/bin/env python3
 """
-Shadow-validation of leaderboard scan candidates — PAPER ONLY, never trades.
+Shadow-validation of leaderboard scan candidates — PAPER ONLY via WebSocket push.
 
-Watches each candidate's live positions and records their FRESH round-trips out-of-sample:
-open (flat→position or flip) → entry at current mark; close (→flat or flip) → exit at mark,
-paper return = direction × (exit−entry)/entry. Per-trader cumulative return%, win-rate, and
-trade log let us see which names actually hold up before risking any capital.
+WS upgrade 2026-05-30: replaces the 300s REST poll with HL WebSocket subscriptions:
+- one `allMids` subscription → ms-latency mark prices in memory
+- one `userFills:<addr>` per candidate → fills pushed within ~10-50ms of on-chain confirm
 
-Discipline (mirrors the live engine):
-- FRESH-ENTRY ONLY: positions held at startup are seeded as BASELINE and NOT credited — we
-  only score entries that open after we begin watching (no stale-adoption inflation).
-- Equal-weight % per round-trip (leverage-agnostic signal quality), $100 nominal stake for $ display.
-- Clean-read-only; state persisted to data/shadow_scan_state.json so restarts don't lose history.
+This was sized to diagnose why 36f2_patient ran -2% cumRet on 70% WR under the
+polled version: the 5min poll captured opens/closes ~150-300s after they happened
+so the recorded entry/exit prices were drifted, eating his real edge. With WS push
+we record at the mid AT THE MOMENT his fill confirms, so the paper PnL should
+match what a 0-latency sleeve would have realized.
 
-Runs as hl-shadow-scan.service. No keys needed beyond read-only API.
+Discipline (unchanged from polled version):
+- FRESH-ENTRY ONLY: positions held at startup are seeded as BASELINE and NOT credited.
+- Equal-weight %/round-trip (leverage-agnostic), $100 nominal stake for display.
+- Idempotent dedup via (time, oid, tid) per-fill — WS reconnect replays are safe.
+- State at data/shadow_scan_state.json; schema is back-compat (adds `nets`,
+  `seen_fills`, `startup_ts_ms` fields, preserves prior `log`/`cum_ret`/`n`/`wins`).
+
+Runs as hl-shadow-scan.service. Read-only API; no keys needed.
 """
-import sys, time, json, os, datetime as dt
-
+import sys, time, json, os, threading
 sys.path.insert(0, "/root/hl-bot")
 sys.path.insert(0, "/root/hl-bot/src")
 
 import requests
 from loguru import logger
+from hyperliquid.websocket_manager import WebsocketManager
 
-API   = "https://api.hyperliquid.xyz/info"
-POLL_S = 300     # 5 min — paper validation doesn't need 60s; saves rate-limit budget
-STAKE  = 100.0   # nominal $ per paper position (for $ display; ranking uses return%)
-STATE  = "/root/hl-bot/data/shadow_scan_state.json"
+API_REST = "https://api.hyperliquid.xyz/info"
+WS_BASE  = "https://api.hyperliquid.xyz"
+STAKE    = 100.0
+STATE    = "/root/hl-bot/data/shadow_scan_state.json"
+SEEN_CAP = 2000               # per-candidate dedup ring (bounds disk growth)
+SCOREBOARD_S = 1800           # 30 min
 
-# Rewritten 2026-05-29 after the 3,837-wallet scan + upgraded forensic gates
-# (knife-trap, paper-drag, sample-aware concentration, warn-vs-reject tiering).
-#
-# Expanded 2026-05-29 PM after the v2.1 scan (23 survivors) + live spot-check.
-# Added 3 names from the v2.1 batch + 1 explicit HFT lag-test:
-#   - 0x8a820d3b  live cscore 66.5 CLEAN, SOL swing, 4-leg book live, sharpest
-#                 payoff (5.32) in the copyable set. 29 trips → small sample
-#                 so shadow first; promote only if paper holds.
-#   - 0x186a0ede  live cscore 54.6 CLEAN, ETH swing, 88% WR, currently flat.
-#                 Sporadic (max gap 60d) so shadow tests whether he stays active.
-#   - 0x0526345b  HFT lag-test. Real cscore 92.5 but 183 trips/day @ $25 avg
-#                 win = uncopyable in theory. Shadow PROVES the lag eats the
-#                 edge (or doesn't) at 20s poll — definitive data point.
-#
-# v2.1 scanner shipped 0x0252f92e as CLEAN cscore 46.3 but live forensic says
-# REJECT (90% one-trade-dep, stale 146d). Scanner has a realized_pnl / recency_d
-# bug — see research/SCANNER_v2.1_BUGREPORT.md. Do not promote his row until
-# the LXC fixes the calc + re-ships.
+# Roster — see comments above for v2.1-batch additions.
 CANDS = {
     "36f2_patient":         "0x36f26e2e5bed062968c17fc770863fd740713205",
     "da830d2d_HYPEmajors":  "0xda830d2d83a57cea255bcfd0cf89c3e94abde0fd",
@@ -58,14 +49,20 @@ CANDS = {
 }
 FLAT_EPS = 1e-9
 
+# Shared in-memory state. `state_lock` guards file writes + cross-thread reads.
+state_lock = threading.Lock()
+state: dict = {}
+mids: dict = {}                # coin -> latest mid (float)
+startup_ts_ms = int(time.time() * 1000)
 
-def _post(t, **k):
-    return requests.post(API, json={"type": t, **k}, timeout=20).json()
+
+def _rest_post(t, **k):
+    return requests.post(API_REST, json={"type": t, **k}, timeout=15).json()
 
 
-def _positions(addr):
-    """coin → signed size for an address."""
-    cs = _post("clearinghouseState", user=addr)
+def _positions_rest(addr):
+    """Initial baseline-positions via REST (one call per candidate at startup)."""
+    cs = _rest_post("clearinghouseState", user=addr)
     out = {}
     for ap in cs.get("assetPositions", []):
         p = ap["position"]; szi = float(p.get("szi", 0))
@@ -74,90 +71,231 @@ def _positions(addr):
     return out
 
 
-def _load():
+def _load_state():
     if os.path.exists(STATE):
         try: return json.load(open(STATE))
         except Exception: pass
     return {}
 
 
-def _save(state):
+def _save_state_locked():
+    """Atomic save; caller must hold state_lock."""
     tmp = STATE + ".tmp"
     json.dump(state, open(tmp, "w"), indent=2)
     os.replace(tmp, STATE)
 
 
-def _summary(state):
-    lines = []
-    for label, s in state.items():
-        n = s["n"]; cum = s["cum_ret"]; wr = (s["wins"] / n * 100) if n else 0
-        lines.append(f"  {label:<18} trips {n:>3} | WR {wr:>3.0f}% | cumRet {cum:>+7.1f}% | paper ${cum/100*STAKE:>+8.0f} | open {len(s['open'])}")
-    return "\n".join(lines)
+def _seed_or_upgrade():
+    """For each candidate: if new → REST-seed; if existing → re-baseline from REST so
+    positions opened/closed during downtime are reflected, and any stale in-flight
+    paper opens are dropped (we can't honestly score what we didn't witness). Keeps
+    historical `cum_ret`/`wins`/`n`/`log` intact."""
+    for label, addr in CANDS.items():
+        try:
+            held = _positions_rest(addr)
+        except Exception as e:
+            logger.warning(f"[shadow-ws] {label} baseline REST failed: {e}")
+            held = {}
+        if label not in state:
+            state[label] = {
+                "addr": addr,
+                "nets": {c: sz for c, sz in held.items()},
+                "open": {},
+                "baseline": list(held.keys()),
+                "cum_ret": 0.0, "wins": 0, "n": 0,
+                "log": [],
+                "seen_fills": [],
+                "startup_ts_ms": startup_ts_ms,
+            }
+            logger.info(f"[shadow-ws] seed {label} baseline: {list(held.keys()) or 'flat'}")
+        else:
+            s = state[label]
+            # back-compat: fill in fields missing from the old polled-version state
+            s.setdefault("nets", {c: held.get(c, 0.0) for c in s.get("baseline", [])})
+            s.setdefault("seen_fills", [])
+            # re-baseline on every restart: nets ← REST truth, drop in-flight opens
+            dropped = list(s.get("open", {}).keys())
+            s["nets"] = {c: sz for c, sz in held.items()}
+            s["baseline"] = list(held.keys())
+            s["open"] = {}
+            s["startup_ts_ms"] = startup_ts_ms
+            if dropped:
+                logger.warning(f"[shadow-ws] {label} restart: dropped {len(dropped)} "
+                               f"in-flight paper open(s) {dropped} (can't score what we missed)")
+            logger.info(f"[shadow-ws] resume {label}: baseline={list(held.keys()) or 'flat'} "
+                        f"history n={s['n']} cum={s['cum_ret']:.1f}%")
+
+
+def _make_fills_handler(label):
+    """Closure: handles userFills WS pushes for one candidate."""
+    def handler(msg):
+        try:
+            data = msg.get("data") or {}
+            fills = data.get("fills") or []
+            if not fills:
+                return
+            with state_lock:
+                _process_fills(label, fills)
+        except Exception as e:
+            logger.exception(f"[shadow-ws] {label} fill handler error: {e}")
+    return handler
+
+
+def _process_fills(label, fills):
+    """Caller must hold state_lock. Processes a batch of fills for one candidate."""
+    s = state[label]
+    seen = set(s.get("seen_fills") or [])
+    new = []
+    for f in fills:
+        key = f"{f.get('time')}:{f.get('oid')}:{f.get('tid')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        new.append((key, f))
+    if not new:
+        return
+
+    # process in chronological order so net-position transitions resolve correctly
+    new.sort(key=lambda kf: kf[1].get("time", 0))
+
+    persist = False
+    for key, f in new:
+        coin = f.get("coin"); side = f.get("side")
+        try:
+            sz = float(f.get("sz", 0)); px = float(f.get("px", 0))
+        except Exception:
+            continue
+        t_ms = int(f.get("time", 0))
+        if not coin or sz <= 0 or px <= 0 or side not in ("B", "A"):
+            continue
+
+        # Pre-startup fills are part of the REST baseline we already loaded —
+        # mark them seen so reconnects don't re-process, but DON'T update nets
+        # (would double-count the baseline state).
+        if t_ms <= s.get("startup_ts_ms", startup_ts_ms):
+            continue
+
+        d = sz if side == "B" else -sz
+        prev = float(s["nets"].get(coin, 0.0))
+        new_net = round(prev + d, 8)
+
+        # Detect transitions BEFORE updating nets
+        flipped = (abs(new_net) > FLAT_EPS and abs(prev) > FLAT_EPS
+                   and (prev > 0) != (new_net > 0))
+        went_flat = (abs(prev) > FLAT_EPS and abs(new_net) <= FLAT_EPS)
+        opened = (abs(prev) <= FLAT_EPS and abs(new_net) > FLAT_EPS) or flipped
+
+        # CLOSE / FLIP: had a paper-open on this coin
+        if coin in s["open"] and (went_flat or flipped):
+            o = s["open"][coin]
+            mid = float(mids.get(coin, 0)) or px   # fall back to fill px if mid missing
+            ret = (1 if o["dir"] > 0 else -1) * (mid - o["entry"]) / o["entry"] * 100
+            s["cum_ret"] += ret
+            s["n"] += 1
+            s["wins"] += 1 if ret > 0 else 0
+            s["log"].append({
+                "coin": coin, "dir": "L" if o["dir"] > 0 else "S",
+                "entry": o["entry"], "exit": mid, "ret": round(ret, 2),
+                "opened": o["t"], "closed": int(t_ms / 1000),
+            })
+            hold_h = (t_ms / 1000 - o["t"]) / 3600
+            logger.success(f"[shadow-ws] {label} CLOSE {coin} "
+                           f"{'L' if o['dir']>0 else 'S'} {o['entry']:.4g}→{mid:.4g} "
+                           f"= {ret:+.2f}% ({hold_h:.1f}h) cum {s['cum_ret']:+.1f}% n={s['n']}")
+            del s["open"][coin]
+            persist = True
+
+        # OPEN: flat→non-zero, or sign flip (post-close)
+        if opened:
+            if coin in s.get("baseline", []):
+                # baseline holds first transition is the close above; this open scores normally
+                # only skip if this is the FIRST open and we never closed yet
+                pass
+            if coin not in s["open"]:
+                mid = float(mids.get(coin, 0)) or px
+                s["open"][coin] = {
+                    "dir": 1 if new_net > 0 else -1,
+                    "entry": mid,
+                    "t": int(t_ms / 1000),
+                }
+                logger.info(f"[shadow-ws] {label} OPEN {coin} "
+                            f"{'L' if new_net>0 else 'S'} @ {mid:.4g} "
+                            f"(fill px {px:.4g}, mid drift {(mid-px)/px*100:+.2f}%)")
+                persist = True
+
+        # Baseline clears once a held coin goes flat — re-entries then score
+        if coin in s.get("baseline", []) and abs(new_net) <= FLAT_EPS:
+            s["baseline"] = [c for c in s["baseline"] if c != coin]
+            logger.info(f"[shadow-ws] {label} baseline {coin} cleared (now flat)")
+            persist = True
+
+        s["nets"][coin] = new_net
+        if abs(new_net) <= FLAT_EPS:
+            s["nets"].pop(coin, None)
+
+    # Bounded dedup ring
+    s["seen_fills"] = list(seen)[-SEEN_CAP:]
+    persist = True
+    if persist:
+        _save_state_locked()
+
+
+def _mids_handler(msg):
+    """Update in-memory mids from allMids push (multiple coins per msg)."""
+    try:
+        data = msg.get("data") or {}
+        mids_obj = data.get("mids") or {}
+        for c, p in mids_obj.items():
+            try:
+                mids[c] = float(p)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.exception(f"[shadow-ws] mids handler error: {e}")
+
+
+def _scoreboard_loop():
+    while True:
+        time.sleep(SCOREBOARD_S)
+        try:
+            with state_lock:
+                lines = []
+                for label, s in state.items():
+                    n = s["n"]; cum = s["cum_ret"]
+                    wr = (s["wins"]/n*100) if n else 0
+                    lines.append(f"  {label:<22} trips {n:>3} | WR {wr:>3.0f}% | "
+                                 f"cumRet {cum:>+7.1f}% | paper ${cum/100*STAKE:>+8.0f} | "
+                                 f"open {len(s.get('open', {}))}")
+            logger.info("[shadow-ws] scoreboard:\n" + "\n".join(lines))
+        except Exception as e:
+            logger.warning(f"[shadow-ws] scoreboard error: {e}")
 
 
 def main():
-    state = _load()
-    mids = _post("allMids")
+    global state
+    with state_lock:
+        state = _load_state()
+        _seed_or_upgrade()
+        _save_state_locked()
+
+    logger.info(f"[shadow-ws] start | {len(CANDS)} candidates | WS push-mode | paper-only")
+
+    ws = WebsocketManager(WS_BASE)
+    ws.start()
+
+    # Global allMids — ms-latency mark prices for paper entry/exit recording
+    ws.subscribe({"type": "allMids"}, _mids_handler)
+
+    # Per-candidate userFills — push on every on-chain fill
     for label, addr in CANDS.items():
-        if label not in state:
-            held = _positions(addr)
-            # seed baseline: current holds are NOT credited (fresh-entry discipline)
-            state[label] = {"addr": addr, "open": {}, "baseline": list(held.keys()),
-                            "cum_ret": 0.0, "wins": 0, "n": 0, "log": []}
-            logger.info(f"[shadow] seed {label} baseline (not scored): {list(held.keys()) or 'flat'}")
-    _save(state)
-    logger.info(f"[shadow] start | {len(CANDS)} candidates | poll {POLL_S}s | paper-only")
+        ws.subscribe({"type": "userFills", "user": addr}, _make_fills_handler(label))
+        logger.info(f"[shadow-ws] subscribed userFills {label}={addr[:10]}…")
 
+    threading.Thread(target=_scoreboard_loop, daemon=True).start()
+
+    # Block forever; WS runs in its own thread
     while True:
-        try:
-            mids = _post("allMids")
-        except Exception as e:
-            logger.warning(f"[shadow] mids read failed (skip): {e}"); time.sleep(POLL_S); continue
-
-        for label, addr in CANDS.items():
-            s = state[label]
-            try:
-                pos = _positions(addr)
-            except Exception as e:
-                logger.warning(f"[shadow] {label} read failed (skip): {e}"); continue
-
-            # CLOSES / FLIPS: coin was open for us, now flat or flipped
-            for coin in list(s["open"].keys()):
-                o = s["open"][coin]
-                cur = pos.get(coin, 0.0)
-                flipped = (cur != 0 and (cur > 0) != (o["dir"] > 0))
-                if abs(cur) <= FLAT_EPS or flipped:
-                    px = float(mids.get(coin, 0)) or o["entry"]
-                    ret = (1 if o["dir"] > 0 else -1) * (px - o["entry"]) / o["entry"] * 100
-                    s["cum_ret"] += ret; s["n"] += 1; s["wins"] += 1 if ret > 0 else 0
-                    s["log"].append({"coin": coin, "dir": "L" if o["dir"] > 0 else "S",
-                                     "entry": o["entry"], "exit": px, "ret": round(ret, 2),
-                                     "opened": o["t"], "closed": int(time.time())})
-                    logger.success(f"[shadow] {label} CLOSE {coin} {'L' if o['dir']>0 else 'S'} "
-                                   f"{o['entry']:.4g}→{px:.4g} = {ret:+.1f}% (cum {s['cum_ret']:+.1f}%)")
-                    del s["open"][coin]
-
-            # OPENS: coin now held that we aren't tracking AND wasn't a seeded baseline still-open
-            for coin, szi in pos.items():
-                if coin in s["open"]:
-                    continue
-                # skip a baseline position until it has been closed once (then future re-opens count)
-                if coin in s.get("baseline", []):
-                    continue
-                px = float(mids.get(coin, 0))
-                if px <= 0:
-                    continue
-                s["open"][coin] = {"dir": 1 if szi > 0 else -1, "entry": px, "t": int(time.time())}
-                logger.info(f"[shadow] {label} OPEN {coin} {'L' if szi>0 else 'S'} @ {px:.4g}")
-
-            # once a baseline coin goes flat, drop it from baseline so re-entries are scored
-            s["baseline"] = [c for c in s.get("baseline", []) if c in pos]
-
-        _save(state)
-        # periodic scoreboard (every ~30 min)
-        if int(time.time()) % 1800 < POLL_S:
-            logger.info("[shadow] scoreboard:\n" + _summary(state))
-        time.sleep(POLL_S)
+        time.sleep(60)
 
 
 if __name__ == "__main__":
