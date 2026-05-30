@@ -105,6 +105,12 @@ spreads_bps = {}                # coin -> latest spread bps
 startup_ts_ms = int(time.time() * 1000)
 SZDEC = {}                      # coin -> sz decimals
 
+# Detection-latency instrumentation: same fill arrives via both channels;
+# we record local_recv_ms by (oid, tid, time) key to compare which path is faster.
+# Key: f"{time}:{oid}" → {"userfills_t": ms, "trades_t": ms}
+detection_log: dict = {}
+detection_summary_lock = threading.Lock()
+
 # Thread pool for order placement so WS handler returns instantly
 order_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="scalp-order")
 
@@ -178,6 +184,7 @@ def _check_daily_rollover():
 # ── source-side WS handler ────────────────────────────────────────────────────
 def _on_source_fills(msg):
     """Receive source's fills, detect A/B/C/D/E, dispatch action."""
+    recv_ms = int(time.time() * 1000)
     try:
         with state_lock:
             state["last_msg_t"] = int(time.time())
@@ -185,6 +192,19 @@ def _on_source_fills(msg):
         fills = data.get("fills") or []
         if not fills:
             return
+        # Instrument: record receipt time per fill for path-comparison
+        for f in fills:
+            if f.get("coin") != COIN: continue
+            key = f"{f.get('time')}:{f.get('oid')}"
+            with detection_summary_lock:
+                rec = detection_log.setdefault(key, {})
+                rec.setdefault("userfills_t", recv_ms)
+                rec["fill_t"] = int(f.get("time", 0))
+                # if trades_t already set, log the delta
+                if "trades_t" in rec and "_delta_logged" not in rec:
+                    d = rec["userfills_t"] - rec["trades_t"]
+                    logger.info(f"[{NAME}] LAT trades→userfills delta: {d:+d}ms (fill@{rec['fill_t']}, oid={f.get('oid')})")
+                    rec["_delta_logged"] = True
         new_fills = []
         with state_lock:
             seen = set(state["seen_fills_source"])
@@ -285,6 +305,62 @@ def _on_mids(msg):
             state["last_msg_t"] = int(time.time())
     except Exception as e:
         logger.exception(f"[{NAME}] mids handler error: {e}")
+
+
+def _on_trades(msg):
+    """Public trades stream for COIN. Tag trades involving SOURCE to compare detection path
+    vs userFills:source. The trades stream is broadcast to everyone — we want to know if it
+    propagates faster or slower than the per-user userFills channel."""
+    recv_ms = int(time.time() * 1000)
+    try:
+        data = msg.get("data") or []
+        # message format: list of trade dicts OR {"data":[...]} — be defensive
+        trades = data if isinstance(data, list) else (data.get("trades") or [])
+        if not trades: return
+        for t in trades:
+            try:
+                if t.get("coin") and t.get("coin") != COIN: continue
+                users = t.get("users") or []
+                # Trades expose [buyer, seller] address pair on HL. Match if source is either.
+                source_involved = any(u.lower() == SOURCE for u in users)
+                if not source_involved: continue
+                key = f"{t.get('time')}:{t.get('hash','')[:16]}"
+                with detection_summary_lock:
+                    rec = detection_log.setdefault(key, {})
+                    rec.setdefault("trades_t", recv_ms)
+                    rec["fill_t"] = int(t.get("time", 0))
+                    if "userfills_t" in rec and "_delta_logged" not in rec:
+                        d = rec["userfills_t"] - rec["trades_t"]
+                        logger.info(f"[{NAME}] LAT trades→userfills delta: {d:+d}ms (fill@{rec['fill_t']}, hash={t.get('hash','')[:12]})")
+                        rec["_delta_logged"] = True
+            except Exception as e:
+                logger.warning(f"[{NAME}] trade parse error: {e}")
+    except Exception as e:
+        logger.exception(f"[{NAME}] trades handler error: {e}")
+
+
+def _latency_summary_loop():
+    """Every 5min, summarize detection-path lead/lag from collected samples."""
+    while True:
+        time.sleep(300)
+        try:
+            with detection_summary_lock:
+                samples = [(k, v) for k, v in detection_log.items()
+                           if "userfills_t" in v and "trades_t" in v]
+            if not samples:
+                logger.info(f"[{NAME}] LAT summary: no paired samples yet")
+                continue
+            deltas = [v["userfills_t"] - v["trades_t"] for _, v in samples]
+            n = len(deltas)
+            avg = sum(deltas) / n
+            trades_lead = sum(1 for d in deltas if d > 0)
+            sorted_d = sorted(deltas)
+            p50 = sorted_d[n // 2]
+            logger.info(f"[{NAME}] LAT summary n={n} avg_delta={avg:+.1f}ms p50={p50:+d}ms "
+                        f"trades_path_leads_in {trades_lead}/{n} cases "
+                        f"({'trades:HYPE' if trades_lead*2 > n else 'userFills:source'} preferred)")
+        except Exception as e:
+            logger.warning(f"[{NAME}] latency summary error: {e}")
 
 
 # ── action dispatchers (queue to thread pool, return immediately) ─────────────
@@ -550,10 +626,15 @@ def main():
     ws.subscribe({"type": "allMids"}, _on_mids)
     ws.subscribe({"type": "userFills", "user": SOURCE}, _on_source_fills)
     ws.subscribe({"type": "userFills", "user": SUB}, _on_sub_fills)
-    logger.info(f"[{NAME}] WS subscribed: allMids + userFills:source + userFills:sub")
+    # Instrumentation: subscribe to public trades on the coin to measure whether that
+    # path propagates source-involved fills faster than userFills:source. Decision
+    # path stays userFills until we have data showing trades is consistently earlier.
+    ws.subscribe({"type": "trades", "coin": COIN}, _on_trades)
+    logger.info(f"[{NAME}] WS subscribed: allMids + userFills:src + userFills:sub + trades:{COIN}")
 
     threading.Thread(target=_safety_loop, daemon=True).start()
     threading.Thread(target=_scoreboard_loop, daemon=True).start()
+    threading.Thread(target=_latency_summary_loop, daemon=True).start()
 
     while True:
         time.sleep(60)
