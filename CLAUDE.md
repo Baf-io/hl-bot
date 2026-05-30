@@ -32,6 +32,20 @@ Hyperliquid perp trading **infrastructure**. The model is **sleeve-copy on subac
 
 ---
 
+## Infrastructure (2026-05-30 migration)
+Two-box architecture for IP-budget isolation + lower live-trade latency:
+- **us-east-1 Hetzner Ashburn `5.161.252.215`** (live trading) — `hl-77998579-sleeve`,
+  `hl-bbf82c80-scalp-sleeve` (PAPER), `hl-pos-watch`, `hl-flip-alerts`. RTT to HL ~200ms
+  (vs 245ms from Nuremberg, mostly server-side processing — WS push should be much
+  cheaper). Agent: `bot-ashburn` (key rotated during migration, separate from any
+  prior key — never reused across boxes).
+- **Nuremberg Hetzner** (research/scanning + intake) — `hl-bot` (intake server, has
+  Tailscale binding for LXC POST, kept here until LXC IP cutover), `hl-shadow-scan`,
+  `hl-source-health`, `hl-candle-log`, `hl-btc-alert`, `hl-tracker-scan`. Heavy /info
+  reads stay here so they don't compete with live-trading IP budget.
+- SSH segregation: Nuremberg can no longer reach Ashburn (migration key removed
+  post-cutover). User-laptop key authorizes both boxes independently.
+
 ## Current state (update after each deploy)
 - **Equity / accounts (2026-05-28 19:10):** MAIN $702.82 (user discretion, hands-off from all bot signals — recent: BTC short 0.04794 @ $73,583 + scale-in limit @ $74,200, watched by `hl-pos-watch`; legacy PURR funding-carry short still open pending user decision). Sub Baf $483.72 = lead77 sleeve. Other subs drained ~$1 (Downside, SwingDyn, AkkaVault — kept for future re-funding).
 - **Live sleeve (only one):** `hl-77998579-sleeve` on Sub Baf `0xdac952c2…2246`, mirrors `0x77998579` (trust forensic score 66.2, highest vetted) bar-for-bar on BTC+ETH. `MAX_CONCURRENT=3`, `MARGIN_PCT=0.40`, `LEV=4` iso → $773/leg notional, $193 margin, $93 dead-man stop-loss. Fresh-entry-only, baseline-seeded his BTC -13.1 + ETH -74.1 (not adopted).
