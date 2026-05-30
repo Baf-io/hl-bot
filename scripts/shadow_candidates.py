@@ -78,6 +78,11 @@ CANDS = {
     "c2c060e3_BTCswing":    "0xc2c060e3309461ec7c4291b1aac6c89aa228727e",
     "ae332e9d_ETHswing":    "0xae332e9d33af93c0ee8362f61a8a5aa378bfd508",
     "66d1f704_BTCdurable":  "0x66d1f704749ced8c60df03cd0ccfce05c5d87fae",
+    # 2026-05-30 PM cont'd: +2 from final v2.2 sweep (only unshadowed CLEAN with n≥30):
+    #   - d205b029 cscore 34.5 BTC swing n=40 WR 78% $98k — high-WR low-sample
+    #   - 901a6642 cscore 38.8 HYPE swing n=73 WR 38% — low-WR control / negative-edge probe
+    "d205b029_BTChighwr":   "0xd205b02969b04af5a87112ca24d27573aea2ae46",
+    "901a6642_HYPElowwr":   "0x901a664271fcda5065027edcd339ca50cd9d77f3",
 }
 FLAT_EPS = 1e-9
 
