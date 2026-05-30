@@ -4,7 +4,8 @@
 push-mode on the shadow service (`shadow_candidates.py` → fills detected within ~10-50ms
 of on-chain confirm, was ~150-300s under polling). That drops the executable lag floor
 from ~150-300s to ~150-300**ms**, which collapses the per-trip cost from ~50-100bps
-down to ~10-12bps. Net effect on scope: **the 5-30min scalp band is now copyable**, and
+down to ~10-12bps on majors. Net effect on scope: **the 1-30min scalp + ultra-scalp
+band is now copyable on liquid majors**, and
 **cohort-vote consensus across many mid-trust sources** is now a viable strategy that
 REST polling could never have supported. The §3 gates are unchanged; §2 hold floor and
 §5 yield expectations bumped; §7 NEW cohort-correlation analysis added. See changelog
@@ -37,15 +38,21 @@ pasteable code in §3 to make the gates uniform across the codebase.
 
 ## 2. THE TRADER MODEL (what your scanner serves) — UPDATED v2.3
 
-- **Cadence (v2.3 lowered):** **Median hold ≥ 5min**, ideally ≥ 30min. WS push-mode means
-  our detection lag is ~10-50ms and total round-trip execution lag is ~150-300ms, so
-  the per-trip cost floor is ~10-12bps. Anything with hold ≥ 5min on a liquid coin can
-  clear that floor. Sub-minute HFT is still uncopyable (the edge IS sub-second so any
-  exchange-latency floor eats it). v1/v2 said 30min — that was the polled-mode floor.
+- **Cadence (v2.3 lowered):** **Median hold ≥ 1min**, with tier-specific gates (see §6).
+  WS push-mode means our detection lag is ~10-50ms and total round-trip execution lag
+  is ~150-300ms. On a liquid major (BTC/ETH/SOL), entry+exit drift at 150ms is ~6-16bps;
+  on a 1-3min hold the signed-move available is ~25-50bps, so net edge of ~10-35bps
+  is extractable IF the source has asymmetric payoff. Below 1min the alpha IS sub-second
+  and uncopyable at any lag we can hit without exchange colo. v1/v2 said 30min — that
+  was the polled-mode floor; v2.3 pre-cohort first draft said 5min — that was a safety
+  margin, not the real floor. **The real floor is 1min on liquid majors.**
 - **Execution:** fresh-entry-only, direction-only copy. Sleeve sizes legs off OUR equity.
-  Mid-trust sources may be cohort-voted (see §7) instead of individually sleeved.
+  Mid-trust + scalp + ultra-scalp tiers go to cohort-vote (§7), not individual sleeves.
 - **Universe:** BTC, ETH, SOL, HYPE first. Liquid alts second. **Exclude any candidate whose
   top-3 coins by volume contain `xyz:`/`hyna:`/`cash:`/`km:`/`flx:`/`vntl:` prefixes.**
+  Illiquid alts have ~20-40bps drift per leg vs ~6-16bps on majors, which pushes the
+  cadence floor up — scalp/ultra-scalp tiers MUST trade primarily liquid majors
+  (top-3 coins ⊂ {BTC, ETH, SOL, HYPE, XRP, DOGE, SUI, BNB}) to qualify.
 - **Risk:** ≤4x lev, dead-man stop, daily kill-switch, walled-off sub-account.
 
 ---
@@ -245,11 +252,12 @@ Acceptance gate: `verdict(m)[0] == expected` for all 9. Print the actual verdict
 for each address so the diff is visible.
 
 **v2.3 note:** the §3 gates don't include a hold-time threshold (`median_hold_h` is
-computed but never used as a reject). So lowering the §2 hold floor from 30min to 5min
+computed but never used as a reject). So lowering the §2 hold floor from 30min to 1min
 doesn't change `verdict()` — it just means **you should no longer manually skip / down-rank
-scalp-tier addresses during pre-filter**. Any candidate that survives §3 with
-`median_hold_h ≥ 0.083h` (5min) is ship-worthy. Expect ~3-5× more scalp-cadence names
-to show up in v2.2+ batches than in v2 — that's the WS unlock, not a filter regression.
+scalp or ultra-scalp tier addresses during pre-filter**. Any candidate that survives §3 with
+`median_hold_h ≥ 0.0167h` (1min) is ship-worthy. Tier-eligibility for solo sleeves is
+separate (see §6 `tier_eligible_for_solo_sleeve` rider). Expect ~4-7× more
+scalp+ultra-scalp-cadence names than v2 — that's the WS unlock, not a filter regression.
 
 ---
 
@@ -267,9 +275,9 @@ Once the acceptance test passes:
 - **Cohort analysis** on the CLEAN+WATCH set (apply §7 — required for v2.3).
 - **Ship** the survivors that pass §3 with full schema (see §6).
 
-**Expected yield (v2.3): 15-30 names** — up from v2's 5-15 because the WS unlock
-makes the 5-30min scalp band copyable. ≥40 = filters are still leaking; ≤10 = pre-filter
-is too tight (likely culling scalp tier).
+**Expected yield (v2.3 patched): 20-40 names** — up from v2's 5-15 because the WS unlock
+makes the 1-30min scalp + ultra-scalp band copyable. ≥50 = filters are still leaking;
+≤15 = pre-filter is too tight (likely culling ultra-scalp tier).
 
 ---
 
@@ -284,7 +292,8 @@ New v2.3 fields: `cohort` block (see §7), `tier` recommendation, bumped `scanne
   "shipped_ts": 1780000000,
   "verdict": "WATCH",                  // "CLEAN" | "WATCH" — never ship "REJECT"
   "verdict_flags": ["yellow: payoff 0.55 — small wins (asymmetry weak)"],
-  "tier": "scalp",                     // "swing" | "intraday" | "scalp" — derived from median_hold_h
+  "tier": "scalp",                     // "swing" | "intraday" | "scalp" | "ultra-scalp" — see classification below
+  "tier_eligible_for_solo_sleeve": true,  // false for scalp+ultra-scalp UNLESS payoff ≥ 1.0 AND top-3 coins ⊂ liquid-majors
   "metrics": {
     "n_closed": 123,
     "wr": 64,
@@ -330,7 +339,19 @@ Tier classification rule:
 - `median_hold_h ≥ 4` → `"swing"`
 - `0.5 ≤ median_hold_h < 4` → `"intraday"`
 - `0.083 ≤ median_hold_h < 0.5` (5-30min) → `"scalp"`
-- `< 0.083` → DON'T SHIP (uncopyable HFT, fails the §2 cadence floor)
+- `0.0167 ≤ median_hold_h < 0.083` (1-5min) → `"ultra-scalp"`
+- `< 0.0167` (< 1min) → DON'T SHIP (sub-second HFT, fails the §2 cadence floor)
+
+Solo-sleeve eligibility (`tier_eligible_for_solo_sleeve`):
+- `swing` or `intraday` → **always true**
+- `scalp` → true IF top-3 coins ⊂ liquid-majors set AND `payoff ≥ 0.7`
+- `ultra-scalp` → true IF top-3 coins ⊂ liquid-majors set AND **`payoff ≥ 1.0`**
+  (asymmetric payoff required — at 1-3min holds the lag drift eats too much of a
+  knife-trap source's edge, even with cohort vote; solo sleeve needs proven asymmetry)
+- liquid-majors set: `{BTC, ETH, SOL, HYPE, XRP, DOGE, SUI, BNB, AVAX, LINK, LTC}`
+
+If `tier_eligible_for_solo_sleeve == false`, the source is **cohort-vote-only** — it
+can contribute to a 3-of-N consensus signal but won't be individually sleeved on VPS side.
 
 Field names match the metrics dict in §3 exactly — that way I can `json.load → gates(m) →
 warns(m)` your output as a sanity-check before promoting to `COPYABLE_DB.md`.
@@ -494,18 +515,20 @@ unless you have evidence the sibling materially diverges.
 7. I'll grade within minutes and report which ones get sleeved (Tier 1) vs
    cohort-voted (Tier 2) vs paper-shadow only.
 
-**v2.3 changelog (2026-05-30):**
-- §2 hold floor: 30min → **5min** (WS push-mode deployed, lag floor dropped from
-  150-300s to ~10-50ms → per-trip cost floor dropped from 50-100bps to 10-12bps,
-  scalp tier now copyable).
-- §3 gates: **unchanged** — no hold threshold in the gates. Scalp-tier eligibility
-  is purely from §2 + §6 tier classification.
+**v2.3 changelog (2026-05-30, patched same day):**
+- §2 hold floor: 30min → **1min** (WS push-mode deployed, total exec lag ~150-300ms
+  → entry+exit drift ~6-16bps on liquid majors → 1min holds have ~25-50bps signed-move
+  available, so 10-35bps net edge extractable IF source has asymmetric payoff).
+  Initial draft said 5min; that was a safety margin, not the real floor.
+- §3 gates: **unchanged** — no hold threshold in gates. Scalp/ultra-scalp eligibility
+  is purely from §2 + §6 tier classification + solo-sleeve rider.
 - §4 acceptance test: unchanged, but added note about scalp-tier expectations.
-- §5 yield: 5-15 → **15-30**.
-- §6 schema: added `tier` (swing/intraday/scalp) and `cohort` block; bumped filename
-  to `scan_v2_2_survivors.jsonl`; bumped `scanner_version` to v2.3.
-- §7 NEW — cohort cadence analysis (required). Co-active overlap windows + entity-
-  graph alias flagging so I can vote-aggregate without double-counting one operator.
+- §5 yield: 5-15 → **20-40** (ultra-scalp tier adds ~5-10 cohort-vote candidates).
+- §6 schema: added `tier` (swing/intraday/scalp/**ultra-scalp**), `tier_eligible_for_solo_sleeve`
+  rider (false for scalp/ultra-scalp unless payoff threshold + liquid-majors), and `cohort`
+  block. Filename bumped to `scan_v2_2_survivors.jsonl`. `scanner_version` v2.3.
+- §7 NEW — cohort cadence analysis (required). Co-active overlap windows + entity-graph
+  alias flagging so I can vote-aggregate without double-counting one operator.
 - §8 (was §7) heartbeat: added `wallets_passed_cohort` field for v2.3 visibility.
 - §9 (was §8) known-bad: unchanged.
 
