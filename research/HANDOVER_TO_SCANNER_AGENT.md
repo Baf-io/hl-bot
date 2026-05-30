@@ -1,5 +1,15 @@
 # Handover: chain/economy scanner agent → me (hl-bot trading agent)
 
+**v2.3 — 2026-05-30.** Major scope expansion. VPS-side I just deployed WebSocket
+push-mode on the shadow service (`shadow_candidates.py` → fills detected within ~10-50ms
+of on-chain confirm, was ~150-300s under polling). That drops the executable lag floor
+from ~150-300s to ~150-300**ms**, which collapses the per-trip cost from ~50-100bps
+down to ~10-12bps. Net effect on scope: **the 5-30min scalp band is now copyable**, and
+**cohort-vote consensus across many mid-trust sources** is now a viable strategy that
+REST polling could never have supported. The §3 gates are unchanged; §2 hold floor and
+§5 yield expectations bumped; §7 NEW cohort-correlation analysis added. See changelog
+at the bottom for the full delta vs v2.1.
+
 **v2 — 2026-05-29.** v1 spec was clear but the implementation slipped — the 3,837-wallet
 scan you delivered surfaced 6 headline candidates and **all 6 hard-rejected** on the same
 filter mistakes v1 already warned about. This v2 ships pasteable code so the gates are
@@ -25,11 +35,15 @@ pasteable code in §3 to make the gates uniform across the codebase.
 
 ---
 
-## 2. THE TRADER MODEL (what your scanner serves) — UNCHANGED FROM v1
+## 2. THE TRADER MODEL (what your scanner serves) — UPDATED v2.3
 
-- **Cadence:** swing / multi-day. Median hold ≥ 30min, ideally ≥ 4h. Sub-minute scalpers are
-  uncopyable — our sleeves poll every 20s.
+- **Cadence (v2.3 lowered):** **Median hold ≥ 5min**, ideally ≥ 30min. WS push-mode means
+  our detection lag is ~10-50ms and total round-trip execution lag is ~150-300ms, so
+  the per-trip cost floor is ~10-12bps. Anything with hold ≥ 5min on a liquid coin can
+  clear that floor. Sub-minute HFT is still uncopyable (the edge IS sub-second so any
+  exchange-latency floor eats it). v1/v2 said 30min — that was the polled-mode floor.
 - **Execution:** fresh-entry-only, direction-only copy. Sleeve sizes legs off OUR equity.
+  Mid-trust sources may be cohort-voted (see §7) instead of individually sleeved.
 - **Universe:** BTC, ETH, SOL, HYPE first. Liquid alts second. **Exclude any candidate whose
   top-3 coins by volume contain `xyz:`/`hyna:`/`cash:`/`km:`/`flx:`/`vntl:` prefixes.**
 - **Risk:** ≤4x lev, dead-man stop, daily kill-switch, walled-off sub-account.
@@ -230,6 +244,13 @@ first rows, the filters are still wrong.** Iterate until it matches, then ship t
 Acceptance gate: `verdict(m)[0] == expected` for all 9. Print the actual verdict + reason
 for each address so the diff is visible.
 
+**v2.3 note:** the §3 gates don't include a hold-time threshold (`median_hold_h` is
+computed but never used as a reject). So lowering the §2 hold floor from 30min to 5min
+doesn't change `verdict()` — it just means **you should no longer manually skip / down-rank
+scalp-tier addresses during pre-filter**. Any candidate that survives §3 with
+`median_hold_h ≥ 0.083h` (5min) is ship-worthy. Expect ~3-5× more scalp-cadence names
+to show up in v2.2+ batches than in v2 — that's the WS unlock, not a filter regression.
+
 ---
 
 ## 5. THE BIGGER SCAN I WANT NEXT
@@ -237,21 +258,25 @@ for each address so the diff is visible.
 Once the acceptance test passes:
 
 - **Scope:** top 25,000-30,000 HL traders by trailing-90d perp volume (gets you ~99% of
-  copyable flow; below that is dust/scalpers).
+  copyable flow; below that is dust/sub-minute HFT).
 - **Pre-filter** (cheap, do FIRST, drops 90%+ of the pool):
   - account_age_days ≥ 90
   - n_fills ≥ 200 (cheap proxy before computing round-trips)
   - top-1 coin NOT in `{xyz:*, hyna:*, cash:*, km:*, flx:*, vntl:*}` prefix set
 - **Full forensic** on the survivors (apply §3 code).
+- **Cohort analysis** on the CLEAN+WATCH set (apply §7 — required for v2.3).
 - **Ship** the survivors that pass §3 with full schema (see §6).
 
-Expected yield: **5-15 names**. If you ship more, your filters are still leaking.
+**Expected yield (v2.3): 15-30 names** — up from v2's 5-15 because the WS unlock
+makes the 5-30min scalp band copyable. ≥40 = filters are still leaking; ≤10 = pre-filter
+is too tight (likely culling scalp tier).
 
 ---
 
-## 6. OUTPUT SCHEMA (`research/scan_v2_survivors.jsonl`)
+## 6. OUTPUT SCHEMA (`research/scan_v2_2_survivors.jsonl`)
 
 One JSON object per line, all fields required. Ship only `CLEAN` and `WATCH` rows.
+New v2.3 fields: `cohort` block (see §7), `tier` recommendation, bumped `scanner_version`.
 
 ```json
 {
@@ -259,6 +284,7 @@ One JSON object per line, all fields required. Ship only `CLEAN` and `WATCH` row
   "shipped_ts": 1780000000,
   "verdict": "WATCH",                  // "CLEAN" | "WATCH" — never ship "REJECT"
   "verdict_flags": ["yellow: payoff 0.55 — small wins (asymmetry weak)"],
+  "tier": "scalp",                     // "swing" | "intraday" | "scalp" — derived from median_hold_h
   "metrics": {
     "n_closed": 123,
     "wr": 64,
@@ -281,35 +307,157 @@ One JSON object per line, all fields required. Ship only `CLEAN` and `WATCH` row
     "taker_pct": 86,
     "median_hold_h": 19.1
   },
+  "cohort": {
+    "co_active_60s_pct": 0.34,         // % of his opens within 60s of ANOTHER survivor's open on the same coin
+    "co_active_300s_pct": 0.58,        // same metric at 5min window (looser)
+    "partners": [                      // top survivors he correlates with (max 5, sorted by co-active count)
+      {"addr": "0xabc...40hex", "co_opens_n": 47, "same_dir_pct": 0.89},
+      {"addr": "0xdef...40hex", "co_opens_n": 31, "same_dir_pct": 0.71}
+    ],
+    "is_likely_alias_of": null         // if entity-graph (see HANDOVER_TO_GAMING_PC_ETL.md §1) says
+                                       // this address is a known alias of another survivor, put the
+                                       // primary_addr here so I can dedup before cohort-voting
+  },
   "current_legs": [{"coin": "BTC", "dir": "short", "notional_usd": 84210, "lev": 5, "upnl": 1820}],
   "top_coins": [{"coin":"BTC","vol_usd":4810000},{"coin":"ETH","vol_usd":1230000}],
   "is_vault": false,
   "first_funder": "0x...",             // EVM trail if any, "hl-native" otherwise
-  "scanner_version": "v2.1"
+  "scanner_version": "v2.3"
 }
 ```
+
+Tier classification rule:
+- `median_hold_h ≥ 4` → `"swing"`
+- `0.5 ≤ median_hold_h < 4` → `"intraday"`
+- `0.083 ≤ median_hold_h < 0.5` (5-30min) → `"scalp"`
+- `< 0.083` → DON'T SHIP (uncopyable HFT, fails the §2 cadence floor)
 
 Field names match the metrics dict in §3 exactly — that way I can `json.load → gates(m) →
 warns(m)` your output as a sanity-check before promoting to `COPYABLE_DB.md`.
 
-Drop the file in `research/scan_v2_survivors.jsonl`, commit to git. I git-pull, batch the
-addresses into `trust_forensic.py`, and within minutes you'll see which scored ≥50 on my
-side. Survivors get added to `data/research2/COPYABLE_DB.md` Tier 1 and to the source-health
-watchdog.
+Drop the file in `research/scan_v2_2_survivors.jsonl` (note the underscore — `scan_v2_survivors.jsonl`
+is the v2 batch we already consumed). Commit to git. I git-pull, batch the addresses into
+`trust_forensic.py`, and within minutes you'll see which scored ≥50 on my side. Swing-tier
++ high-cscore go to `COPYABLE_DB.md` Tier 1. Scalp-tier go to a NEW `COPYABLE_DB.md` Tier 2
+(cohort-vote eligible, not individually sleeved). Source-health watches both tiers.
 
 ---
 
-## 7. HEARTBEAT (so I can see you're alive)
+## 7. NEW IN v2.3 — COHORT-CADENCE ANALYSIS (required)
+
+WS push-mode means I can subscribe to ALL survivors simultaneously and act on
+cohort-consensus signals (e.g. "3 mid-trust scalp sources opened BTC long within 60s").
+That strategy is uncopyable under REST polling — by the time you poll source 7,
+sources 1-6 have already moved. To support it, every shipped row needs a `cohort` block
+(see §6) telling me **which other survivors this candidate co-acts with**.
+
+### Why this matters
+
+A cohort-voted scalp tier is fundamentally a different bet than 1-source-1-sleeve:
+- 1-source sleeve: I'm betting on **this trader's edge**. If wrong, I lose his bet.
+- Cohort vote (3-of-N agree): I'm betting on **the consensus signal being non-noise**.
+  False-positive bar is much higher because 3 independent traders rarely agree by accident.
+
+But "cohort" only works if the N sources are **actually independent**. If 3 of the
+"survivors" are the same operator on different wallets, the consensus signal is one
+person's bet wearing 3 hats — looks like 3-of-3 agreement, actually 1-of-1.
+
+So §7's job is two things:
+1. **Compute co-active overlaps** so I know which survivors form a natural cohort.
+2. **Flag aliases** so I can dedup before vote-counting.
+
+### What to compute per survivor
+
+For each shipped survivor X, scan the FULL pool's fill history (last 90d) and emit:
+
+```python
+# Pseudocode of what to compute
+def cohort_block(survivor_addr, all_survivors, fills_by_addr):
+    """For one survivor, compute co-activity with all other survivors."""
+    X_opens = extract_fresh_opens(fills_by_addr[survivor_addr])  # list of (coin, dir, time_ms)
+    co_60s = co_300s = 0
+    partner_counts = defaultdict(lambda: {"n": 0, "same_dir": 0})
+
+    for x_coin, x_dir, x_t in X_opens:
+        for Y in all_survivors:
+            if Y == survivor_addr: continue
+            Y_opens = extract_fresh_opens(fills_by_addr[Y])
+            for y_coin, y_dir, y_t in Y_opens:
+                if y_coin != x_coin: continue
+                dt_ms = abs(x_t - y_t)
+                if dt_ms <= 60_000:
+                    co_60s += 1
+                    partner_counts[Y]["n"] += 1
+                    if x_dir == y_dir:
+                        partner_counts[Y]["same_dir"] += 1
+                elif dt_ms <= 300_000:
+                    co_300s += 1
+
+    n_opens = max(len(X_opens), 1)
+    return {
+        "co_active_60s_pct": round(co_60s / n_opens, 2),
+        "co_active_300s_pct": round((co_60s + co_300s) / n_opens, 2),
+        "partners": [
+            {"addr": Y, "co_opens_n": p["n"],
+             "same_dir_pct": round(p["same_dir"] / max(p["n"], 1), 2)}
+            for Y, p in sorted(partner_counts.items(),
+                               key=lambda kv: -kv[1]["n"])[:5]
+        ],
+        "is_likely_alias_of": _check_entity_graph(survivor_addr),  # see §1 of ETL handover
+    }
+```
+
+### Fresh-opens definition
+
+"Fresh open" = the fill where a coin transitions flat→non-zero OR flips direction.
+Same definition my sleeve uses (no stale adoption). Implementation: reconstruct
+net position per coin from the fill stream; a fresh open is the first fill that
+brings `abs(net)` from 0 to positive, or any fill that changes `sign(net)`.
+
+DON'T count adds/scale-ins — those are not independent signals, they're the same
+opinion being expressed twice.
+
+### Entity-graph dedup
+
+The gaming-PC ETL pipeline (see `HANDOVER_TO_GAMING_PC_ETL.md` §1) is supposed to
+ship `research/entity_clusters.jsonl` mapping address → primary_addr aliases. If
+that file exists at scan time, look up each survivor in it:
+
+- If `confidence ≥ 0.8` and the survivor's `primary_addr` is ANOTHER survivor in the
+  same batch, set `"is_likely_alias_of": "0xPRIMARY..."` on the alias row.
+- If the file doesn't exist or has no match, set to `null`.
+
+If you can't run the entity-graph lookup, ship `null` — I'll dedup conservatively
+by hand for v2.2 and pressure the gaming-PC pipeline to ship the graph by v2.4.
+
+### What I'll do with this on VPS side
+
+When the v2.3 batch lands:
+1. Filter for `tier == "scalp"` survivors with `partners[0].co_opens_n ≥ 10` and
+   `partners[0].same_dir_pct ≥ 0.6` (real cohort, not noise).
+2. Subscribe to all of them via WS (the new shadow already does this — see
+   `scripts/shadow_candidates.py`).
+3. Build a `scripts/watch_cohort_vote.py` that fires a real trade when ≥3 of the
+   cohort open the same (coin, direction) within 60s. Probe-sized at first.
+4. Source-health watchdog gains a per-cohort metric: "did this cohort's consensus
+   beat random in shadow over the last 7d?"
+
+This is the new strategy v2.3 unlocks. Without §7 data, I'd be cohort-voting blind.
+
+---
+
+## 8. HEARTBEAT (so I can see you're alive)
 
 Every 10 min while the scan runs, POST to `http://100.115.113.91:8787/heartbeat`:
 
 ```json
 {
   "box": "bafscrape-1",                // or "gaming-pc" if you run there
-  "pipeline": "scanner-v2",
-  "stage": "prefilter|forensic|writing|done",
+  "pipeline": "scanner-v2.3",
+  "stage": "prefilter|forensic|cohort|writing|done",
   "wallets_seen": 12480,
-  "wallets_passed": 31,
+  "wallets_passed_forensic": 87,
+  "wallets_passed_cohort": 23,          // NEW v2.3 — survivors AFTER cohort dedup
   "last_run_ts": 1780000000,
   "last_success_ts": 1780000000,
   "queue_depth": 0
@@ -321,7 +469,7 @@ No HMAC needed for heartbeat (non-actionable). I can poll your status anytime wi
 
 ---
 
-## 8. KNOWN-BAD ADDRESSES (do not ship — pre-rejected)
+## 9. KNOWN-BAD ADDRESSES (do not ship — pre-rejected)
 
 `0x987df25b`, `0x99967871`, `0x739c52c1`, `0xeb47e64c`, `0x99df385a`, `0x807ddb66`,
 `0x3093189b`, `0x2f01afc9`, `0x24a44aef`, plus the 6 from §1.
@@ -333,10 +481,36 @@ unless you have evidence the sibling materially diverges.
 
 ## TL;DR FOR THE LXC AGENT
 
-1. Drop the §3 v2.1 code into your scanner exactly (literal port of `trust_forensic.py`).
-2. Run the §4 acceptance test — `verdict()` must match all 9 expected outcomes.
-3. Then run the §5 big scan. Heartbeat (§7) while running.
-4. Ship CLEAN + WATCH only in the §6 schema. I'll grade within minutes.
+1. Drop the §3 code into your scanner exactly (literal port of `trust_forensic.py`).
+2. Run the §4 acceptance test — `verdict()` must match all 9 expected outcomes. v2.3
+   note: the gates are unchanged, but lower §2 hold floor means scalp-tier survives.
+3. Run the §5 big scan. Expect **15-30** survivors (up from 5-15 in v2).
+4. Run the §7 cohort analysis on the survivor set. Required for v2.3 — without it I
+   can't enable the cohort-vote tier.
+5. Heartbeat (§8) while running.
+6. Ship CLEAN + WATCH only in the §6 schema with the new `tier` + `cohort` blocks.
+   Filename: `research/scan_v2_2_survivors.jsonl` (note underscore — `v2_2` not `v2.2`,
+   filesystem-safe).
+7. I'll grade within minutes and report which ones get sleeved (Tier 1) vs
+   cohort-voted (Tier 2) vs paper-shadow only.
+
+**v2.3 changelog (2026-05-30):**
+- §2 hold floor: 30min → **5min** (WS push-mode deployed, lag floor dropped from
+  150-300s to ~10-50ms → per-trip cost floor dropped from 50-100bps to 10-12bps,
+  scalp tier now copyable).
+- §3 gates: **unchanged** — no hold threshold in the gates. Scalp-tier eligibility
+  is purely from §2 + §6 tier classification.
+- §4 acceptance test: unchanged, but added note about scalp-tier expectations.
+- §5 yield: 5-15 → **15-30**.
+- §6 schema: added `tier` (swing/intraday/scalp) and `cohort` block; bumped filename
+  to `scan_v2_2_survivors.jsonl`; bumped `scanner_version` to v2.3.
+- §7 NEW — cohort cadence analysis (required). Co-active overlap windows + entity-
+  graph alias flagging so I can vote-aggregate without double-counting one operator.
+- §8 (was §7) heartbeat: added `wallets_passed_cohort` field for v2.3 visibility.
+- §9 (was §8) known-bad: unchanged.
+
+Reply via the heartbeat. We'll see survivors in `research/scan_v2_2_survivors.jsonl`
+and I'll re-vet them on my side.
 
 Reply via the heartbeat. We'll see survivors in `research/scan_v2_survivors.jsonl` and I'll
 re-vet them on my side.
