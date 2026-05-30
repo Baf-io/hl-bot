@@ -46,6 +46,16 @@ CANDS = {
     "8a820d3b_SOLswing":    "0x8a820d3b050bafc0a1f3156706f28038aa292dce",
     "186a0ede_ETHsharp":    "0x186a0ede279bb1e46fc383d990635d32dda655f2",
     "0526345b_HFT_lagtest": "0x0526345bf8e09eb32256008c2844c8949ee3bb9a",
+    # 2026-05-30: WS-mode + v2.3 tier model unlocked sub-swing copying. Backfilled
+    # 4 names that were Tier-1 in COPYABLE_DB or v2.1 batch but not yet shadowed:
+    #   - 5c42b895 score 63.5 CLEAN HYPE intraday (DB Tier 1, payoff 1.68, $172k real)
+    #   - 422c3cf3 score 50.8 CLEAN HYPE/ETH/XRP intraday (DB Tier 1, 170 trips/101d)
+    #   - 5847fd14 score 46.2 CLEAN BTC swing/scalp (DB Tier 1, payoff 2.56, tiny trades)
+    #   - 06e0602c score 42.5 CLEAN ETH grid (v2.1, 357 trips on 21,614 adds — cohort)
+    "5c42b895_HYPEdaily":   "0x5c42b895c1a7f42fe0f72ed2ba1fe442376fb61d",
+    "422c3cf3_intraday":    "0x422c3cf3457a85e9f369242340c023a72a4d6374",
+    "5847fd14_BTCsharp":    "0x5847fd1490cbfb598116edd0e2901689aed65983",
+    "06e0602c_ETHgrid":     "0x06e0602c9158ee8478365c74606346d90d06df67",
 }
 FLAT_EPS = 1e-9
 
