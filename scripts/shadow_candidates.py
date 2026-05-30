@@ -70,6 +70,14 @@ CANDS = {
     "b19e0376_BTCwhale":    "0xb19e03768f72cb1b47fcd68f7fb99460b1e789b9",
     "f2704e08_BTCasym":     "0xf2704e08a4d989f76171c9389665e77c870345a7",
     "1169a721_142niche":    "0x1169a721e2e2052ac3768ca3a6e120b745247097",
+    # 2026-05-30 PM: v2.3-patched batch (43 survivors). +5 fresh CLEAN solo-eligible
+    # from the post-bugfix data. All live-cscore-verified exact-match. The first two
+    # form a SECOND cohort pair (45f3 ↔ 38f2, partner n=2 each direction):
+    "45f36597_BTCswing":    "0x45f3659785468c122609951014bc66a7c472f640",
+    "38f2bc66_ETHintra":    "0x38f2bc667b46467e7c6d10348695f9ba804bcf02",
+    "c2c060e3_BTCswing":    "0xc2c060e3309461ec7c4291b1aac6c89aa228727e",
+    "ae332e9d_ETHswing":    "0xae332e9d33af93c0ee8362f61a8a5aa378bfd508",
+    "66d1f704_BTCdurable":  "0x66d1f704749ced8c60df03cd0ccfce05c5d87fae",
 }
 FLAT_EPS = 1e-9
 
