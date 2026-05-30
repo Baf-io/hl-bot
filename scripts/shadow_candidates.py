@@ -56,6 +56,20 @@ CANDS = {
     "422c3cf3_intraday":    "0x422c3cf3457a85e9f369242340c023a72a4d6374",
     "5847fd14_BTCsharp":    "0x5847fd1490cbfb598116edd0e2901689aed65983",
     "06e0602c_ETHgrid":     "0x06e0602c9158ee8478365c74606346d90d06df67",
+    # 2026-05-30 PM: v2.2 batch (44 survivors, all live-cscore-verified). Top 6 fresh:
+    #   - bbf82c80 cscore 80.9 ultra-scalp HYPE — half of the cohort pair (n=24 co-opens
+    #              w/ 9f3e77cb, 100% same-dir) — single biggest cohort signal in batch
+    #   - 9f3e77cb cscore 73.7 intraday HYPE — other half of the cohort pair
+    #   - 5d9d19a3 cscore 68.7 swing BTC 47h holds, $121k realized — prime solo pick
+    #   - b19e0376 cscore 51.6 swing BTC 13h holds, **$546k realized** (largest in batch)
+    #   - f2704e08 cscore 51.8 swing BTC 775 trips, payoff 2.04 — asymmetric trader
+    #   - 1169a721 cscore 52.9 swing @142 (HL spot niche pair) — n=136 trips
+    "bbf82c80_HYPEultra":   "0xbbf82c801652198aaac1d06dd974b4d607edf0c9",
+    "9f3e77cb_HYPEintra":   "0x9f3e77cb89df964003053aa5b438e5697c77f4f9",
+    "5d9d19a3_BTCswing":    "0x5d9d19a3e5005225f13780fa10c198f87816670d",
+    "b19e0376_BTCwhale":    "0xb19e03768f72cb1b47fcd68f7fb99460b1e789b9",
+    "f2704e08_BTCasym":     "0xf2704e08a4d989f76171c9389665e77c870345a7",
+    "1169a721_142niche":    "0x1169a721e2e2052ac3768ca3a6e120b745247097",
 }
 FLAT_EPS = 1e-9
 
